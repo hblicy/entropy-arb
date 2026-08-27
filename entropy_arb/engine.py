@@ -58,6 +58,7 @@ class Engine:
         # a chain read can never race an in-flight order on that venue
         self._venue_locks: Dict[str, asyncio.Lock] = {}
         self._exec_tasks: set = set()
+        self._shutdown_reconcile_required = False
         self.halted = False
         self.consec_errors = 0
         self.last_trade_ts = 0.0
@@ -226,6 +227,18 @@ class Engine:
                 log.critical(
                     "shutdown still waiting for %d in-flight execution(s); "
                     "orders are not being cancelled", len(still_pending))
+        while self._shutdown_reconcile_required:
+            last_trade = max(
+                (v.last_traded_ts for v in self.venues.values()), default=0.0)
+            delay = max(
+                self.RECONCILE_GRACE_SEC - (time.time() - last_trade), 0.0)
+            if delay:
+                log.warning(
+                    "shutdown waiting %.2fs for position state to become "
+                    "fresh before reconciling an unknown order", delay)
+                await asyncio.sleep(delay)
+            self._shutdown_reconcile_required = False
+            await self._reconcile_positions(hedge=True, strict=True)
 
     # --------------------------------------------------------------- signals
 
@@ -353,6 +366,7 @@ class Engine:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()
         if unresolved:
+            self._shutdown_reconcile_required = True
             self._reconcile_evt.set()
         else:
             await self._maybe_hedge()
@@ -571,6 +585,7 @@ class Engine:
                               info.err or "unresolved")
                     if info.rate_limited:
                         self._mark_limited(v)
+                    self._shutdown_reconcile_required = True
                     self._reconcile_evt.set()
                 else:
                     fill = info.filled_base
@@ -624,7 +639,7 @@ class Engine:
                 retry_after = remaining if retry_after is None \
                     else min(retry_after, remaining)
                 continue  # just traded: chain read would be stale
-            if v.key in self._venue_down \
+            if not strict and v.key in self._venue_down \
                     and now < self._venue_probe_at.get(v.key, 0.0):
                 continue  # down venue: probe only every venue_probe_sec
             vs.append(v)

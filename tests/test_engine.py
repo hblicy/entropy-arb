@@ -277,6 +277,26 @@ def test_shutdown_drain_waits_for_execution_without_cancelling_it():
     asyncio.run(go())
 
 
+def test_shutdown_drain_reconciles_an_unknown_inflight_outcome():
+    async def go():
+        eng = make_engine()
+        eng.RECONCILE_GRACE_SEC = 0.0
+        reconciles = []
+
+        async def reconcile(*, hedge, strict=False):
+            reconciles.append((hedge, strict))
+
+        eng._reconcile_positions = reconcile
+        eng._shutdown_reconcile_required = True
+
+        await eng._drain_executions(poll_sec=0.005)
+
+        assert reconciles == [(True, True)]
+        assert eng._shutdown_reconcile_required is False
+
+    asyncio.run(go())
+
+
 def test_reconcile_skipped_during_grace_is_rescheduled():
     async def go():
         eng = make_engine()
