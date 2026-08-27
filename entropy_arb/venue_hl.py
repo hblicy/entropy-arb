@@ -8,8 +8,7 @@ official `hyperliquid-python-sdk` signing helpers + eth_account —
 
 IOC limit orders settle synchronously in the /exchange response; unknown
 outcomes (timeout/5xx) fall back to orderStatus-by-cloid polling inside
-send_taker(), so the engine sees the same unified result shape as the Lighter
-venue: {status, filled_base, avg_px, err, unresolved}.
+send_taker(), which returns the same normalized OrderResult as Lighter.
 """
 from __future__ import annotations
 
@@ -25,6 +24,7 @@ import aiohttp
 from .book import OrderBook
 from .config import VenueConf
 from .feeds import HLBookFeed
+from .models import OrderResult
 
 log = logging.getLogger("hl")
 
@@ -180,7 +180,7 @@ class HLVenue:
         return Cloid.from_int(self._cloid)
 
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
-                         reduce_only: bool = False) -> dict:
+                         reduce_only: bool = False) -> OrderResult:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
         cloid = self._next_cloid()
@@ -197,16 +197,14 @@ class HLVenue:
             payload = {"action": action, "nonce": nonce, "signature": sig,
                        "vaultAddress": None, "expiresAfter": None}
         except Exception as e:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": f"signing failed: {e!r}", "unresolved": False}
+            return OrderResult.send_failed(f"signing failed: {e!r}")
 
         body, err, unresolved = await self._post_exchange(payload)
         if err is not None:
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": err, "unresolved": False}
+            return OrderResult.send_failed(err)
         if not unresolved:
             res = self._parse(body)
-            if not res.get("unresolved"):
+            if not res.unresolved:
                 return res
         # unknown outcome: poll orderStatus by cloid until the deadline
         deadline = time.time() + self.settle_timeout
@@ -227,11 +225,9 @@ class HLVenue:
                 except (TypeError, ValueError):
                     filled = 0.0
                 if status != "open":
-                    return {"status": status, "filled_base": filled,
-                            "avg_px": None, "err": None, "unresolved": False}
+                    return OrderResult(status=status, filled_base=filled)
             await asyncio.sleep(0.5)
-        return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                "err": None, "unresolved": True}
+        return OrderResult.unknown("timeout")
 
     async def _post_exchange(self, payload: dict):
         try:
@@ -250,13 +246,13 @@ class HLVenue:
             return None, None, True
 
     @staticmethod
-    def _parse(body: dict) -> dict:
-        def fail(msg: str) -> dict:
+    def _parse(body: dict) -> OrderResult:
+        def fail(msg: str) -> OrderResult:
             low = msg.lower()
             if "rate limit" in low or "too many" in low:
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return OrderResult.send_failed(msg)
+
         if body.get("status") == "err":
             return fail(str(body.get("response")))
         if body.get("status") != "ok":
@@ -266,20 +262,20 @@ class HLVenue:
         except (KeyError, IndexError, TypeError):
             return fail(f"malformed response: {str(body)[:200]}")
         if "filled" in st:
-            f = st["filled"]
-            return {"status": "filled",
-                    "filled_base": float(f.get("totalSz") or 0.0),
-                    "avg_px": float(f["avgPx"]) if f.get("avgPx") else None,
-                    "err": None, "unresolved": False}
+            fill = st["filled"]
+            return OrderResult(
+                status="filled",
+                filled_base=float(fill.get("totalSz") or 0.0),
+                avg_px=(float(fill["avgPx"])
+                        if fill.get("avgPx") else None),
+            )
         if "error" in st:
             msg = str(st["error"])
             if "could not immediately match" in msg.lower():
-                return {"status": "canceled", "filled_base": 0.0, "avg_px": None,
-                        "err": None, "unresolved": False}
+                return OrderResult(status="canceled")
             return fail(msg)
         if "resting" in st:
-            return {"status": "resting?", "filled_base": 0.0, "avg_px": None,
-                    "err": None, "unresolved": True}
+            return OrderResult.unknown("resting?")
         return fail(f"unknown status: {str(st)[:150]}")
 
     # -------------------------------------------------------------- accounts

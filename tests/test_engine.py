@@ -9,9 +9,10 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.book import OrderBook  # noqa: E402
+from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
+from entropy_arb.models import OrderResult  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
@@ -36,7 +37,7 @@ class StubVenue:
         self.key, self.name = key, label
         self.cap_usd, self.fee_bps = cap, fee
         self.size_decimals, self.min_base, self.min_quote = 4, 1e-4, 10.0
-        self.position, self.cash = 0.0, 0.0
+        self.position, self.cash, self.volume_usd = 0.0, 0.0, 0.0
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
@@ -47,6 +48,36 @@ class StubVenue:
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
                             [{"px": str(ask), "sz": str(sz)}]])
+
+
+class ExecutingVenue(StubVenue):
+    def __init__(self, key, label, result):
+        super().__init__(key, label)
+        self.result = result
+
+    def px_round(self, px, round_up):
+        return px
+
+    async def send_taker(self, **_kwargs):
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+def execution_plan():
+    return ArbPlan(
+        qty=0.5,
+        buy_limit=100.0,
+        sell_limit=100.2,
+        buy_notional=50.0,
+        sell_notional=50.1,
+        q_max=0.5,
+        q_max_notional=50.0,
+        top_premium_bps=20.0,
+        marginal_premium_bps=20.0,
+        buy_fee=0.0,
+        sell_fee=0.0,
+    )
 
 
 def make_engine(**thr):
@@ -143,6 +174,47 @@ def test_scan_respects_position_caps():
     eng.hedge.position = 100.0
     eng.hedge.cap_usd = 10000.0
     assert run_scan(eng) is None
+
+
+def test_execute_consumes_typed_order_results():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert buy.position == 0.5
+    assert sell.position == -0.5
+    assert eng.trades == 1
+    approx(eng.total_fill_edge, 0.1)
+
+
+def test_execute_converts_raised_leg_exception_to_failure():
+    eng = make_engine()
+    buy = ExecutingVenue("hedge", "RH", RuntimeError("send exploded"))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["status"] == "send-failed/filled"
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
+from .models import OrderResult
 from .recorder import MinuteRecorder
 from .venue_hl import HLVenue
 from .venue_lighter import LighterVenue
@@ -428,54 +429,61 @@ class Engine:
         sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
         self._record_send(buy)
         self._record_send(sell)
-        res = await asyncio.gather(
+        raw_results = await asyncio.gather(
             buy.send_taker(is_buy=True, qty=plan.qty, limit_px=buy_bound),
             sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound),
             return_exceptions=True)
-        binfo, sinfo = (r if isinstance(r, dict) else
-                        {"status": "send-failed", "filled_base": 0.0,
-                         "avg_px": None, "err": repr(r), "unresolved": False}
-                        for r in res)
-        for v, info, side in ((buy, binfo, "buy"), (sell, sinfo, "sell")):
-            if info.get("err"):
-                log.error("[%s] %s leg: %s", v.name, side, info["err"])
-        bfill = binfo["filled_base"]
-        sfill = sinfo["filled_base"]
+        results = []
+        for result in raw_results:
+            if isinstance(result, BaseException):
+                results.append(OrderResult.send_failed(repr(result)))
+            elif isinstance(result, OrderResult):
+                results.append(result)
+            else:
+                raise TypeError(
+                    f"venue returned {type(result).__name__}, expected OrderResult")
+        binfo, sinfo = results
+        for venue, info, side in ((buy, binfo, "buy"),
+                                  (sell, sinfo, "sell")):
+            if info.err:
+                log.error("[%s] %s leg: %s", venue.name, side, info.err)
+        bfill = binfo.filled_base
+        sfill = sinfo.filled_base
         buy.position += bfill
         sell.position -= sfill
         if bfill:
-            bpx = binfo.get("avg_px") or plan.buy_limit
+            bpx = binfo.avg_px or plan.buy_limit
             buy.cash -= bfill * bpx * (1 + plan.buy_fee)
             buy.volume_usd += bfill * bpx
         if sfill:
-            spx = sinfo.get("avg_px") or plan.sell_limit
+            spx = sinfo.avg_px or plan.sell_limit
             sell.cash += sfill * spx * (1 - plan.sell_fee)
             sell.volume_usd += sfill * spx
 
         matched = min(bfill, sfill)
         fill_edge = 0.0
-        if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
-            fill_edge = matched * (sinfo["avg_px"] * (1 - plan.sell_fee)
-                                   - binfo["avg_px"] * (1 + plan.buy_fee))
+        if matched > 0 and binfo.avg_px and sinfo.avg_px:
+            fill_edge = matched * (
+                sinfo.avg_px * (1 - plan.sell_fee)
+                - binfo.avg_px * (1 + plan.buy_fee))
             self.total_fill_edge += fill_edge
         log.info("[SETTLED] %s: buy %s %s %.6g/%.6g | sell %s %s %.6g/%.6g | "
                  "matched %.6g | fill edge $%.4f", direction,
-                 buy.name, binfo["status"], bfill, plan.qty,
-                 sell.name, sinfo["status"], sfill, plan.qty, matched, fill_edge)
+                 buy.name, binfo.status, bfill, plan.qty,
+                 sell.name, sinfo.status, sfill, plan.qty, matched, fill_edge)
         buy.last_traded_ts = sell.last_traded_ts = time.time()
 
-        unresolved = binfo.get("unresolved") or sinfo.get("unresolved")
-        hard_err = (binfo.get("err") is not None
-                    or sinfo.get("err") is not None)
+        unresolved = binfo.unresolved or sinfo.unresolved
+        hard_err = binfo.err is not None or sinfo.err is not None
         rate_limited = False
-        for v, info in ((buy, binfo), (sell, sinfo)):
-            if str(info.get("err", "")).startswith("RATE_LIMITED"):
+        for venue, info in ((buy, binfo), (sell, sinfo)):
+            if info.rate_limited:
                 rate_limited = True
-                self._mark_limited(v)
-            elif "margin" in str(info.get("status", "")).lower():
+                self._mark_limited(venue)
+            elif "margin" in info.status.lower():
                 log.warning("[%s] margin rejection — collateral exhausted, "
-                            "pausing venue", v.name)
-                self._mark_limited(v)
+                            "pausing venue", venue.name)
+                self._mark_limited(venue)
         sent_ok = not hard_err and not unresolved
         if sent_ok:
             self.consec_errors = 0
@@ -489,11 +497,12 @@ class Engine:
         if sent_ok:
             self.trades += 1
             self.total_exp_edge += plan.exp_edge_usd
-        self._record_trade(direction, plan,
-                           None if unresolved else fill_edge,
-                           f"{binfo['status']}/{sinfo['status']}", sent_ok)
-        self._log_csv(direction, buy, sell, plan, sent_ok, bfill, sfill,
-                      binfo["status"], sinfo["status"], fill_edge, inv_bps)
+        self._record_trade(
+            direction, plan, None if unresolved else fill_edge,
+            f"{binfo.status}/{sinfo.status}", sent_ok)
+        self._log_csv(
+            direction, buy, sell, plan, sent_ok, bfill, sfill,
+            binfo.status, sinfo.status, fill_edge, inv_bps)
         self.last_trade_ts = time.time()
         return bool(unresolved)
 
@@ -546,23 +555,27 @@ class Engine:
                 self._record_send(v)  # counts toward the budget, never blocked
                 info = await v.send_taker(is_buy=not is_sell, qty=qty,
                                           limit_px=limit, reduce_only=True)
-                if info.get("err") or info.get("unresolved"):
+                if not isinstance(info, OrderResult):
+                    raise TypeError(
+                        f"venue returned {type(info).__name__}, "
+                        "expected OrderResult")
+                if info.err or info.unresolved:
                     log.error("[HEDGE] %s: %s", v.name,
-                              info.get("err") or "unresolved")
-                    if str(info.get("err", "")).startswith("RATE_LIMITED"):
+                              info.err or "unresolved")
+                    if info.rate_limited:
                         self._mark_limited(v)
                     self._reconcile_evt.set()
                 else:
-                    fill = info["filled_base"]
+                    fill = info.filled_base
                     v.position += -fill if is_sell else fill
                     if fill:
-                        px = info.get("avg_px") or limit
+                        px = info.avg_px or limit
                         fee = v.fee_bps / 1e4
                         v.cash += fill * px * (1 - fee) if is_sell \
                             else -fill * px * (1 + fee)
                         v.volume_usd += fill * px
                     log.info("[HEDGE SETTLED] %s %s %.6g/%.6g",
-                             v.name, info["status"], fill, qty)
+                             v.name, info.status, fill, qty)
                 v.last_traded_ts = time.time()
             finally:
                 lk.release()
