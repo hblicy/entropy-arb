@@ -207,15 +207,23 @@ errors), credentials in `.env`, and the markets on the command line
 main.py                  entry point (--record-only, or live by default)
 entropy_arb/config.py    YAML + .env contract, validation
 entropy_arb/book.py      order books + fee-aware crossing/sizing math
+entropy_arb/models.py    normalized order-result domain values
 entropy_arb/feeds.py     official HL ws + zkLighter ws book feeds
 entropy_arb/venue_hl.py  Hyperliquid dex adapter (Entropy, tradexyz)
 entropy_arb/venue_lighter.py  zkLighter adapter (mainnet, Robinhood chain)
+entropy_arb/venues/base.py  common venue adapter protocol
+entropy_arb/venues/registry.py  explicit adapter factory registry
 entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute orderbook bars
 tools/analyze.py         minutes.csv -> suggested thresholds
 tests/                   python3 -m pytest tests/
 ```
+
+The current CLI still runs exactly two legs. Venue construction now goes
+through a common protocol and an explicit registry; this is the compatibility
+foundation for the staged multi-hedge design in
+`docs/superpowers/specs/2026-08-27-multi-hedge-arbitrage-design.md`.
 
 ## Known risks
 

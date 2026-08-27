@@ -191,15 +191,22 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 main.py                  入口（--record-only，默认即实盘）
 entropy_arb/config.py    YAML + .env 配置契约与校验
 entropy_arb/book.py      订单簿 + 含手续费的套利规模计算
+entropy_arb/models.py    标准化订单结果数据结构
 entropy_arb/feeds.py     官方 HL ws + zkLighter ws 行情
 entropy_arb/venue_hl.py  Hyperliquid dex 适配器（Entropy、tradexyz）
 entropy_arb/venue_lighter.py  zkLighter 适配器（主网、Robinhood 链）
+entropy_arb/venues/base.py  统一交易所适配器协议
+entropy_arb/venues/registry.py  显式适配器工厂注册表
 entropy_arb/engine.py    双交易所策略主循环
 entropy_arb/dashboard.py Rich 终端仪表盘
 entropy_arb/recorder.py  分钟级盘口数据采集
 tools/analyze.py         minutes.csv -> 阈值建议
 tests/                   python3 -m pytest tests/
 ```
+
+当前命令行仍然只运行两条腿。交易所创建已经统一经过适配器协议和显式注册表；
+这是后续按阶段实现多对冲交易所架构的兼容基础，完整设计见
+`docs/superpowers/specs/2026-08-27-multi-hedge-arbitrage-design.md`。
 
 ## 已知风险
 
