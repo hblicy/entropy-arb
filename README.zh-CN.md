@@ -103,6 +103,9 @@ pip install -r requirements-live.txt
 python3 main.py --symbol SNDK --hedge lighter-rh
 ```
 
+运行时和签名 SDK 的直接依赖都已固定版本，Lighter 也固定到了具体 Git 提交。
+升级依赖必须主动修改版本，并在部署新环境前重新跑完整测试和仅采集检查。
+
 不带 `--record-only` 运行时，只要两边行情就绪且溢价越过带宽，就会立即
 发送真实订单。
 
@@ -135,7 +138,8 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 
 ## 配置说明
 
-策略在 `config.yaml`（严格校验——未知键名直接报错），密钥在 `.env`。
+策略在 `config.yaml`（严格校验——未知键名、非有限数字及不安全的金额、频率、
+比例和超时边界都会在启动时直接报错），密钥在 `.env`。
 交易市场由命令行指定（`--symbol`、`--hedge`）。完整的双语注释参考：
 [config.example.yaml](config.example.yaml)。核心项：
 
@@ -171,8 +175,9 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 ## 执行机制
 
 - 两条腿**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
-  上异步确认成交；Hyperliquid 用 IOC 限价单同步结算（结果未知时轮询
-  orderStatus 兜底）。
+  上异步确认成交；Hyperliquid HIP-3 用 IOC 限价单同步结算。HIP-3 当前不兼容
+  `cloid`，因此请求不会携带它；超时或 5xx 会保持为明确的“结果未知”并触发
+  仓位对账，绝不会盲目重发订单。
 - **持续性闸门**（`premium_persist_sec`）：信号先"武装"，持续存在才触发，
   过滤单 tick 的假信号。
 - **库存阶梯**：仓位超过上限的 `floor_frac` 后，同方向加仓需要线性递增的
@@ -182,6 +187,9 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 - **故障隔离**：被限频的交易所短暂暂停；交易所不可达（如例行维护）时暂停
   交易并每 `venue_probe_sec` 探测直至恢复；连续 `max_consecutive_errors`
   次执行异常则整体停机。
+- **安全关机**：收到停止信号后不再产生新机会，但会等待所有已经提交的双腿
+  执行得到结果后才关闭交易所连接。等待过久会写入 critical 日志，不会由程序
+  主动取消在途下单任务。
 - **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
   其余都是真金白银。
 
