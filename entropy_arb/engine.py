@@ -26,9 +26,10 @@ import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
+from .models import OrderResult
 from .recorder import MinuteRecorder
-from .venue_hl import HLVenue
-from .venue_lighter import LighterVenue
+from .venues.base import VenueAdapter
+from .venues.registry import VenueRuntime, create_venue
 
 log = logging.getLogger("engine")
 
@@ -45,9 +46,9 @@ class Engine:
         self.cfg = cfg
         self.record_only = record_only
         self.session: Optional[aiohttp.ClientSession] = None
-        self.entropy = None
-        self.hedge = None
-        self.venues: Dict[str, object] = {}
+        self.entropy: Optional[VenueAdapter] = None
+        self.hedge: Optional[VenueAdapter] = None
+        self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.markets_ready = False
         self.stop = asyncio.Event()
@@ -57,6 +58,7 @@ class Engine:
         # a chain read can never race an in-flight order on that venue
         self._venue_locks: Dict[str, asyncio.Lock] = {}
         self._exec_tasks: set = set()
+        self._shutdown_reconcile_required = False
         self.halted = False
         self.consec_errors = 0
         self.last_trade_ts = 0.0
@@ -67,6 +69,7 @@ class Engine:
         self.start_ts = time.time()
         self._last_skiplog = 0.0
         self._poke_due: Optional[float] = None
+        self._reconcile_due: Optional[float] = None
         # per-direction persistence arming: direction key -> first-seen ts
         self._armed: Dict[str, Optional[float]] = {"sell_entropy": None,
                                                    "buy_entropy": None}
@@ -130,16 +133,16 @@ class Engine:
         finally:
             await self.session.close()
 
-    def _make_venue(self, vc):
-        if vc.kind == "lighter":
-            return LighterVenue(vc, self.session, self.cfg.settle_timeout_sec)
-        return HLVenue(vc, self.cfg.hl_api_url, self.cfg.hl_ws_url,
-                       self.session, self.cfg.settle_timeout_sec)
-
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        self.entropy = self._make_venue(cfg.entropy)
-        self.hedge = self._make_venue(cfg.hedge)
+        runtime = VenueRuntime(
+            session=self.session,
+            hl_api_url=cfg.hl_api_url,
+            hl_ws_url=cfg.hl_ws_url,
+            settle_timeout_sec=cfg.settle_timeout_sec,
+        )
+        self.entropy = create_venue(cfg.entropy, runtime)
+        self.hedge = create_venue(cfg.hedge, runtime)
         self.venues = {"entropy": self.entropy, "hedge": self.hedge}
         await asyncio.gather(self.entropy.load_market(), self.hedge.load_market())
         self.markets_ready = True
@@ -154,12 +157,7 @@ class Engine:
                     "请用 --record-only")
             self.entropy.init_signer()
             self.hedge.init_signer()
-            if self.hedge.kind == "hl":
-                self.entropy.share_nonces_with(self.hedge)
-        if (self.hedge.kind == "hl"
-                and self.entropy._query_address()
-                and self.entropy._query_address() == self.hedge._query_address()):
-            self.hedge.include_core_equity = False  # shared account: count once
+        self.entropy.configure_peer(self.hedge)
 
         self._step = 10 ** -min(self.entropy.size_decimals,
                                 self.hedge.size_decimals)
@@ -207,11 +205,7 @@ class Engine:
                                              name="reconcile"))
 
         await self.stop.wait()
-        if self._exec_tasks:  # let in-flight executions settle, never cancel
-            log.info("waiting for %d in-flight execution(s) to settle",
-                     len(self._exec_tasks))
-            await asyncio.wait(self._exec_tasks,
-                               timeout=cfg.settle_timeout_sec + 2.0)
+        await self._drain_executions()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -219,7 +213,32 @@ class Engine:
             await v.close()
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
-                 self.total_exp_edge, self.total_fill_edge)
+                  self.total_exp_edge, self.total_fill_edge)
+
+    async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
+        """Wait for every submitted execution; shutdown never abandons a leg."""
+        interval = poll_sec or max(self.cfg.settle_timeout_sec + 2.0, 5.0)
+        while self._exec_tasks:
+            pending = tuple(self._exec_tasks)
+            log.info("waiting for %d in-flight execution(s) to settle",
+                     len(pending))
+            _, still_pending = await asyncio.wait(pending, timeout=interval)
+            if still_pending:
+                log.critical(
+                    "shutdown still waiting for %d in-flight execution(s); "
+                    "orders are not being cancelled", len(still_pending))
+        while self._shutdown_reconcile_required:
+            last_trade = max(
+                (v.last_traded_ts for v in self.venues.values()), default=0.0)
+            delay = max(
+                self.RECONCILE_GRACE_SEC - (time.time() - last_trade), 0.0)
+            if delay:
+                log.warning(
+                    "shutdown waiting %.2fs for position state to become "
+                    "fresh before reconciling an unknown order", delay)
+                await asyncio.sleep(delay)
+            self._shutdown_reconcile_required = False
+            await self._reconcile_positions(hedge=True, strict=True)
 
     # --------------------------------------------------------------- signals
 
@@ -347,6 +366,7 @@ class Engine:
             self._vlock(buy.key).release()
             self._vlock(sell.key).release()
         if unresolved:
+            self._shutdown_reconcile_required = True
             self._reconcile_evt.set()
         else:
             await self._maybe_hedge()
@@ -428,55 +448,64 @@ class Engine:
         sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
         self._record_send(buy)
         self._record_send(sell)
-        res = await asyncio.gather(
+        raw_results = await asyncio.gather(
             buy.send_taker(is_buy=True, qty=plan.qty, limit_px=buy_bound),
             sell.send_taker(is_buy=False, qty=plan.qty, limit_px=sell_bound),
             return_exceptions=True)
-        binfo, sinfo = (r if isinstance(r, dict) else
-                        {"status": "send-failed", "filled_base": 0.0,
-                         "avg_px": None, "err": repr(r), "unresolved": False}
-                        for r in res)
-        for v, info, side in ((buy, binfo, "buy"), (sell, sinfo, "sell")):
-            if info.get("err"):
-                log.error("[%s] %s leg: %s", v.name, side, info["err"])
-        bfill = binfo["filled_base"]
-        sfill = sinfo["filled_base"]
+        results = []
+        for result in raw_results:
+            if isinstance(result, BaseException):
+                results.append(OrderResult.send_failed(repr(result)))
+            elif isinstance(result, OrderResult):
+                results.append(result)
+            else:
+                raise TypeError(
+                    f"venue returned {type(result).__name__}, expected OrderResult")
+        binfo, sinfo = results
+        for venue, info, side in ((buy, binfo, "buy"),
+                                  (sell, sinfo, "sell")):
+            if info.err:
+                log.error("[%s] %s leg: %s", venue.name, side, info.err)
+        bfill = binfo.filled_base
+        sfill = sinfo.filled_base
         buy.position += bfill
         sell.position -= sfill
         if bfill:
-            bpx = binfo.get("avg_px") or plan.buy_limit
+            bpx = binfo.avg_px or plan.buy_limit
             buy.cash -= bfill * bpx * (1 + plan.buy_fee)
             buy.volume_usd += bfill * bpx
         if sfill:
-            spx = sinfo.get("avg_px") or plan.sell_limit
+            spx = sinfo.avg_px or plan.sell_limit
             sell.cash += sfill * spx * (1 - plan.sell_fee)
             sell.volume_usd += sfill * spx
 
         matched = min(bfill, sfill)
         fill_edge = 0.0
-        if matched > 0 and binfo.get("avg_px") and sinfo.get("avg_px"):
-            fill_edge = matched * (sinfo["avg_px"] * (1 - plan.sell_fee)
-                                   - binfo["avg_px"] * (1 + plan.buy_fee))
+        if matched > 0 and binfo.avg_px and sinfo.avg_px:
+            fill_edge = matched * (
+                sinfo.avg_px * (1 - plan.sell_fee)
+                - binfo.avg_px * (1 + plan.buy_fee))
             self.total_fill_edge += fill_edge
         log.info("[SETTLED] %s: buy %s %s %.6g/%.6g | sell %s %s %.6g/%.6g | "
                  "matched %.6g | fill edge $%.4f", direction,
-                 buy.name, binfo["status"], bfill, plan.qty,
-                 sell.name, sinfo["status"], sfill, plan.qty, matched, fill_edge)
+                 buy.name, binfo.status, bfill, plan.qty,
+                 sell.name, sinfo.status, sfill, plan.qty, matched, fill_edge)
         buy.last_traded_ts = sell.last_traded_ts = time.time()
 
-        unresolved = binfo.get("unresolved") or sinfo.get("unresolved")
-        hard_err = (binfo.get("err") is not None
-                    or sinfo.get("err") is not None)
+        unresolved = binfo.unresolved or sinfo.unresolved
+        hard_err = binfo.err is not None or sinfo.err is not None
         rate_limited = False
-        for v, info in ((buy, binfo), (sell, sinfo)):
-            if str(info.get("err", "")).startswith("RATE_LIMITED"):
+        for venue, info in ((buy, binfo), (sell, sinfo)):
+            if info.rate_limited:
                 rate_limited = True
-                self._mark_limited(v)
-            elif "margin" in str(info.get("status", "")).lower():
+                self._mark_limited(venue)
+            elif "margin" in info.status.lower():
                 log.warning("[%s] margin rejection — collateral exhausted, "
-                            "pausing venue", v.name)
-                self._mark_limited(v)
-        sent_ok = not hard_err and not unresolved
+                            "pausing venue", venue.name)
+                self._mark_limited(venue)
+        fills_match = (matched > 0
+                       and abs(bfill - sfill) <= cfg.net_tolerance_base)
+        sent_ok = not hard_err and not unresolved and fills_match
         if sent_ok:
             self.consec_errors = 0
         elif not rate_limited:
@@ -489,11 +518,12 @@ class Engine:
         if sent_ok:
             self.trades += 1
             self.total_exp_edge += plan.exp_edge_usd
-        self._record_trade(direction, plan,
-                           None if unresolved else fill_edge,
-                           f"{binfo['status']}/{sinfo['status']}", sent_ok)
-        self._log_csv(direction, buy, sell, plan, sent_ok, bfill, sfill,
-                      binfo["status"], sinfo["status"], fill_edge, inv_bps)
+        self._record_trade(
+            direction, plan, None if unresolved else fill_edge,
+            f"{binfo.status}/{sinfo.status}", sent_ok)
+        self._log_csv(
+            direction, buy, sell, plan, sent_ok, bfill, sfill,
+            binfo.status, sinfo.status, fill_edge, inv_bps)
         self.last_trade_ts = time.time()
         return bool(unresolved)
 
@@ -546,23 +576,28 @@ class Engine:
                 self._record_send(v)  # counts toward the budget, never blocked
                 info = await v.send_taker(is_buy=not is_sell, qty=qty,
                                           limit_px=limit, reduce_only=True)
-                if info.get("err") or info.get("unresolved"):
+                if not isinstance(info, OrderResult):
+                    raise TypeError(
+                        f"venue returned {type(info).__name__}, "
+                        "expected OrderResult")
+                if info.err or info.unresolved:
                     log.error("[HEDGE] %s: %s", v.name,
-                              info.get("err") or "unresolved")
-                    if str(info.get("err", "")).startswith("RATE_LIMITED"):
+                              info.err or "unresolved")
+                    if info.rate_limited:
                         self._mark_limited(v)
+                    self._shutdown_reconcile_required = True
                     self._reconcile_evt.set()
                 else:
-                    fill = info["filled_base"]
+                    fill = info.filled_base
                     v.position += -fill if is_sell else fill
                     if fill:
-                        px = info.get("avg_px") or limit
+                        px = info.avg_px or limit
                         fee = v.fee_bps / 1e4
                         v.cash += fill * px * (1 - fee) if is_sell \
                             else -fill * px * (1 + fee)
                         v.volume_usd += fill * px
                     log.info("[HEDGE SETTLED] %s %s %.6g/%.6g",
-                             v.name, info["status"], fill, qty)
+                             v.name, info.status, fill, qty)
                 v.last_traded_ts = time.time()
             finally:
                 lk.release()
@@ -577,17 +612,39 @@ class Engine:
     # phantom hedge oscillations. Grace-guard + venue lock prevent that.
     RECONCILE_GRACE_SEC = 5.0
 
+    def _schedule_reconcile(self, delay: float) -> None:
+        loop = asyncio.get_running_loop()
+        due = loop.time() + max(delay, 0.01)
+        if (self._reconcile_due is not None
+                and self._reconcile_due <= due + 0.02):
+            return
+
+        def _fire() -> None:
+            self._reconcile_due = None
+            if not self.stop.is_set():
+                self._reconcile_evt.set()
+
+        self._reconcile_due = due
+        loop.call_at(due, _fire)
+
     async def _reconcile_positions(self, hedge: bool,
                                    strict: bool = False) -> None:
         now = time.time()
         vs = []
+        retry_after = None
         for v in self.venues.values():
-            if now - v.last_traded_ts <= self.RECONCILE_GRACE_SEC:
+            age = now - v.last_traded_ts
+            if age <= self.RECONCILE_GRACE_SEC:
+                remaining = self.RECONCILE_GRACE_SEC - age
+                retry_after = remaining if retry_after is None \
+                    else min(retry_after, remaining)
                 continue  # just traded: chain read would be stale
-            if v.key in self._venue_down \
+            if not strict and v.key in self._venue_down \
                     and now < self._venue_probe_at.get(v.key, 0.0):
                 continue  # down venue: probe only every venue_probe_sec
             vs.append(v)
+        if retry_after is not None:
+            self._schedule_reconcile(retry_after)
         if not vs:
             return
         got = await asyncio.gather(
@@ -602,7 +659,9 @@ class Engine:
     async def _reconcile_venue(self, v, strict: bool) -> None:
         async with self._vlock(v.key):
             now = time.time()
-            if now - v.last_traded_ts <= self.RECONCILE_GRACE_SEC:
+            age = now - v.last_traded_ts
+            if age <= self.RECONCILE_GRACE_SEC:
+                self._schedule_reconcile(self.RECONCILE_GRACE_SEC - age)
                 return  # traded while waiting for the lock
             try:
                 r = await v.fetch_position()

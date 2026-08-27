@@ -7,8 +7,7 @@ without the SDK. Trading lazily imports the official `lighter` SDK
 
 Market orders carry mandatory avg-execution-price protection and settle
 asynchronously on the authenticated account_orders websocket; send_taker()
-hides that behind the same result shape the HL venue returns:
-{status, filled_base, avg_px, err, unresolved}.
+hides that behind the same normalized OrderResult returned by Hyperliquid.
 """
 from __future__ import annotations
 
@@ -30,6 +29,7 @@ except ImportError:
 from .book import OrderBook
 from .config import VenueConf
 from .feeds import LighterBookFeed
+from .models import OrderResult
 
 log = logging.getLogger("lighter")
 
@@ -222,6 +222,10 @@ class LighterVenue:
         self.signer = signer
         log.info("[%s] signer ready (account %d)", self.name, c.account_index)
 
+    def configure_peer(self, other) -> None:
+        """Lighter deployments do not share Hyperliquid account state."""
+        return
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         tasks = [asyncio.create_task(
             LighterBookFeed(self.name, self.profile.ws_url, self.market_id,
@@ -269,7 +273,7 @@ class LighterVenue:
         return self._coi
 
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
-                         reduce_only: bool = False) -> dict:
+                         reduce_only: bool = False) -> OrderResult:
         """Market order with avg-price protection; settle via account ws."""
         assert self.signer is not None
         from lighter import SignerClient
@@ -295,8 +299,7 @@ class LighterVenue:
             msg = f"{type(e).__name__}: {e}"
             if getattr(e, "status", None) == 429 or "(429)" in str(e):
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return OrderResult.send_failed(msg)
         if err is not None or (getattr(resp, "code", 200) or 200) != 200:
             if fut is not None:
                 self.orders_feed.unwatch(coi)
@@ -304,21 +307,21 @@ class LighterVenue:
                 f"tx rejected code={resp.code} msg={getattr(resp, 'message', None)}"
             if "rate limit" in msg.lower():
                 msg = "RATE_LIMITED: " + msg
-            return {"status": "send-failed", "filled_base": 0.0, "avg_px": None,
-                    "err": msg, "unresolved": False}
+            return OrderResult.send_failed(msg)
         if fut is None:
-            return {"status": "sent-unconfirmed", "filled_base": 0.0,
-                    "avg_px": None, "err": None, "unresolved": True}
+            return OrderResult.unknown("sent-unconfirmed")
         try:
             info = await asyncio.wait_for(fut, timeout=self.settle_timeout)
-            return {"status": info["status"], "filled_base": info["filled_base"],
-                    "avg_px": info.get("avg_px"), "err": None, "unresolved": False}
+            return OrderResult(
+                status=info["status"],
+                filled_base=info["filled_base"],
+                avg_px=info.get("avg_px"),
+            )
         except asyncio.TimeoutError:
             self.orders_feed.unwatch(coi)
             log.warning("[%s] no settle confirmation for coi %d in %.1fs",
                         self.name, coi, self.settle_timeout)
-            return {"status": "timeout", "filled_base": 0.0, "avg_px": None,
-                    "err": None, "unresolved": True}
+            return OrderResult.unknown("timeout")
 
     # -------------------------------------------------------------- accounts
 

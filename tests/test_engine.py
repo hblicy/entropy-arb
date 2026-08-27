@@ -6,12 +6,14 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.book import OrderBook  # noqa: E402
+from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
+from entropy_arb.models import OrderResult  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
@@ -36,7 +38,7 @@ class StubVenue:
         self.key, self.name = key, label
         self.cap_usd, self.fee_bps = cap, fee
         self.size_decimals, self.min_base, self.min_quote = 4, 1e-4, 10.0
-        self.position, self.cash = 0.0, 0.0
+        self.position, self.cash, self.volume_usd = 0.0, 0.0, 0.0
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
@@ -47,6 +49,36 @@ class StubVenue:
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
                             [{"px": str(ask), "sz": str(sz)}]])
+
+
+class ExecutingVenue(StubVenue):
+    def __init__(self, key, label, result):
+        super().__init__(key, label)
+        self.result = result
+
+    def px_round(self, px, round_up):
+        return px
+
+    async def send_taker(self, **_kwargs):
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+def execution_plan():
+    return ArbPlan(
+        qty=0.5,
+        buy_limit=100.0,
+        sell_limit=100.2,
+        buy_notional=50.0,
+        sell_notional=50.1,
+        q_max=0.5,
+        q_max_notional=50.0,
+        top_premium_bps=20.0,
+        marginal_premium_bps=20.0,
+        buy_fee=0.0,
+        sell_fee=0.0,
+    )
 
 
 def make_engine(**thr):
@@ -143,6 +175,142 @@ def test_scan_respects_position_caps():
     eng.hedge.position = 100.0
     eng.hedge.cap_usd = 10000.0
     assert run_scan(eng) is None
+
+
+def test_execute_consumes_typed_order_results():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert buy.position == 0.5
+    assert sell.position == -0.5
+    assert eng.trades == 1
+    approx(eng.total_fill_edge, 0.1)
+
+
+def test_execute_converts_raised_leg_exception_to_failure():
+    eng = make_engine()
+    buy = ExecutingVenue("hedge", "RH", RuntimeError("send exploded"))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["status"] == "send-failed/filled"
+
+
+def test_execute_does_not_count_mismatched_terminal_fills_as_success():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH", OrderResult(status="canceled", filled_base=0.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["ok"] is False
+
+
+def test_execute_does_not_count_two_zero_fills_as_success():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH", OrderResult(status="canceled", filled_base=0.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY", OrderResult(status="canceled", filled_base=0.0))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["ok"] is False
+
+
+def test_shutdown_drain_waits_for_execution_without_cancelling_it():
+    async def go():
+        eng = make_engine()
+
+        async def settle_later():
+            await asyncio.sleep(0.03)
+            return "settled"
+
+        task = asyncio.create_task(settle_later())
+        eng._exec_tasks.add(task)
+        task.add_done_callback(eng._exec_tasks.discard)
+
+        await eng._drain_executions(poll_sec=0.005)
+
+        assert task.done()
+        assert task.cancelled() is False
+        assert task.result() == "settled"
+
+    asyncio.run(go())
+
+
+def test_shutdown_drain_reconciles_an_unknown_inflight_outcome():
+    async def go():
+        eng = make_engine()
+        eng.RECONCILE_GRACE_SEC = 0.0
+        reconciles = []
+
+        async def reconcile(*, hedge, strict=False):
+            reconciles.append((hedge, strict))
+
+        eng._reconcile_positions = reconcile
+        eng._shutdown_reconcile_required = True
+
+        await eng._drain_executions(poll_sec=0.005)
+
+        assert reconciles == [(True, True)]
+        assert eng._shutdown_reconcile_required is False
+
+    asyncio.run(go())
+
+
+def test_reconcile_skipped_during_grace_is_rescheduled():
+    async def go():
+        eng = make_engine()
+        eng.RECONCILE_GRACE_SEC = 0.03
+        eng.entropy.last_traded_ts = time.time()
+        eng.hedge.last_traded_ts = time.time()
+
+        await eng._reconcile_positions(hedge=False)
+
+        assert eng._reconcile_evt.is_set() is False
+        await asyncio.sleep(0.05)
+        assert eng._reconcile_evt.is_set() is True
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":

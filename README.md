@@ -111,6 +111,10 @@ pip install -r requirements-live.txt
 python3 main.py --symbol SNDK --hedge lighter-rh
 ```
 
+The direct runtime and signing dependencies are pinned, including Lighter at
+a specific Git commit. Upgrade them deliberately and repeat the full test and
+record-only checks before deploying the new environment.
+
 Running without `--record-only` sends real orders immediately once both
 feeds are fresh and the band is crossed.
 
@@ -147,8 +151,8 @@ recent data; premiums drift, so re-run it regularly and update
 
 ## Configuration
 
-Strategy lives in `config.yaml` (validated — unknown keys are startup
-errors), credentials in `.env`, and the markets on the command line
+Strategy lives in `config.yaml` (validated — unknown keys, non-finite values,
+and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.env`, and the markets on the command line
 (`--symbol`, `--hedge`). Full commented reference:
 [config.example.yaml](config.example.yaml). The essentials:
 
@@ -185,8 +189,10 @@ errors), credentials in `.env`, and the markets on the command line
 
 - Both legs are **taker** orders sent concurrently: Lighter market orders
   with average-price protection settling on the authenticated account
-  websocket; Hyperliquid IOC limits settling synchronously (with
-  orderStatus polling for unknown outcomes).
+  websocket; Hyperliquid HIP-3 IOC limits settle synchronously and omit
+  `cloid` because HIP-3 currently rejects it. A timeout/5xx stays explicitly
+  unresolved and triggers position reconciliation; the order is never
+  blindly resent.
 - A **persistence gate** (`premium_persist_sec`) arms each direction and only
   fires if the edge survives — one-tick phantoms are filtered.
 - **Inventory ladder**: past `floor_frac` of a venue's cap, adding to the
@@ -198,6 +204,10 @@ errors), credentials in `.env`, and the markets on the command line
   unreachable venue (e.g. exchange maintenance) pauses trading and is probed
   every `venue_probe_sec` until it recovers; `max_consecutive_errors`
   execution pathologies halt the engine entirely.
+- **Safe shutdown**: after a stop signal, no new opportunity is started and
+  the process keeps waiting for every already-submitted two-leg execution to
+  settle before closing exchange connections. A long wait is logged as
+  critical rather than cancelling the in-flight order tasks.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 
@@ -207,15 +217,23 @@ errors), credentials in `.env`, and the markets on the command line
 main.py                  entry point (--record-only, or live by default)
 entropy_arb/config.py    YAML + .env contract, validation
 entropy_arb/book.py      order books + fee-aware crossing/sizing math
+entropy_arb/models.py    normalized order-result domain values
 entropy_arb/feeds.py     official HL ws + zkLighter ws book feeds
 entropy_arb/venue_hl.py  Hyperliquid dex adapter (Entropy, tradexyz)
 entropy_arb/venue_lighter.py  zkLighter adapter (mainnet, Robinhood chain)
+entropy_arb/venues/base.py  common venue adapter protocol
+entropy_arb/venues/registry.py  explicit adapter factory registry
 entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute orderbook bars
 tools/analyze.py         minutes.csv -> suggested thresholds
 tests/                   python3 -m pytest tests/
 ```
+
+The current CLI still runs exactly two legs. Venue construction now goes
+through a common protocol and an explicit registry; this is the compatibility
+foundation for the staged multi-hedge design in
+`docs/superpowers/specs/2026-08-27-multi-hedge-arbitrage-design.md`.
 
 ## Known risks
 
