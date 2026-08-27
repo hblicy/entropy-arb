@@ -155,12 +155,7 @@ class Engine:
                     "请用 --record-only")
             self.entropy.init_signer()
             self.hedge.init_signer()
-            if self.hedge.kind == "hl":
-                self.entropy.share_nonces_with(self.hedge)
-        if (self.hedge.kind == "hl"
-                and self.entropy._query_address()
-                and self.entropy._query_address() == self.hedge._query_address()):
-            self.hedge.include_core_equity = False  # shared account: count once
+        self.entropy.configure_peer(self.hedge)
 
         self._step = 10 ** -min(self.entropy.size_decimals,
                                 self.hedge.size_decimals)

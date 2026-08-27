@@ -222,6 +222,10 @@ class LighterVenue:
         self.signer = signer
         log.info("[%s] signer ready (account %d)", self.name, c.account_index)
 
+    def configure_peer(self, other) -> None:
+        """Lighter deployments do not share Hyperliquid account state."""
+        return
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         tasks = [asyncio.create_task(
             LighterBookFeed(self.name, self.profile.ws_url, self.market_id,

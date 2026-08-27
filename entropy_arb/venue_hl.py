@@ -144,6 +144,15 @@ class HLVenue:
             log.info("[%s]/[%s] same signer — shared nonce allocator",
                      self.name, other.name)
 
+    def configure_peer(self, other) -> None:
+        """Configure shared Hyperliquid signer and account accounting."""
+        if not isinstance(other, HLVenue):
+            return
+        self.share_nonces_with(other)
+        address = self._query_address()
+        if address and address == other._query_address():
+            other.include_core_equity = False
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         return [asyncio.create_task(
             HLBookFeed(self.name, self.ws_url, self.coin, self.book,
