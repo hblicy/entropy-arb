@@ -133,12 +133,14 @@ def _usd(x: Optional[float], signed: bool = True, decimals: int = 4) -> Text:
 
 class Dashboard:
     def __init__(self, eng, log_buffer: BufferLogHandler, log_file: str,
-                 force_terminal: bool = False, lang: str = "en") -> None:
+                 force_terminal: bool = False, lang: str = "en",
+                 console: Optional[Console] = None) -> None:
         self.eng = eng
         self.log_buffer = log_buffer
         self.log_file = log_file
         self.lang = lang
-        self.console = Console(force_terminal=True if force_terminal else None)
+        self.console = console if console is not None else Console(
+            force_terminal=True if force_terminal else None)
 
     def _t(self, s: str, /, **kw) -> str:
         """Translate a UI string (English key -> current language), then
