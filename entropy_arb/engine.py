@@ -68,6 +68,7 @@ class Engine:
         self.start_ts = time.time()
         self._last_skiplog = 0.0
         self._poke_due: Optional[float] = None
+        self._reconcile_due: Optional[float] = None
         # per-direction persistence arming: direction key -> first-seen ts
         self._armed: Dict[str, Optional[float]] = {"sell_entropy": None,
                                                    "buy_entropy": None}
@@ -203,11 +204,7 @@ class Engine:
                                              name="reconcile"))
 
         await self.stop.wait()
-        if self._exec_tasks:  # let in-flight executions settle, never cancel
-            log.info("waiting for %d in-flight execution(s) to settle",
-                     len(self._exec_tasks))
-            await asyncio.wait(self._exec_tasks,
-                               timeout=cfg.settle_timeout_sec + 2.0)
+        await self._drain_executions()
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -215,7 +212,20 @@ class Engine:
             await v.close()
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
-                 self.total_exp_edge, self.total_fill_edge)
+                  self.total_exp_edge, self.total_fill_edge)
+
+    async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
+        """Wait for every submitted execution; shutdown never abandons a leg."""
+        interval = poll_sec or max(self.cfg.settle_timeout_sec + 2.0, 5.0)
+        while self._exec_tasks:
+            pending = tuple(self._exec_tasks)
+            log.info("waiting for %d in-flight execution(s) to settle",
+                     len(pending))
+            _, still_pending = await asyncio.wait(pending, timeout=interval)
+            if still_pending:
+                log.critical(
+                    "shutdown still waiting for %d in-flight execution(s); "
+                    "orders are not being cancelled", len(still_pending))
 
     # --------------------------------------------------------------- signals
 
@@ -479,7 +489,9 @@ class Engine:
                 log.warning("[%s] margin rejection — collateral exhausted, "
                             "pausing venue", venue.name)
                 self._mark_limited(venue)
-        sent_ok = not hard_err and not unresolved
+        fills_match = (matched > 0
+                       and abs(bfill - sfill) <= cfg.net_tolerance_base)
+        sent_ok = not hard_err and not unresolved and fills_match
         if sent_ok:
             self.consec_errors = 0
         elif not rate_limited:
@@ -585,17 +597,39 @@ class Engine:
     # phantom hedge oscillations. Grace-guard + venue lock prevent that.
     RECONCILE_GRACE_SEC = 5.0
 
+    def _schedule_reconcile(self, delay: float) -> None:
+        loop = asyncio.get_running_loop()
+        due = loop.time() + max(delay, 0.01)
+        if (self._reconcile_due is not None
+                and self._reconcile_due <= due + 0.02):
+            return
+
+        def _fire() -> None:
+            self._reconcile_due = None
+            if not self.stop.is_set():
+                self._reconcile_evt.set()
+
+        self._reconcile_due = due
+        loop.call_at(due, _fire)
+
     async def _reconcile_positions(self, hedge: bool,
                                    strict: bool = False) -> None:
         now = time.time()
         vs = []
+        retry_after = None
         for v in self.venues.values():
-            if now - v.last_traded_ts <= self.RECONCILE_GRACE_SEC:
+            age = now - v.last_traded_ts
+            if age <= self.RECONCILE_GRACE_SEC:
+                remaining = self.RECONCILE_GRACE_SEC - age
+                retry_after = remaining if retry_after is None \
+                    else min(retry_after, remaining)
                 continue  # just traded: chain read would be stale
             if v.key in self._venue_down \
                     and now < self._venue_probe_at.get(v.key, 0.0):
                 continue  # down venue: probe only every venue_probe_sec
             vs.append(v)
+        if retry_after is not None:
+            self._schedule_reconcile(retry_after)
         if not vs:
             return
         got = await asyncio.gather(
@@ -610,7 +644,9 @@ class Engine:
     async def _reconcile_venue(self, v, strict: bool) -> None:
         async with self._vlock(v.key):
             now = time.time()
-            if now - v.last_traded_ts <= self.RECONCILE_GRACE_SEC:
+            age = now - v.last_traded_ts
+            if age <= self.RECONCILE_GRACE_SEC:
+                self._schedule_reconcile(self.RECONCILE_GRACE_SEC - age)
                 return  # traded while waiting for the lock
             try:
                 r = await v.fetch_position()

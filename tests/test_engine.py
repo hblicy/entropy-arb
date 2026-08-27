@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -215,6 +216,81 @@ def test_execute_converts_raised_leg_exception_to_failure():
     assert eng.trades == 0
     assert eng.consec_errors == 1
     assert eng.recent_trades[-1]["status"] == "send-failed/filled"
+
+
+def test_execute_does_not_count_mismatched_terminal_fills_as_success():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH", OrderResult(status="canceled", filled_base=0.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=0.5, avg_px=100.2))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    unresolved = asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert unresolved is False
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["ok"] is False
+
+
+def test_execute_does_not_count_two_zero_fills_as_success():
+    eng = make_engine()
+    buy = ExecutingVenue(
+        "hedge", "RH", OrderResult(status="canceled", filled_base=0.0))
+    sell = ExecutingVenue(
+        "entropy", "ENTROPY", OrderResult(status="canceled", filled_base=0.0))
+    buy.set_book(99.9, 100.0)
+    sell.set_book(100.2, 100.3)
+    eng.entropy, eng.hedge = sell, buy
+    eng.venues = {"entropy": sell, "hedge": buy}
+
+    asyncio.run(eng._execute(buy, sell, execution_plan()))
+
+    assert eng.trades == 0
+    assert eng.consec_errors == 1
+    assert eng.recent_trades[-1]["ok"] is False
+
+
+def test_shutdown_drain_waits_for_execution_without_cancelling_it():
+    async def go():
+        eng = make_engine()
+
+        async def settle_later():
+            await asyncio.sleep(0.03)
+            return "settled"
+
+        task = asyncio.create_task(settle_later())
+        eng._exec_tasks.add(task)
+        task.add_done_callback(eng._exec_tasks.discard)
+
+        await eng._drain_executions(poll_sec=0.005)
+
+        assert task.done()
+        assert task.cancelled() is False
+        assert task.result() == "settled"
+
+    asyncio.run(go())
+
+
+def test_reconcile_skipped_during_grace_is_rescheduled():
+    async def go():
+        eng = make_engine()
+        eng.RECONCILE_GRACE_SEC = 0.03
+        eng.entropy.last_traded_ts = time.time()
+        eng.hedge.last_traded_ts = time.time()
+
+        await eng._reconcile_positions(hedge=False)
+
+        assert eng._reconcile_evt.is_set() is False
+        await asyncio.sleep(0.05)
+        assert eng._reconcile_evt.is_set() is True
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":
