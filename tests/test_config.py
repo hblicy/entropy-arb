@@ -16,7 +16,8 @@ NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
 
 
 def write_tmp(text: str) -> str:
-    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    f = tempfile.NamedTemporaryFile(
+        "w", suffix=".yaml", delete=False, encoding="utf-8")
     f.write(text)
     f.close()
     return f.name
@@ -46,6 +47,18 @@ def test_example_config_loads():
     assert cfg.entropy.symbol == "SNDK" and cfg.hedge.symbol == "SNDK"
     assert cfg.recorder_enabled and cfg.recorder_csv
     assert cfg.dashboard and cfg.log_file
+
+
+def test_utf8_config_loads_independently_of_system_locale():
+    cfg = load("""
+# 中文配置注释必须在 Windows 和 Linux 上一致读取
+thresholds:
+  midline_bps: 5.0
+  upper_bps: 4.0
+  lower_bps: 3.0
+""")
+    assert cfg.symbol == "SNDK"
+    assert cfg.midline_bps == 5.0
 
 
 def test_minimal_defaults():
