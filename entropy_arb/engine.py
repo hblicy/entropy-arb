@@ -28,8 +28,8 @@ from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .models import OrderResult
 from .recorder import MinuteRecorder
-from .venue_hl import HLVenue
-from .venue_lighter import LighterVenue
+from .venues.base import VenueAdapter
+from .venues.registry import VenueRuntime, create_venue
 
 log = logging.getLogger("engine")
 
@@ -46,9 +46,9 @@ class Engine:
         self.cfg = cfg
         self.record_only = record_only
         self.session: Optional[aiohttp.ClientSession] = None
-        self.entropy = None
-        self.hedge = None
-        self.venues: Dict[str, object] = {}
+        self.entropy: Optional[VenueAdapter] = None
+        self.hedge: Optional[VenueAdapter] = None
+        self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.markets_ready = False
         self.stop = asyncio.Event()
@@ -131,16 +131,16 @@ class Engine:
         finally:
             await self.session.close()
 
-    def _make_venue(self, vc):
-        if vc.kind == "lighter":
-            return LighterVenue(vc, self.session, self.cfg.settle_timeout_sec)
-        return HLVenue(vc, self.cfg.hl_api_url, self.cfg.hl_ws_url,
-                       self.session, self.cfg.settle_timeout_sec)
-
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        self.entropy = self._make_venue(cfg.entropy)
-        self.hedge = self._make_venue(cfg.hedge)
+        runtime = VenueRuntime(
+            session=self.session,
+            hl_api_url=cfg.hl_api_url,
+            hl_ws_url=cfg.hl_ws_url,
+            settle_timeout_sec=cfg.settle_timeout_sec,
+        )
+        self.entropy = create_venue(cfg.entropy, runtime)
+        self.hedge = create_venue(cfg.hedge, runtime)
         self.venues = {"entropy": self.entropy, "hedge": self.hedge}
         await asyncio.gather(self.entropy.load_market(), self.hedge.load_market())
         self.markets_ready = True
