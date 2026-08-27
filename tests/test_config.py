@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.config import ConfigError, load_config  # noqa: E402
@@ -113,6 +115,36 @@ def test_nonpositive_band():
     expect_error("thresholds:\n"
                  "  midline_bps: 5\n  upper_bps: 0\n  lower_bps: 3\n",
                  "must be > 0")
+
+
+@pytest.mark.parametrize(("section", "needle"), [
+    ("entropy:\n  taker_fee_bps: -1\n", "entropy.taker_fee_bps"),
+    ("entropy:\n  max_position_usd: 0\n", "entropy.max_position_usd"),
+    ("hedge:\n  max_orders_per_min: 0\n", "hedge.max_orders_per_min"),
+    ("sizing:\n  max_order_notional_usd: 0\n", "sizing.max_order_notional_usd"),
+    ("sizing:\n  max_order_notional_usd: 10\n"
+     "  min_order_notional_usd: 11\n", "min_order_notional_usd"),
+    ("inventory:\n  scale_bps: -1\n", "inventory.scale_bps"),
+    ("inventory:\n  floor_frac: 1\n", "inventory.floor_frac"),
+    ("execution:\n  premium_persist_sec: -1\n", "premium_persist_sec"),
+    ("execution:\n  settle_timeout_sec: 0\n", "settle_timeout_sec"),
+    ("execution:\n  leg_slippage_bps: -1\n", "leg_slippage_bps"),
+    ("execution:\n  net_tolerance_base: -1\n", "net_tolerance_base"),
+    ("execution:\n  max_consecutive_errors: 0\n", "max_consecutive_errors"),
+    ("execution:\n  staleness_sec: 0\n", "staleness_sec"),
+    ("execution:\n  reconcile_sec: 0\n", "reconcile_sec"),
+    ("execution:\n  venue_probe_sec: 0\n", "venue_probe_sec"),
+    ("execution:\n  http_keepalive_sec: -1\n", "http_keepalive_sec"),
+    ("logging:\n  status_interval_sec: 0\n", "status_interval_sec"),
+    ("logging:\n  level: LOUD\n", "logging.level"),
+])
+def test_invalid_runtime_boundaries_are_rejected(section, needle):
+    expect_error(MINIMAL + section, needle)
+
+
+def test_nonfinite_numbers_are_rejected():
+    expect_error(MINIMAL + "sizing:\n  max_order_notional_usd: .nan\n",
+                 "finite")
 
 
 if __name__ == "__main__":

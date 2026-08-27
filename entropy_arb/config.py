@@ -21,6 +21,7 @@ Threshold model (fixed numbers the user derives from recorded minute data):
 """
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -280,13 +281,16 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             raise ConfigError(f"'thresholds.{k}' is required — derive it from "
                               f"recorded minute data / 必须填写，请用采集的分钟"
                               f"数据计算后填入")
+    midline = float(thr["midline_bps"])
     upper, lower = float(thr["upper_bps"]), float(thr["lower_bps"])
+    if not all(math.isfinite(v) for v in (midline, upper, lower)):
+        raise ConfigError("threshold values must be finite numbers")
     if upper <= 0 or lower <= 0:
         raise ConfigError("thresholds.upper_bps and lower_bps must be > 0 "
                           "(the round trip nets upper+lower bps after fees)")
 
     take_fraction = float(_get(raw, "sizing", "take_fraction", 0.5))
-    if not 0.0 < take_fraction <= 1.0:
+    if not math.isfinite(take_fraction) or not 0.0 < take_fraction <= 1.0:
         raise ConfigError("sizing.take_fraction must be in (0, 1] — taking "
                           "more than the profitable depth loses money on the "
                           "tail / 必须在 (0, 1] 之间")
@@ -334,12 +338,12 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                                        _env_s("LIGHTER_API_PRIVATE_KEY")),
         )
 
-    return Config(
+    cfg = Config(
         symbol=symbol,
         hedge_venue=hedge_venue,
         entropy=entropy,
         hedge=hedge,
-        midline_bps=float(thr["midline_bps"]),
+        midline_bps=midline,
         upper_bps=upper,
         lower_bps=lower,
         take_fraction=take_fraction,
@@ -367,3 +371,50 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         dashboard=bool(_get(raw, "logging", "dashboard", True)),
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
     )
+
+    nonnegative = (
+        ("entropy.taker_fee_bps", cfg.entropy.fee_bps),
+        ("hedge.taker_fee_bps", cfg.hedge.fee_bps),
+        ("inventory.scale_bps", cfg.inventory_scale_bps),
+        ("execution.premium_persist_sec", cfg.premium_persist_sec),
+        ("execution.cooldown_sec", cfg.cooldown_sec),
+        ("execution.leg_slippage_bps", cfg.leg_slippage_bps),
+        ("execution.hedge_slippage_bps", cfg.hedge_slippage_bps),
+        ("execution.net_tolerance_base", cfg.net_tolerance_base),
+        ("execution.rate_limit_pause_sec", cfg.rate_limit_pause_sec),
+        ("execution.http_keepalive_sec", cfg.http_keepalive_sec),
+    )
+    positive = (
+        ("entropy.max_position_usd", cfg.entropy.cap_usd),
+        ("hedge.max_position_usd", cfg.hedge.cap_usd),
+        ("entropy.max_orders_per_min", cfg.entropy.orders_per_min),
+        ("hedge.max_orders_per_min", cfg.hedge.orders_per_min),
+        ("sizing.max_order_notional_usd", cfg.max_order_notional),
+        ("sizing.min_order_notional_usd", cfg.min_order_notional),
+        ("execution.settle_timeout_sec", cfg.settle_timeout_sec),
+        ("execution.max_consecutive_errors", cfg.max_consecutive_errors),
+        ("execution.staleness_sec", cfg.staleness_sec),
+        ("execution.reconcile_sec", cfg.reconcile_sec),
+        ("execution.venue_probe_sec", cfg.venue_probe_sec),
+        ("logging.status_interval_sec", cfg.status_interval_sec),
+    )
+    for name, value in nonnegative:
+        if not math.isfinite(value):
+            raise ConfigError(f"'{name}' must be finite, got {value!r}")
+        if value < 0:
+            raise ConfigError(f"'{name}' must be >= 0, got {value!r}")
+    for name, value in positive:
+        if not math.isfinite(value):
+            raise ConfigError(f"'{name}' must be finite, got {value!r}")
+        if value <= 0:
+            raise ConfigError(f"'{name}' must be > 0, got {value!r}")
+    if cfg.min_order_notional > cfg.max_order_notional:
+        raise ConfigError("'sizing.min_order_notional_usd' must be <= "
+                          "'sizing.max_order_notional_usd'")
+    if not math.isfinite(cfg.inventory_floor_frac) \
+            or not 0 <= cfg.inventory_floor_frac < 1:
+        raise ConfigError("'inventory.floor_frac' must be in [0, 1)")
+    if cfg.log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+        raise ConfigError("'logging.level' must be one of CRITICAL, ERROR, "
+                          "WARNING, INFO, DEBUG")
+    return cfg
