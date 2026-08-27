@@ -6,9 +6,9 @@ OFFICIAL websocket (see feeds.HLBookFeed). Trading lazily imports the
 official `hyperliquid-python-sdk` signing helpers + eth_account —
 --record-only data collection needs neither.
 
-IOC limit orders settle synchronously in the /exchange response; unknown
-outcomes (timeout/5xx) fall back to orderStatus-by-cloid polling inside
-send_taker(), which returns the same normalized OrderResult as Lighter.
+IOC limit orders settle synchronously in the /exchange response. HIP-3 orders
+omit cloid because the exchange currently rejects that combination; unknown
+outcomes (timeout/5xx) are returned unresolved for position reconciliation.
 """
 from __future__ import annotations
 
@@ -86,7 +86,6 @@ class HLVenue:
         self.size_decimals = 0
         self.min_base = 0.0
         self.min_quote = 10.0
-        self._cloid = int(time.time() * 1000)
         self._signing = None      # lazy hyperliquid-sdk signing module
 
     async def _info(self, payload: dict):
@@ -183,20 +182,14 @@ class HLVenue:
 
     # ------------------------------------------------------------- execution
 
-    def _next_cloid(self):
-        from hyperliquid.utils.types import Cloid
-        self._cloid += 1
-        return Cloid.from_int(self._cloid)
-
     async def send_taker(self, *, is_buy: bool, qty: float, limit_px: float,
                          reduce_only: bool = False) -> OrderResult:
         assert self.account is not None and self.asset_id >= 0
         s = self._signing
-        cloid = self._next_cloid()
         order_req = {"coin": self.coin, "is_buy": is_buy, "sz": round(qty, 8),
                      "limit_px": limit_px,
                      "order_type": {"limit": {"tif": "Ioc"}},
-                     "reduce_only": reduce_only, "cloid": cloid}
+                     "reduce_only": reduce_only}
         try:
             wire = s.order_request_to_order_wire(order_req, self.asset_id)
             action = s.order_wires_to_order_action([wire])
@@ -211,32 +204,9 @@ class HLVenue:
         body, err, unresolved = await self._post_exchange(payload)
         if err is not None:
             return OrderResult.send_failed(err)
-        if not unresolved:
-            res = self._parse(body)
-            if not res.unresolved:
-                return res
-        # unknown outcome: poll orderStatus by cloid until the deadline
-        deadline = time.time() + self.settle_timeout
-        while time.time() < deadline:
-            try:
-                st = await self._info({"type": "orderStatus",
-                                       "user": self.account.query_address,
-                                       "oid": cloid.to_raw()})
-            except Exception:
-                st = None
-            if st and st.get("status") == "order":
-                o = st.get("order") or {}
-                status = str(o.get("status", ""))
-                inner = o.get("order") or {}
-                try:
-                    filled = max(float(inner.get("origSz") or 0)
-                                 - float(inner.get("sz") or 0), 0.0)
-                except (TypeError, ValueError):
-                    filled = 0.0
-                if status != "open":
-                    return OrderResult(status=status, filled_base=filled)
-            await asyncio.sleep(0.5)
-        return OrderResult.unknown("timeout")
+        if unresolved:
+            return OrderResult.unknown("exchange response unknown")
+        return self._parse(body)
 
     async def _post_exchange(self, payload: dict):
         try:

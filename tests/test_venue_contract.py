@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
@@ -71,3 +72,77 @@ def test_hl_peer_setup_shares_nonce_and_deduplicates_equity():
 
     assert hedge.account.nonces is anchor.account.nonces
     assert hedge.include_core_equity is False
+
+
+class FakeSigning:
+    def __init__(self):
+        self.order_request = None
+
+    def order_request_to_order_wire(self, request, _asset_id):
+        self.order_request = request
+        return {"wire": "order"}
+
+    @staticmethod
+    def order_wires_to_order_action(wires):
+        return {"orders": wires}
+
+    @staticmethod
+    def sign_l1_action(*_args):
+        return {"signature": "test"}
+
+
+def live_hl_venue(settle_timeout=0.01):
+    cfg = make_cfg("tradexyz")
+    venue = HLVenue(
+        cfg.entropy, "https://api", "wss://ws", object(), settle_timeout)
+    venue.coin = "io:SNDK"
+    venue.asset_id = 110000
+    venue._signing = FakeSigning()
+    venue.account = SimpleNamespace(
+        wallet=object(), query_address="0xaccount", is_mainnet=True,
+        nonces=SimpleNamespace(next=lambda: 123))
+    venue._next_cloid = lambda: SimpleNamespace(to_raw=lambda: "0xtest")
+    return venue
+
+
+def test_hip3_order_request_omits_cloid():
+    async def go():
+        venue = live_hl_venue()
+
+        async def post_exchange(_payload):
+            return ({"status": "ok", "response": {"data": {"statuses": [
+                {"filled": {"totalSz": "0.5", "avgPx": "100"}}
+            ]}}}, None, False)
+
+        venue._post_exchange = post_exchange
+        result = await venue.send_taker(
+            is_buy=True, qty=0.5, limit_px=100.0)
+
+        assert result.status == "filled"
+        assert "cloid" not in venue._signing.order_request
+
+    asyncio.run(go())
+
+
+def test_hip3_unknown_response_does_not_poll_by_cloid():
+    async def go():
+        venue = live_hl_venue()
+        info_calls = 0
+
+        async def post_exchange(_payload):
+            return None, None, True
+
+        async def info(_payload):
+            nonlocal info_calls
+            info_calls += 1
+            return None
+
+        venue._post_exchange = post_exchange
+        venue._info = info
+        result = await venue.send_taker(
+            is_buy=False, qty=0.5, limit_px=100.0)
+
+        assert result.unresolved is True
+        assert info_calls == 0
+
+    asyncio.run(go())
