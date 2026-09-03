@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .book import OrderBook
+from .book import OrderBook, plan_arb
 
 log = logging.getLogger("recorder")
 
@@ -268,16 +268,59 @@ class SignalRecorder:
         top_edge = ""
         if buy_ask is not None and sell_bid is not None:
             top_edge = (sell_bid / buy_ask - 1.0) * 1e4
-        return {
+        invalid = self._books_status(now)
+        plan = None
+        if invalid is None:
+            plan, plan_status = plan_arb(
+                buy.book, sell.book,
+                threshold_bps=threshold,
+                buy_fee_bps=buy.fee_bps,
+                sell_fee_bps=sell.fee_bps,
+                take_fraction=self.take_fraction,
+                cap_notional=self.max_order_notional,
+                min_base=self.min_base,
+                min_notional=self.min_notional,
+                size_step=self.size_step,
+            )
+        else:
+            plan_status = invalid
+        row = {
             "entropy_bid": "" if e_bid is None else e_bid,
             "entropy_ask": "" if e_ask is None else e_ask,
             "hedge_bid": "" if h_bid is None else h_bid,
             "hedge_ask": "" if h_ask is None else h_ask,
+            "entropy_book_age_ms": (
+                max((now - e_book.last_update_ts) * 1000.0, 0.0)
+                if e_book.last_update_ts else ""
+            ),
+            "hedge_book_age_ms": (
+                max((now - h_book.last_update_ts) * 1000.0, 0.0)
+                if h_book.last_update_ts else ""
+            ),
+            "book_update_skew_ms": (
+                abs(e_book.last_update_ts - h_book.last_update_ts) * 1000.0
+                if e_book.last_update_ts and h_book.last_update_ts else ""
+            ),
             "top_edge_bps": top_edge,
             "net_threshold_bps": threshold,
             "total_fee_bps": buy.fee_bps + sell.fee_bps,
+            "plan_status": plan_status,
             "leg_slippage_limit_bps": self.leg_slippage_bps,
         }
+        if plan is not None:
+            row.update({
+                "qty": plan.qty,
+                "buy_limit": plan.buy_limit,
+                "sell_limit": plan.sell_limit,
+                "planned_notional_usd": plan.buy_notional,
+                "crossable_notional_usd": plan.q_max_notional,
+                "buy_depth_slippage_bps": (
+                    plan.buy_limit / buy_ask - 1.0) * 1e4,
+                "sell_depth_slippage_bps": (
+                    sell_bid / plan.sell_limit - 1.0) * 1e4,
+                "expected_edge_usd": plan.exp_edge_usd,
+            })
+        return row
 
     def _qualifies(self, direction: str, now: float) -> tuple[bool, str]:
         invalid = self._books_status(now)

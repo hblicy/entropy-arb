@@ -7,9 +7,11 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.book import OrderBook  # noqa: E402
+from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
 from entropy_arb.recorder import (  # noqa: E402
     HEADER,
     MinuteRecorder,
@@ -33,6 +35,15 @@ def set_signal_book(venue, *, bid, ask, ts):
     venue.book.apply_hl([
         [{"px": str(bid), "sz": "100"}],
         [{"px": str(ask), "sz": "100"}],
+    ])
+    venue.book.last_update_ts = ts
+    venue.book.alive_ts = ts
+
+
+def set_signal_levels(venue, *, bids, asks, ts):
+    venue.book.apply_hl([
+        [{"px": str(px), "sz": str(size)} for px, size in bids],
+        [{"px": str(px), "sz": str(size)} for px, size in asks],
     ])
     venue.book.last_update_ts = ts
     venue.book.alive_ts = ts
@@ -179,6 +190,112 @@ def test_signal_directions_have_independent_lifecycles():
     assert sell_id.startswith("sell_entropy-")
     assert buy_id.startswith("buy_entropy-")
     assert sell_id != buy_id
+
+
+def test_signal_metrics_use_plan_and_book_update_times():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    entropy = SignalVenue("entropy", fee_bps=0.3)
+    hedge = SignalVenue("hedge", fee_bps=0.6)
+    set_signal_levels(
+        entropy,
+        bids=[(100.20, 0.5), (100.15, 1.5)],
+        asks=[(100.21, 2.0)],
+        ts=2000.8,
+    )
+    set_signal_levels(
+        hedge,
+        bids=[(99.99, 2.0)],
+        asks=[(100.00, 0.5), (100.05, 1.5)],
+        ts=2000.5,
+    )
+    entropy.book.alive_ts = hedge.book.alive_ts = 2000.99
+    rec = SignalRecorder(
+        path, entropy, hedge,
+        midline_bps=0.0, upper_bps=5.0, lower_bps=5.0,
+        take_fraction=1.0, max_order_notional=150.0,
+        min_base=0.0, min_notional=0.0, size_step=0.001,
+        leg_slippage_bps=20.0, staleness_sec=3.0,
+    )
+
+    rec.observe(now=2001.0)
+    rec.close(now=2001.0)
+
+    row = read_signal_rows(path)[0]
+    expected_plan, reason = plan_arb(
+        hedge.book, entropy.book,
+        threshold_bps=5.0,
+        buy_fee_bps=hedge.fee_bps,
+        sell_fee_bps=entropy.fee_bps,
+        take_fraction=1.0,
+        cap_notional=150.0,
+        min_base=0.0,
+        min_notional=0.0,
+        size_step=0.001,
+    )
+    assert reason == "ok" and expected_plan is not None
+    assert float(row["entropy_book_age_ms"]) == pytest.approx(200.0)
+    assert float(row["hedge_book_age_ms"]) == pytest.approx(500.0)
+    assert float(row["book_update_skew_ms"]) == pytest.approx(300.0)
+    assert float(row["top_edge_bps"]) == pytest.approx(
+        (100.20 / 100.00 - 1.0) * 1e4
+    )
+    assert float(row["net_threshold_bps"]) == 5.0
+    assert float(row["total_fee_bps"]) == pytest.approx(0.9)
+    assert row["plan_status"] == "ok"
+    assert float(row["qty"]) == pytest.approx(expected_plan.qty)
+    assert float(row["buy_limit"]) == pytest.approx(expected_plan.buy_limit)
+    assert float(row["sell_limit"]) == pytest.approx(expected_plan.sell_limit)
+    assert float(row["planned_notional_usd"]) == pytest.approx(
+        expected_plan.buy_notional
+    )
+    assert float(row["crossable_notional_usd"]) == pytest.approx(
+        expected_plan.q_max_notional
+    )
+    assert float(row["buy_depth_slippage_bps"]) == pytest.approx(
+        (expected_plan.buy_limit / 100.00 - 1.0) * 1e4
+    )
+    assert float(row["sell_depth_slippage_bps"]) == pytest.approx(
+        (100.20 / expected_plan.sell_limit - 1.0) * 1e4
+    )
+    assert float(row["leg_slippage_limit_bps"]) == 20.0
+    assert float(row["expected_edge_usd"]) == pytest.approx(
+        expected_plan.exp_edge_usd
+    )
+
+
+def test_signal_below_minimum_plan_is_still_recorded():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    entropy = SignalVenue("entropy")
+    hedge = SignalVenue("hedge")
+    set_signal_book(entropy, bid=100.20, ask=100.21, ts=3000.0)
+    set_signal_levels(
+        hedge,
+        bids=[(99.99, 0.1)],
+        asks=[(100.00, 0.1)],
+        ts=3000.0,
+    )
+    rec = SignalRecorder(
+        path, entropy, hedge,
+        midline_bps=0.0, upper_bps=5.0, lower_bps=5.0,
+        take_fraction=1.0, max_order_notional=100_000.0,
+        min_base=0.0, min_notional=100.0, size_step=0.001,
+        leg_slippage_bps=20.0, staleness_sec=3.0,
+    )
+
+    rec.observe(now=3000.0)
+    rec.close(now=3000.0)
+
+    row = read_signal_rows(path)[0]
+    assert row["event"] == "start"
+    assert row["plan_status"] == "below_min_notional"
+    for field in (
+        "qty", "buy_limit", "sell_limit", "planned_notional_usd",
+        "crossable_notional_usd", "buy_depth_slippage_bps",
+        "sell_depth_slippage_bps", "expected_edge_usd",
+    ):
+        assert row[field] == ""
+    assert float(row["top_edge_bps"]) > 5.0
+    assert row["entropy_bid"] and row["hedge_ask"]
 
 
 if __name__ == "__main__":
