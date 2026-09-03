@@ -202,10 +202,24 @@ class MinuteRecorder:
 
     def close(self) -> None:
         """Flush the partial minute and close the file (call on shutdown)."""
-        self._flush_agg()
-        if self._fh is not None:
-            self._fh.close()
+        primary_error = None
+        try:
+            self._flush_agg()
+        except Exception as exc:
+            primary_error = exc
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            if primary_error is None:
+                raise
+            log.exception(
+                "recorder file also failed while closing; preserving the "
+                "flush error")
+        finally:
             self._fh = self._writer = None
+        if primary_error is not None:
+            raise primary_error
 
     async def run(self, stop: asyncio.Event,
                   fail_fast: bool = False) -> None:

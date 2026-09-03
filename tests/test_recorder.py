@@ -185,6 +185,43 @@ def test_minute_rotation_preserves_existing_archive():
         assert fh.read() == "previous,header\n1,2\n"
 
 
+def test_minute_flush_failure_still_closes_file():
+    class AlwaysFailFlushBuffer(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.fail_flush = False
+            self.close_called = False
+
+        def flush(self):
+            if self.fail_flush:
+                raise OSError("persistent flush failure")
+            return super().flush()
+
+        def close(self):
+            self.close_called = True
+            return super().close()
+
+    entropy, hedge = OrderBook(), OrderBook()
+    set_book(entropy, 100.0, 100.02)
+    set_book(hedge, 100.0, 100.02)
+    rec = MinuteRecorder(
+        os.path.join(tempfile.mkdtemp(), "minutes.csv"),
+        entropy, hedge, staleness_sec=1e9)
+    rec.sample(1_700_000_000.0)
+    stream = AlwaysFailFlushBuffer()
+    rec._fh = stream
+    rec._writer = csv.writer(stream)
+    stream.fail_flush = True
+
+    with pytest.raises(OSError, match="persistent flush failure"):
+        rec.close()
+
+    assert stream.close_called
+    assert stream.closed
+    assert rec._fh is None
+    assert rec._writer is None
+
+
 def test_signal_lifecycle_writes_start_sample_and_end():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, _ = make_signal_recorder(path)
