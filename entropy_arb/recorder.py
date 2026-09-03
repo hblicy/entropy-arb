@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -43,6 +44,25 @@ HEADER = ["minute_ts", "time_utc",
           "premium_close_bps", "premium_mean_bps", "premium_std_bps",
           "sell_edge_mean_bps", "sell_edge_max_bps",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
+
+SIGNAL_HEADER = [
+    "ts_ms", "time_utc", "event_id", "event", "direction",
+    "elapsed_ms", "end_reason", "entropy_bid", "entropy_ask",
+    "hedge_bid", "hedge_ask", "entropy_book_age_ms",
+    "hedge_book_age_ms", "book_update_skew_ms", "top_edge_bps",
+    "net_threshold_bps", "total_fee_bps", "plan_status", "qty",
+    "buy_limit", "sell_limit", "planned_notional_usd",
+    "crossable_notional_usd", "buy_depth_slippage_bps",
+    "sell_depth_slippage_bps", "leg_slippage_limit_bps",
+    "expected_edge_usd",
+]
+
+
+@dataclass
+class _SignalState:
+    event_id: str
+    started_at: float
+    last_written_at: float
 
 
 class _MinuteAgg:
@@ -180,3 +200,148 @@ class MinuteRecorder:
             self.close()
             log.info("recorder stopped — %d minute row(s) written to %s",
                      self.rows_written, self.path)
+
+
+class SignalRecorder:
+    """Record fee-aware signal lifecycles without placing orders."""
+
+    def __init__(self, path: str, entropy, hedge, *, midline_bps: float,
+                 upper_bps: float, lower_bps: float, take_fraction: float,
+                 max_order_notional: float, min_base: float,
+                 min_notional: float, size_step: float,
+                 leg_slippage_bps: float, staleness_sec: float,
+                 sample_sec: float = 1.0) -> None:
+        self.path = path
+        self.entropy = entropy
+        self.hedge = hedge
+        self.midline_bps = midline_bps
+        self.upper_bps = upper_bps
+        self.lower_bps = lower_bps
+        self.take_fraction = take_fraction
+        self.max_order_notional = max_order_notional
+        self.min_base = min_base
+        self.min_notional = min_notional
+        self.size_step = size_step
+        self.leg_slippage_bps = leg_slippage_bps
+        self.staleness_sec = staleness_sec
+        self.sample_sec = sample_sec
+        self.rows_written = 0
+        self._states = {"sell_entropy": None, "buy_entropy": None}
+        self._fh = None
+        self._writer = None
+        self._closed = False
+
+    def _open(self) -> None:
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        self._fh = open(self.path, "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=SIGNAL_HEADER)
+        if new:
+            self._writer.writeheader()
+            self._fh.flush()
+
+    def _books_status(self, now: float) -> Optional[str]:
+        books = (self.entropy.book, self.hedge.book)
+        if any(book.best_bid() is None or book.best_ask() is None
+               for book in books):
+            return "empty_book"
+        if any(now - book.last_update_ts > self.staleness_sec
+               for book in books):
+            return "stale_book"
+        return None
+
+    def _direction(self, direction: str):
+        if direction == "sell_entropy":
+            return (self.hedge, self.entropy,
+                    self.midline_bps + self.upper_bps)
+        return (self.entropy, self.hedge,
+                self.lower_bps - self.midline_bps)
+
+    def _snapshot(self, direction: str, now: float) -> dict:
+        buy, sell, threshold = self._direction(direction)
+        e_book, h_book = self.entropy.book, self.hedge.book
+        e_bid, e_ask = e_book.best_bid(), e_book.best_ask()
+        h_bid, h_ask = h_book.best_bid(), h_book.best_ask()
+        buy_ask, sell_bid = buy.book.best_ask(), sell.book.best_bid()
+        top_edge = ""
+        if buy_ask is not None and sell_bid is not None:
+            top_edge = (sell_bid / buy_ask - 1.0) * 1e4
+        return {
+            "entropy_bid": "" if e_bid is None else e_bid,
+            "entropy_ask": "" if e_ask is None else e_ask,
+            "hedge_bid": "" if h_bid is None else h_bid,
+            "hedge_ask": "" if h_ask is None else h_ask,
+            "top_edge_bps": top_edge,
+            "net_threshold_bps": threshold,
+            "total_fee_bps": buy.fee_bps + sell.fee_bps,
+            "leg_slippage_limit_bps": self.leg_slippage_bps,
+        }
+
+    def _qualifies(self, direction: str, now: float) -> tuple[bool, str]:
+        invalid = self._books_status(now)
+        if invalid is not None:
+            return False, invalid
+        buy, sell, threshold_bps = self._direction(direction)
+        buy_ask = buy.book.best_ask()
+        sell_bid = sell.book.best_bid()
+        qualifies = sell_bid * (1.0 - sell.fee_bps / 1e4) >= (
+            buy_ask * (1.0 + buy.fee_bps / 1e4)
+            * (1.0 + threshold_bps / 1e4)
+        )
+        return qualifies, "" if qualifies else "edge_below_threshold"
+
+    def _write(self, event: str, direction: str, state: _SignalState,
+               now: float, end_reason: str = "") -> None:
+        if self._writer is None:
+            self._open()
+        row = {name: "" for name in SIGNAL_HEADER}
+        row.update(self._snapshot(direction, now))
+        row.update({
+            "ts_ms": int(now * 1000),
+            "time_utc": datetime.fromtimestamp(now, tz=timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "event_id": state.event_id,
+            "event": event,
+            "direction": direction,
+            "elapsed_ms": int(round((now - state.started_at) * 1000)),
+            "end_reason": end_reason,
+        })
+        self._writer.writerow(row)
+        self._fh.flush()
+        self.rows_written += 1
+
+    def observe(self, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        for direction in self._states:
+            active = self._states[direction]
+            qualifies, end_reason = self._qualifies(direction, now)
+            if qualifies and active is None:
+                active = _SignalState(
+                    event_id=f"{direction}-{int(now * 1000)}",
+                    started_at=now,
+                    last_written_at=now,
+                )
+                self._states[direction] = active
+                self._write("start", direction, active, now)
+            elif (qualifies and active is not None
+                  and now - active.last_written_at >= self.sample_sec):
+                self._write("sample", direction, active, now)
+                active.last_written_at = now
+            elif not qualifies and active is not None:
+                self._write("end", direction, active, now, end_reason)
+                self._states[direction] = None
+
+    def close(self, now: Optional[float] = None) -> None:
+        if self._closed:
+            return
+        now = time.time() if now is None else now
+        for direction, active in self._states.items():
+            if active is not None:
+                self._write("end", direction, active, now, "shutdown")
+                self._states[direction] = None
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = self._writer = None
+        self._closed = True

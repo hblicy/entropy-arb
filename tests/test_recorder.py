@@ -10,12 +10,52 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from entropy_arb.book import OrderBook  # noqa: E402
-from entropy_arb.recorder import HEADER, MinuteRecorder  # noqa: E402
+from entropy_arb.recorder import (  # noqa: E402
+    HEADER,
+    MinuteRecorder,
+    SignalRecorder,
+)
 
 
 def set_book(book, bid, ask):
     book.apply_hl([[{"px": str(bid), "sz": "10"}],
                    [{"px": str(ask), "sz": "10"}]])
+
+
+class SignalVenue:
+    def __init__(self, name: str, fee_bps: float = 0.0):
+        self.name = name
+        self.book = OrderBook()
+        self.fee_bps = fee_bps
+
+
+def set_signal_book(venue, *, bid, ask, ts):
+    venue.book.apply_hl([
+        [{"px": str(bid), "sz": "100"}],
+        [{"px": str(ask), "sz": "100"}],
+    ])
+    venue.book.last_update_ts = ts
+    venue.book.alive_ts = ts
+
+
+def make_signal_recorder(path):
+    entropy = SignalVenue("entropy")
+    hedge = SignalVenue("hedge")
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=1000.0)
+    rec = SignalRecorder(
+        path, entropy, hedge,
+        midline_bps=0.0, upper_bps=5.0, lower_bps=5.0,
+        take_fraction=1.0, max_order_notional=100_000.0,
+        min_base=0.0, min_notional=0.0, size_step=0.001,
+        leg_slippage_bps=20.0, staleness_sec=3.0, sample_sec=1.0,
+    )
+    return rec, entropy, hedge
+
+
+def read_signal_rows(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
 
 
 def test_minute_aggregation_and_rollover():
@@ -80,6 +120,65 @@ def test_append_keeps_single_header():
         lines = fh.read().strip().splitlines()
     assert len(lines) == 3             # one header + two rows
     assert lines[0].startswith("minute_ts,")
+
+
+def test_signal_lifecycle_writes_start_sample_and_end():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    rec.observe(now=1000.5)
+    rec.observe(now=1001.0)
+    set_signal_book(entropy, bid=100.00, ask=100.01, ts=1001.2)
+    rec.observe(now=1001.2)
+    rec.close(now=1001.2)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "sample", "end"]
+    assert {row["direction"] for row in rows} == {"sell_entropy"}
+    assert len({row["event_id"] for row in rows}) == 1
+    assert [int(row["elapsed_ms"]) for row in rows] == [0, 1000, 1200]
+    assert rows[-1]["end_reason"] == "edge_below_threshold"
+
+
+def test_signal_shutdown_closes_active_event_once():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, _, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    rec.close(now=1002.0)
+    rec.close(now=1003.0)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "end"]
+    assert rows[-1]["elapsed_ms"] == "2000"
+    assert rows[-1]["end_reason"] == "shutdown"
+
+
+def test_signal_directions_have_independent_lifecycles():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    set_signal_book(entropy, bid=99.90, ask=99.91, ts=1000.2)
+    set_signal_book(hedge, bid=100.02, ask=100.03, ts=1000.2)
+    rec.observe(now=1000.2)
+    set_signal_book(entropy, bid=100.00, ask=100.01, ts=1000.4)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=1000.4)
+    rec.observe(now=1000.4)
+    rec.close(now=1000.4)
+
+    rows = read_signal_rows(path)
+    assert [(row["direction"], row["event"]) for row in rows] == [
+        ("sell_entropy", "start"),
+        ("sell_entropy", "end"),
+        ("buy_entropy", "start"),
+        ("buy_entropy", "end"),
+    ]
+    sell_id, buy_id = rows[0]["event_id"], rows[2]["event_id"]
+    assert sell_id.startswith("sell_entropy-")
+    assert buy_id.startswith("buy_entropy-")
+    assert sell_id != buy_id
 
 
 if __name__ == "__main__":
