@@ -91,6 +91,7 @@ execution:
 recorder:
   enabled: true
   csv: logs/minutes.csv
+  signal_csv: logs/signals.csv
 
 # ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
 # On a terminal the bot shows a live Rich dashboard (books, signal, positions,
