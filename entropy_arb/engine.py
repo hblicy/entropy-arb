@@ -27,7 +27,7 @@ import aiohttp
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .models import OrderResult
-from .recorder import MinuteRecorder
+from .recorder import MinuteRecorder, SignalRecorder
 from .venues.base import VenueAdapter
 from .venues.registry import VenueRuntime, create_venue
 
@@ -50,6 +50,7 @@ class Engine:
         self.hedge: Optional[VenueAdapter] = None
         self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
+        self.signal_recorder: Optional[SignalRecorder] = None
         self.markets_ready = False
         self.stop = asyncio.Event()
         self._update_evt = asyncio.Event()
@@ -121,6 +122,34 @@ class Engine:
         self._update_evt.set()
         self._reconcile_evt.set()
 
+    def _start_recorders(self, tasks: List[asyncio.Task]) -> None:
+        cfg = self.cfg
+        if cfg.recorder_enabled or self.record_only:
+            self.recorder = MinuteRecorder(
+                cfg.recorder_csv, self.entropy.book, self.hedge.book,
+                cfg.staleness_sec)
+            tasks.append(asyncio.create_task(
+                self.recorder.run(self.stop), name="recorder"))
+        if self.record_only:
+            self.signal_recorder = SignalRecorder(
+                cfg.recorder_signal_csv,
+                self.entropy,
+                self.hedge,
+                midline_bps=cfg.midline_bps,
+                upper_bps=cfg.upper_bps,
+                lower_bps=cfg.lower_bps,
+                take_fraction=cfg.take_fraction,
+                max_order_notional=cfg.max_order_notional,
+                min_base=self._min_base,
+                min_notional=self._min_notional,
+                size_step=self._step,
+                leg_slippage_bps=cfg.leg_slippage_bps,
+                staleness_sec=cfg.staleness_sec,
+            )
+            tasks.append(asyncio.create_task(
+                self.signal_recorder.run(self.stop, self._update_evt),
+                name="signal-recorder"))
+
     # ------------------------------------------------------------- lifecycle
 
     async def run(self) -> None:
@@ -187,11 +216,7 @@ class Engine:
         tasks: List[asyncio.Task] = []
         for v in self.venues.values():
             tasks += v.start_tasks(self.stop, self._update_evt.set, live)
-        if cfg.recorder_enabled or self.record_only:
-            self.recorder = MinuteRecorder(cfg.recorder_csv, self.entropy.book,
-                                           self.hedge.book, cfg.staleness_sec)
-            tasks.append(asyncio.create_task(self.recorder.run(self.stop),
-                                             name="recorder"))
+        self._start_recorders(tasks)
         if not self.record_only:
             tasks.append(asyncio.create_task(self._strategy_loop(),
                                              name="strategy"))

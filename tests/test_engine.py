@@ -81,9 +81,9 @@ def execution_plan():
     )
 
 
-def make_engine(**thr):
+def make_engine(record_only=False, **thr):
     cfg = make_cfg(**thr)
-    eng = Engine(cfg)
+    eng = Engine(cfg, record_only=record_only)
     eng.entropy = StubVenue("entropy", "ENTROPY")
     eng.hedge = StubVenue("hedge", "RH")
     eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
@@ -309,6 +309,37 @@ def test_reconcile_skipped_during_grace_is_rescheduled():
         assert eng._reconcile_evt.is_set() is False
         await asyncio.sleep(0.05)
         assert eng._reconcile_evt.is_set() is True
+
+    asyncio.run(go())
+
+
+def test_signal_recorder_starts_only_in_record_only_mode():
+    async def go():
+        record_engine = make_engine(record_only=True)
+        record_dir = tempfile.mkdtemp()
+        record_engine.cfg.recorder_csv = os.path.join(
+            record_dir, "minutes.csv")
+        record_engine.cfg.recorder_signal_csv = os.path.join(
+            record_dir, "signals.csv")
+        record_tasks = []
+
+        record_engine._start_recorders(record_tasks)
+
+        assert record_engine.signal_recorder is not None
+        assert any(task.get_name() == "signal-recorder"
+                   for task in record_tasks)
+        record_engine.request_stop()
+        await asyncio.gather(*record_tasks)
+
+        live_engine = make_engine(record_only=False)
+        live_engine.cfg.recorder_enabled = False
+        live_tasks = []
+
+        live_engine._start_recorders(live_tasks)
+
+        assert live_engine.signal_recorder is None
+        assert all(task.get_name() != "signal-recorder"
+                   for task in live_tasks)
 
     asyncio.run(go())
 
