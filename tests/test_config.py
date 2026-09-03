@@ -47,6 +47,7 @@ def test_example_config_loads():
     assert cfg.hedge.kind == "lighter"
     assert cfg.hedge.lighter_profile.chain_id == 466324
     assert cfg.entropy.symbol == "SNDK" and cfg.hedge.symbol == "SNDK"
+    assert cfg.entropy.fee_bps == 0.9
     assert cfg.recorder_enabled and cfg.recorder_csv
     assert cfg.recorder_signal_csv == "logs/signals.csv"
     assert cfg.dashboard and cfg.log_file
@@ -70,6 +71,7 @@ def test_minimal_defaults():
     assert cfg.hedge.label == "LIGHTER"
     assert cfg.hedge.lighter_profile.chain_id == 304
     assert cfg.take_fraction == 0.5          # defaults kick in
+    assert cfg.entropy.fee_bps == 0.9
     assert cfg.recorder_enabled is True
     assert cfg.recorder_signal_csv == "logs/signals.csv"
 

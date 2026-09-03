@@ -102,7 +102,7 @@ path can be changed with `recorder.signal_csv`.
 **2. Analyze and set your thresholds:**
 
 ```bash
-python3 tools/analyze.py
+python3 tools/analyze.py --fees-bps 0.9
 ```
 
 It analyzes `logs/minutes.csv` and prints the premium distribution, how often
@@ -149,10 +149,11 @@ Once per second it samples both live books; once per minute it writes a row:
 | `samples` | how many of the ~60 seconds both books were fresh |
 
 Recorded edges are pre-fee; the analyzer subtracts `--fees-bps` (pass the
-**sum** of both venues' taker fees — default 0.0 for the zero-fee venues,
-~1.0 with a `tradexyz` hedge) before counting firings, so its table and
-suggestions translate directly into config values. `--hours 24` restricts to
-recent data; premiums drift, so re-run it regularly and update
+**sum** of both venues' taker fees — currently about 0.9 for Entropy +
+Lighter, or about 1.9 for Entropy + `tradexyz`) before counting firings, so
+its table and suggestions translate directly into config values.
+Fees can vary by account or venue; verify them before deployment. `--hours 24`
+restricts to recent data; premiums drift, so re-run it regularly and update
 `config.yaml`.
 
 ## Configuration
@@ -167,7 +168,7 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `thresholds.midline_bps` | premium center (measure it!) | — |
 | `thresholds.upper_bps` / `lower_bps` | entry bands (> 0) | — |
 | `entropy.dex` | Entropy's dex name on Hyperliquid | `io` |
-| `*.taker_fee_bps` | per-venue taker fee | 0.0 (tradexyz hedge: 1.0) |
+| `*.taker_fee_bps` | per-venue taker fee | Entropy 0.9; Lighter 0.0; tradexyz hedge 1.0 |
 | `*.max_position_usd` | per-venue position cap | 1000 |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |

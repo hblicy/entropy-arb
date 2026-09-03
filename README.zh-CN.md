@@ -92,7 +92,7 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 **第二步：分析数据、设定阈值：**
 
 ```bash
-python3 tools/analyze.py
+python3 tools/analyze.py --fees-bps 0.9
 ```
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
@@ -136,9 +136,10 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `samples` | 该分钟约 60 秒中两边盘口同时有效的秒数 |
 
 采集的 edge 为费前口径；分析工具在统计触发频率前会先扣除 `--fees-bps`
-（请传入**两边吃单费之和**——零费交易所默认 0.0，对冲腿为 `tradexyz` 时
-约为 1.0），因此其表格与建议值可直接填入配置。`--hours 24`
-可只分析最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
+（请传入**两边吃单费之和**——目前 Entropy + Lighter 约为 0.9，
+Entropy + `tradexyz` 约为 1.9），因此其表格与建议值可直接填入配置。
+费率可能因账户或交易所调整，上线前应核对实际费率。`--hours 24` 可只分析
+最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
 
 ## 配置说明
 
@@ -152,7 +153,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `thresholds.midline_bps` | 溢价中枢（必须实测！） | — |
 | `thresholds.upper_bps` / `lower_bps` | 入场带宽（> 0） | — |
 | `entropy.dex` | Entropy 在 Hyperliquid 上的 dex 名 | `io` |
-| `*.taker_fee_bps` | 各所吃单费 | 0.0（tradexyz 对冲腿：1.0） |
+| `*.taker_fee_bps` | 各所吃单费 | Entropy 0.9；Lighter 0.0；tradexyz 对冲腿 1.0 |
 | `*.max_position_usd` | 各所持仓上限 | 1000 |
 | `*.max_orders_per_min` | 各所每分钟下单预算（滑动 60 秒） | 120；Lighter 对冲腿 30 |
 | `sizing.take_fraction` | 吃掉可套利深度的比例 | 0.5 |

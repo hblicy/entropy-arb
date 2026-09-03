@@ -307,7 +307,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     entropy = VenueConf(
         key="entropy", kind="hl", label="ENTROPY",
         symbol=symbol,
-        fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.0)),
+        fee_bps=float(_get(raw, "entropy", "taker_fee_bps", 0.9)),
         cap_usd=float(_get(raw, "entropy", "max_position_usd", 1000.0)),
         orders_per_min=int(_get(raw, "entropy", "max_orders_per_min", 120)),
         hl_dex=entropy_dex,

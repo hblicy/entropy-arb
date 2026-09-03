@@ -12,7 +12,7 @@ and prints:
 以及可直接粘贴进 config.yaml 的 thresholds 建议值。
 
 Usage:
-    python3 tools/analyze.py                    # logs/minutes.csv
+    python3 tools/analyze.py --fees-bps 0.9     # Entropy + Lighter
     python3 tools/analyze.py --csv path.csv --hours 24 --min-samples 10
 """
 from __future__ import annotations
@@ -71,8 +71,9 @@ def main() -> None:
     p.add_argument("--fees-bps", type=float, default=0.0,
                    help="SUM of both venues' taker fees in bps (each crossing "
                         "pays both legs); recorded edges are pre-fee, so this "
-                        "is subtracted before counting firings (default 0.0 — "
-                        "pass ~1.0 with a tradexyz hedge)")
+                        "is subtracted before counting firings (currently "
+                        "pass ~0.9 for Entropy + Lighter, ~1.9 for Entropy + "
+                        "tradexyz; verify your account rates)")
     args = p.parse_args()
 
     try:
@@ -114,7 +115,8 @@ def main() -> None:
                       reverse=True)
 
     print(f"\nwith midline_bps = {midline:+.1f} (median) and {fees:.1f} bps "
-          f"round-trip taker fees, minutes each band would have fired / "
+          f"combined taker fees per crossing, minutes each band would have "
+          f"fired / 单次跨所成交两腿合计手续费，"
           f"各档净阈值触发的分钟数:")
     print(f"  {'band bps':>9} | {'SELL entropy':>17} | {'BUY entropy':>17}")
     print(f"  {'':>9} | {'minutes':>8} {'per day':>8} | "
@@ -132,10 +134,11 @@ def main() -> None:
     sug_lower = max(round(pctl(sorted(buy_room), 90) * 2) / 2, 1.0)
     print(f"""
 suggested starting point (fires ~10% of minutes, already net of the
-{fees:.1f} bps fees passed via --fees-bps; a full round trip nets
->= upper+lower bps after fees) /
-建议起点（约 10% 的分钟触发；已扣除 --fees-bps 传入的 {fees:.1f} bps 手续费，
-一次完整往返扣费后净赚 >= upper+lower bps）:
+{fees:.1f} bps per-crossing fees passed via --fees-bps; after paying them
+on entry and exit, a full round trip nets >= upper+lower bps) /
+建议起点（约 10% 的分钟触发；每次跨所成交均已扣除 --fees-bps 传入的
+{fees:.1f} bps 两腿手续费，开仓和平仓分别扣费后，一次完整往返净赚
+>= upper+lower bps）:
 
 thresholds:
   midline_bps: {midline}

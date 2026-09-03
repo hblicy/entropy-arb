@@ -372,8 +372,8 @@ class SignalRecorder:
             self._open()
         while self._pending_rows:
             self._writer.writerow(self._pending_rows[0])
-            self._fh.flush()
             self._pending_rows.popleft()
+            self._fh.flush()
             self.rows_written += 1
 
     def observe(self, now: Optional[float] = None, *,

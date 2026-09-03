@@ -4,6 +4,7 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_recorder.py)
 """
 import csv
 import asyncio
+import io
 import os
 import sys
 import tempfile
@@ -372,6 +373,44 @@ def test_signal_io_error_stops_and_propagates():
 
         with pytest.raises(OSError):
             await rec.run(stop, update_evt)
+        assert stop.is_set()
+
+    asyncio.run(go())
+
+
+def test_signal_flush_failure_does_not_serialize_pending_row_twice():
+    class FailOnceFlushBuffer(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_flush = False
+
+        def flush(self):
+            if self.fail_next_flush:
+                self.fail_next_flush = False
+                raise OSError("transient flush failure")
+            return super().flush()
+
+        def close(self):
+            pass
+
+    async def go():
+        rec, entropy, hedge = make_signal_recorder("unused.csv")
+        now = time.time()
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=now)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=now)
+        stream = FailOnceFlushBuffer()
+        writer = csv.DictWriter(stream, fieldnames=SIGNAL_HEADER)
+        writer.writeheader()
+        rec._fh = stream
+        rec._writer = writer
+        stream.fail_next_flush = True
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        with pytest.raises(OSError, match="transient flush failure"):
+            await rec.run(stop, update_evt)
+
+        rows = list(csv.DictReader(io.StringIO(stream.getvalue())))
+        assert [row["event"] for row in rows] == ["start", "end"]
         assert stop.is_set()
 
     asyncio.run(go())
