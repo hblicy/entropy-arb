@@ -92,7 +92,12 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
 Let it run for at least a few hours (a day is better — premiums have
-intraday regimes). It writes `logs/minutes.csv`.
+intraday regimes). It writes minute aggregates to `logs/minutes.csv` and,
+in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
+row is written immediately on `start`, once per second as `sample`, and on
+disappearance, stale books, or shutdown as `end`. These rows are observation
+only: they do not gate entries or change live strategy behavior. The signal
+path can be changed with `recorder.signal_csv`.
 
 **2. Analyze and set your thresholds:**
 
@@ -100,8 +105,9 @@ intraday regimes). It writes `logs/minutes.csv`.
 python3 tools/analyze.py
 ```
 
-It prints the premium distribution, how often each candidate band would have
-fired, and a ready-to-paste `thresholds:` block for `config.yaml`.
+It analyzes `logs/minutes.csv` and prints the premium distribution, how often
+each candidate band would have fired, and a ready-to-paste `thresholds:` block
+for `config.yaml`. It does not analyze `logs/signals.csv`.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -169,7 +175,7 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
-| `recorder.*` | minute-data recorder | on, `logs/minutes.csv` |
+| `recorder.*` | minute data; record-only signal lifecycle path | on, `logs/minutes.csv`; `logs/signals.csv` |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
 ## Credentials (`.env`, live only)
@@ -225,7 +231,7 @@ entropy_arb/venues/base.py  common venue adapter protocol
 entropy_arb/venues/registry.py  explicit adapter factory registry
 entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
-entropy_arb/recorder.py  1-minute orderbook bars
+entropy_arb/recorder.py  1-minute bars + record-only signal lifecycles
 tools/analyze.py         minutes.csv -> suggested thresholds
 tests/                   python3 -m pytest tests/
 ```

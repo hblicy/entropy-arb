@@ -83,8 +83,11 @@ cp .env.example .env                     # 密钥——交易必填
 python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
-至少运行几个小时（最好一整天——溢价存在日内规律），数据写入
-`logs/minutes.csv`。
+至少运行几个小时（最好一整天——溢价存在日内规律）。分钟聚合写入
+`logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
+`logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
+`sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
+不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。
 
 **第二步：分析数据、设定阈值：**
 
@@ -92,8 +95,9 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 python3 tools/analyze.py
 ```
 
-它会输出溢价分布、各档带宽的历史触发频率，以及可直接粘贴进
-`config.yaml` 的 `thresholds:` 配置块。
+它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
+以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块；不会分析
+`logs/signals.csv`。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -156,7 +160,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
 | `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
 | `execution.*` | 滑点保护、超时、对账周期等 | 见配置文件 |
-| `recorder.*` | 分钟数据采集器 | 开启，`logs/minutes.csv` |
+| `recorder.*` | 分钟数据；只读模式信号生命周期路径 | 开启，`logs/minutes.csv`；`logs/signals.csv` |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
 
 ## 密钥配置（`.env`，仅实盘需要）
@@ -207,7 +211,7 @@ entropy_arb/venues/base.py  统一交易所适配器协议
 entropy_arb/venues/registry.py  显式适配器工厂注册表
 entropy_arb/engine.py    双交易所策略主循环
 entropy_arb/dashboard.py Rich 终端仪表盘
-entropy_arb/recorder.py  分钟级盘口数据采集
+entropy_arb/recorder.py  分钟级盘口 + 只读信号生命周期采集
 tools/analyze.py         minutes.csv -> 阈值建议
 tests/                   python3 -m pytest tests/
 ```
