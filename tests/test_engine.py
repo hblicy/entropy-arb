@@ -131,6 +131,12 @@ class InvalidBurstVenue(LifecycleVenue):
         return [asyncio.create_task(burst(), name="invalid-burst-entropy")]
 
 
+class CloseFailVenue(InvalidBurstVenue):
+    async def close(self):
+        self.closed = True
+        raise OSError(f"{self.key} close failed")
+
+
 def execution_plan():
     return ArbPlan(
         qty=0.5,
@@ -527,6 +533,57 @@ def test_signal_callback_error_remains_primary_when_close_also_fails():
         finally:
             engine_module.create_venue = original_create_venue
             engine_module.SignalRecorder = original_signal_recorder
+
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_minute_recorder_error_propagates_from_record_only_engine():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("block")
+        cfg.recorder_csv = os.path.join(blocker, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": LifecycleVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(OSError):
+                await asyncio.wait_for(eng._run_inner(), timeout=0.2)
+        finally:
+            engine_module.create_venue = original_create_venue
+
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_signal_error_survives_venue_close_error_and_all_venues_close():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": CloseFailVenue("entropy", "ENTROPY"),
+            "hedge": InvalidBurstVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(ZeroDivisionError):
+                await eng._run_inner()
+        finally:
+            engine_module.create_venue = original_create_venue
 
         assert all(venue.closed for venue in venues.values())
 

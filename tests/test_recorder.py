@@ -455,6 +455,24 @@ def test_signal_invalid_path_fails_before_any_signal():
     asyncio.run(go())
 
 
+def test_minute_io_error_stops_and_propagates_in_fail_fast_mode():
+    async def go():
+        directory = tempfile.mkdtemp()
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("block")
+        rec = MinuteRecorder(
+            os.path.join(blocker, "minutes.csv"),
+            OrderBook(), OrderBook(), staleness_sec=1e9)
+        stop = asyncio.Event()
+
+        with pytest.raises(OSError):
+            await rec.run(stop, fail_fast=True)
+        assert stop.is_set()
+
+    asyncio.run(go())
+
+
 def test_signal_io_error_stops_and_propagates():
     async def go():
         directory = tempfile.mkdtemp()

@@ -207,19 +207,43 @@ class MinuteRecorder:
             self._fh.close()
             self._fh = self._writer = None
 
-    async def run(self, stop: asyncio.Event) -> None:
+    async def run(self, stop: asyncio.Event,
+                  fail_fast: bool = False) -> None:
+        primary_error = None
         try:
-            while not stop.is_set():
-                try:
-                    self.sample()
-                except Exception:
-                    log.exception("recorder sample failed")
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=self.interval_sec)
-                except asyncio.TimeoutError:
-                    pass
+            try:
+                if fail_fast and self._writer is None:
+                    self._open()
+                while not stop.is_set():
+                    try:
+                        self.sample()
+                    except Exception:
+                        log.exception("recorder sample failed")
+                        if fail_fast:
+                            raise
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=self.interval_sec)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                primary_error = exc
+                stop.set()
+                log.exception("recorder failed")
+                raise
         finally:
-            self.close()
+            try:
+                self.close()
+            except Exception:
+                if primary_error is None:
+                    stop.set()
+                    log.exception("recorder failed while closing")
+                    raise
+                log.exception(
+                    "recorder also failed while closing; preserving the "
+                    "original error")
             log.info("recorder stopped — %d minute row(s) written to %s",
                      self.rows_written, self.path)
 

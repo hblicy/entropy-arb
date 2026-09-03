@@ -51,6 +51,7 @@ class Engine:
         self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.signal_recorder: Optional[SignalRecorder] = None
+        self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
         self._signal_callback_error: Optional[BaseException] = None
         self.markets_ready = False
@@ -143,8 +144,11 @@ class Engine:
                 cfg.staleness_sec, symbol=cfg.symbol,
                 entropy_dex=cfg.entropy.hl_dex,
                 hedge_venue=cfg.hedge_venue)
-            tasks.append(asyncio.create_task(
-                self.recorder.run(self.stop), name="recorder"))
+            self._recorder_task = asyncio.create_task(
+                self.recorder.run(
+                    self.stop, fail_fast=self.record_only),
+                name="recorder")
+            tasks.append(self._recorder_task)
         if self.record_only:
             self.signal_recorder = SignalRecorder(
                 cfg.recorder_signal_csv,
@@ -264,22 +268,48 @@ class Engine:
             if (isinstance(result, BaseException)
                     and not isinstance(result, asyncio.CancelledError)):
                 signal_error = result
+        minute_error = None
+        if self.record_only and self._recorder_task is not None:
+            result = results[tasks.index(self._recorder_task)]
+            if (isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)):
+                minute_error = result
         callback_error = self._signal_callback_error
+        recorder_errors = [
+            ("signal recorder task", signal_error),
+            ("minute recorder task", minute_error),
+        ]
+        primary_error = callback_error
+        if primary_error is None:
+            for _, error in recorder_errors:
+                if error is not None:
+                    primary_error = error
+                    break
+        for label, error in recorder_errors:
+            if error is not None and error is not primary_error:
+                log.error(
+                    "%s also failed; preserving the primary error", label,
+                    exc_info=(type(error), error, error.__traceback__))
+
+        venue_close_error = None
         for v in self.venues.values():
-            await v.close()
+            try:
+                await v.close()
+            except Exception as exc:
+                if primary_error is None and venue_close_error is None:
+                    venue_close_error = exc
+                else:
+                    log.error(
+                        "[%s] also failed while closing; preserving the "
+                        "primary error", v.name,
+                        exc_info=(type(exc), exc, exc.__traceback__))
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
                   self.total_exp_edge, self.total_fill_edge)
-        if callback_error is not None:
-            if signal_error is not None:
-                log.error(
-                    "signal recorder also failed while closing; preserving "
-                    "the original callback error",
-                    exc_info=(type(signal_error), signal_error,
-                              signal_error.__traceback__))
-            raise callback_error
-        if signal_error is not None:
-            raise signal_error
+        if primary_error is not None:
+            raise primary_error
+        if venue_close_error is not None:
+            raise venue_close_error
 
     async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
         """Wait for every submitted execution; shutdown never abandons a leg."""
