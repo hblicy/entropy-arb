@@ -140,7 +140,9 @@ class Engine:
         if cfg.recorder_enabled or self.record_only:
             self.recorder = MinuteRecorder(
                 cfg.recorder_csv, self.entropy.book, self.hedge.book,
-                cfg.staleness_sec)
+                cfg.staleness_sec, symbol=cfg.symbol,
+                entropy_dex=cfg.entropy.hl_dex,
+                hedge_venue=cfg.hedge_venue)
             tasks.append(asyncio.create_task(
                 self.recorder.run(self.stop), name="recorder"))
         if self.record_only:

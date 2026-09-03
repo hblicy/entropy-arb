@@ -77,6 +77,31 @@ def read_signal_rows(path):
         return list(csv.DictReader(fh))
 
 
+def test_minute_rows_identify_market_across_appended_runs():
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+
+    for minute, symbol, entropy_dex, hedge_venue in (
+            (1_700_000_000.0, "SNDK", "io", "lighter-rh"),
+            (1_700_000_060.0, "XYZ100", "io", "tradexyz")):
+        e_book, h_book = OrderBook(), OrderBook()
+        set_book(e_book, 100.0, 100.02)
+        set_book(h_book, 100.0, 100.02)
+        rec = MinuteRecorder(
+            path, e_book, h_book, staleness_sec=1e9,
+            symbol=symbol, entropy_dex=entropy_dex,
+            hedge_venue=hedge_venue)
+        rec.sample(minute)
+        rec.close()
+
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [(row["symbol"], row["entropy_dex"], row["hedge_venue"])
+            for row in rows] == [
+        ("SNDK", "io", "lighter-rh"),
+        ("XYZ100", "io", "tradexyz"),
+    ]
+
+
 def test_minute_aggregation_and_rollover():
     e_book, h_book = OrderBook(), OrderBook()
     path = os.path.join(tempfile.mkdtemp(), "minutes.csv")

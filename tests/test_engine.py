@@ -392,6 +392,9 @@ def test_signal_recorder_starts_only_in_record_only_mode():
         record_engine._start_recorders(record_tasks)
 
         assert record_engine.signal_recorder is not None
+        assert record_engine.recorder.symbol == "SNDK"
+        assert record_engine.recorder.entropy_dex == "io"
+        assert record_engine.recorder.hedge_venue == "lighter-rh"
         assert any(task.get_name() == "signal-recorder"
                    for task in record_tasks)
         record_engine.request_stop()

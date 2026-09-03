@@ -65,6 +65,18 @@ def fee_adjusted_rooms(rows: list, *, midline: float,
     return sell_room, buy_room
 
 
+def validate_single_market(rows: list) -> tuple[str, str, str]:
+    markets = {
+        (row["symbol"], row["entropy_dex"], row["hedge_venue"])
+        for row in rows
+    }
+    if len(markets) > 1:
+        raise ValueError(
+            "multiple markets found in one minute CSV; use a separate file "
+            "for each symbol and hedge venue")
+    return next(iter(markets), ("", "", ""))
+
+
 def load_rows(path: str, hours: float, min_samples: int) -> list:
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
     rows = []
@@ -77,6 +89,9 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                     continue
                 rows.append({
                     "ts": float(r["minute_ts"]),
+                    "symbol": r.get("symbol", ""),
+                    "entropy_dex": r.get("entropy_dex", ""),
+                    "hedge_venue": r.get("hedge_venue", ""),
                     "prem": float(r["premium_close_bps"]),
                     "prem_mean": float(r["premium_mean_bps"]),
                     "sell_max": float(r["sell_edge_max_bps"]),
@@ -129,6 +144,12 @@ def main() -> None:
               f"建议至少采集数小时", file=sys.stderr)
         if not rows:
             sys.exit(1)
+    try:
+        validate_single_market(rows)
+    except ValueError as exc:
+        print(f"{exc} / 一个分钟文件中包含多个市场，请按品种和对冲交易所"
+              f"分别采集", file=sys.stderr)
+        sys.exit(2)
 
     span_h = (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0 + 1 / 60.0
     prem = sorted(r["prem"] for r in rows)

@@ -9,6 +9,24 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import tools.analyze as analyze  # noqa: E402
 
 
+def test_validate_single_market_rejects_mixed_minute_rows():
+    with pytest.raises(ValueError, match="multiple markets"):
+        analyze.validate_single_market([
+            {"symbol": "SNDK", "entropy_dex": "io",
+             "hedge_venue": "lighter-rh"},
+            {"symbol": "SNDK", "entropy_dex": "io",
+             "hedge_venue": "tradexyz"},
+        ])
+
+
+def test_validate_single_market_accepts_legacy_rows_without_identity():
+    market = analyze.validate_single_market([
+        {"symbol": "", "entropy_dex": "", "hedge_venue": ""},
+        {"symbol": "", "entropy_dex": "", "hedge_venue": ""},
+    ])
+    assert market == ("", "", "")
+
+
 def test_fee_adjusted_rooms_match_execution_formula_in_both_directions():
     rows = [{"sell_max": 8.0, "buy_max": 7.0}]
     entropy_fee = 0.9
