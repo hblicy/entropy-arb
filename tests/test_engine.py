@@ -3,13 +3,18 @@
 Run:  python3 -m pytest tests/  (or  python3 tests/test_engine.py)
 """
 import asyncio
+import csv
 import os
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import entropy_arb.engine as engine_module  # noqa: E402
 from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
@@ -63,6 +68,67 @@ class ExecutingVenue(StubVenue):
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
+
+
+class LifecycleVenue(StubVenue):
+    def __init__(self, key, label):
+        super().__init__(key, label)
+        self.conf = SimpleNamespace(symbol="SNDK")
+        self.closed = False
+
+    async def load_market(self):
+        if self.key == "entropy":
+            self.set_book(100.10, 100.11)
+        else:
+            self.set_book(99.99, 100.00)
+
+    def configure_peer(self, _other):
+        return
+
+    def start_tasks(self, _stop, _notify, _live):
+        return []
+
+    async def close(self):
+        self.closed = True
+
+
+class BurstVenue(LifecycleVenue):
+    async def load_market(self):
+        if self.key == "entropy":
+            self.set_book(100.00, 100.01)
+        else:
+            self.set_book(99.99, 100.00)
+
+    def start_tasks(self, stop, notify, _live):
+        if self.key != "entropy":
+            return []
+
+        async def burst():
+            self.set_book(100.10, 100.11)
+            notify()
+            self.set_book(100.00, 100.01)
+            notify()
+            await asyncio.sleep(0.01)
+            stop.set()
+            notify()
+
+        return [asyncio.create_task(burst(), name="burst-entropy")]
+
+
+class InvalidBurstVenue(LifecycleVenue):
+    def start_tasks(self, stop, notify, _live):
+        if self.key != "entropy":
+            return []
+
+        async def burst():
+            try:
+                self.set_book(100.00, 0.0)
+                notify()
+            finally:
+                self.set_book(100.00, 100.01)
+                stop.set()
+
+        return [asyncio.create_task(burst(), name="invalid-burst-entropy")]
 
 
 def execution_plan():
@@ -340,6 +406,86 @@ def test_signal_recorder_starts_only_in_record_only_mode():
         assert live_engine.signal_recorder is None
         assert all(task.get_name() != "signal-recorder"
                    for task in live_tasks)
+
+    asyncio.run(go())
+
+
+def test_signal_recorder_io_failure_propagates_from_engine():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("block")
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(blocker, "signals.csv")
+        venues = {
+            "entropy": LifecycleVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(OSError):
+                await eng._run_inner()
+        finally:
+            engine_module.create_venue = original_create_venue
+
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_record_only_captures_burst_signal_before_event_coalesces():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": BurstVenue("entropy", "ENTROPY"),
+            "hedge": BurstVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            await eng._run_inner()
+        finally:
+            engine_module.create_venue = original_create_venue
+
+        assert os.path.exists(cfg.recorder_signal_csv)
+        with open(cfg.recorder_signal_csv, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        assert [(row["direction"], row["event"]) for row in rows] == [
+            ("sell_entropy", "start"),
+            ("sell_entropy", "end"),
+        ]
+
+    asyncio.run(go())
+
+
+def test_record_only_propagates_synchronous_signal_calculation_error():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": InvalidBurstVenue("entropy", "ENTROPY"),
+            "hedge": InvalidBurstVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(ZeroDivisionError):
+                await eng._run_inner()
+        finally:
+            engine_module.create_venue = original_create_venue
+
+        assert all(venue.closed for venue in venues.values())
 
     asyncio.run(go())
 

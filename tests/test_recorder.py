@@ -377,6 +377,39 @@ def test_signal_io_error_stops_and_propagates():
     asyncio.run(go())
 
 
+def test_signal_event_ids_are_unique_within_the_same_millisecond():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=4000.0001)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=4000.0001)
+
+    rec.observe(now=4000.0001)
+    set_signal_book(entropy, bid=100.00, ask=100.01, ts=4000.0002)
+    rec.observe(now=4000.0002)
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=4000.0008)
+    rec.observe(now=4000.0008)
+    rec.close(now=4000.001)
+
+    start_ids = [row["event_id"] for row in read_signal_rows(path)
+                 if row["event"] == "start"]
+    assert len(start_ids) == 2
+    assert len(set(start_ids)) == 2
+
+
+def test_signal_ends_immediately_when_book_is_not_ready():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    entropy.book.ready = False
+    rec.observe(now=1000.1)
+    rec.close(now=1000.2)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "end"]
+    assert rows[-1]["end_reason"] == "book_not_ready"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -227,6 +228,8 @@ class SignalRecorder:
         self.sample_sec = sample_sec
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
+        self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
+        self._pending_rows = deque()
         self._fh = None
         self._writer = None
         self._closed = False
@@ -253,6 +256,8 @@ class SignalRecorder:
 
     def _books_status(self, now: float) -> Optional[str]:
         books = (self.entropy.book, self.hedge.book)
+        if any(not book.ready for book in books):
+            return "book_not_ready"
         if any(book.best_bid() is None or book.best_ask() is None
                for book in books):
             return "empty_book"
@@ -344,10 +349,8 @@ class SignalRecorder:
         )
         return qualifies, "" if qualifies else "edge_below_threshold"
 
-    def _write(self, event: str, direction: str, state: _SignalState,
-               now: float, end_reason: str = "") -> None:
-        if self._writer is None:
-            self._open()
+    def _queue_row(self, event: str, direction: str, state: _SignalState,
+                   now: float, end_reason: str = "") -> None:
         row = {name: "" for name in SIGNAL_HEADER}
         row.update(self._snapshot(direction, now))
         row.update({
@@ -360,30 +363,45 @@ class SignalRecorder:
             "elapsed_ms": int(round((now - state.started_at) * 1000)),
             "end_reason": end_reason,
         })
-        self._writer.writerow(row)
-        self._fh.flush()
-        self.rows_written += 1
+        self._pending_rows.append(row)
 
-    def observe(self, now: Optional[float] = None) -> None:
+    def _flush_pending(self) -> None:
+        if not self._pending_rows:
+            return
+        if self._writer is None:
+            self._open()
+        while self._pending_rows:
+            self._writer.writerow(self._pending_rows[0])
+            self._fh.flush()
+            self._pending_rows.popleft()
+            self.rows_written += 1
+
+    def observe(self, now: Optional[float] = None, *,
+                flush: bool = True) -> None:
         now = time.time() if now is None else now
         for direction in self._states:
             active = self._states[direction]
             qualifies, end_reason = self._qualifies(direction, now)
             if qualifies and active is None:
+                self._event_seq[direction] += 1
                 active = _SignalState(
-                    event_id=f"{direction}-{int(now * 1000)}",
+                    event_id=(f"{direction}-{int(now * 1000)}-"
+                              f"{self._event_seq[direction]}"),
                     started_at=now,
                     last_written_at=now,
                 )
                 self._states[direction] = active
-                self._write("start", direction, active, now)
+                self._queue_row("start", direction, active, now)
             elif (qualifies and active is not None
                   and now - active.last_written_at >= self.sample_sec):
-                self._write("sample", direction, active, now)
+                self._queue_row("sample", direction, active, now)
                 active.last_written_at = now
             elif not qualifies and active is not None:
-                self._write("end", direction, active, now, end_reason)
+                self._queue_row(
+                    "end", direction, active, now, end_reason)
                 self._states[direction] = None
+        if flush:
+            self._flush_pending()
 
     def close(self, now: Optional[float] = None) -> None:
         if self._closed:
@@ -391,8 +409,10 @@ class SignalRecorder:
         now = time.time() if now is None else now
         for direction, active in self._states.items():
             if active is not None:
-                self._write("end", direction, active, now, "shutdown")
+                self._queue_row(
+                    "end", direction, active, now, "shutdown")
                 self._states[direction] = None
+        self._flush_pending()
         if self._fh is not None:
             self._fh.close()
             self._fh = self._writer = None

@@ -51,6 +51,8 @@ class Engine:
         self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.signal_recorder: Optional[SignalRecorder] = None
+        self._signal_task: Optional[asyncio.Task] = None
+        self._signal_callback_error: Optional[BaseException] = None
         self.markets_ready = False
         self.stop = asyncio.Event()
         self._update_evt = asyncio.Event()
@@ -122,6 +124,17 @@ class Engine:
         self._update_evt.set()
         self._reconcile_evt.set()
 
+    def _record_only_book_update(self) -> None:
+        self._update_evt.set()
+        if self.signal_recorder is not None:
+            try:
+                self.signal_recorder.observe(flush=False)
+            except Exception as exc:
+                if self._signal_callback_error is None:
+                    self._signal_callback_error = exc
+                    log.exception("signal recorder failed during book update")
+                self.request_stop()
+
     def _start_recorders(self, tasks: List[asyncio.Task]) -> None:
         cfg = self.cfg
         if cfg.recorder_enabled or self.record_only:
@@ -146,9 +159,10 @@ class Engine:
                 leg_slippage_bps=cfg.leg_slippage_bps,
                 staleness_sec=cfg.staleness_sec,
             )
-            tasks.append(asyncio.create_task(
+            self._signal_task = asyncio.create_task(
                 self.signal_recorder.run(self.stop, self._update_evt),
-                name="signal-recorder"))
+                name="signal-recorder")
+            tasks.append(self._signal_task)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -214,9 +228,14 @@ class Engine:
                      sum(v.position for v in self.venues.values()))
 
         tasks: List[asyncio.Task] = []
+        if self.record_only:
+            self._start_recorders(tasks)
+        notify = (self._record_only_book_update if self.record_only
+                  else self._update_evt.set)
         for v in self.venues.values():
-            tasks += v.start_tasks(self.stop, self._update_evt.set, live)
-        self._start_recorders(tasks)
+            tasks += v.start_tasks(self.stop, notify, live)
+        if not self.record_only:
+            self._start_recorders(tasks)
         if not self.record_only:
             tasks.append(asyncio.create_task(self._strategy_loop(),
                                              name="strategy"))
@@ -233,12 +252,23 @@ class Engine:
         await self._drain_executions()
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        signal_error = None
+        if self._signal_task is not None:
+            result = results[tasks.index(self._signal_task)]
+            if (isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)):
+                signal_error = result
+        callback_error = self._signal_callback_error
         for v in self.venues.values():
             await v.close()
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
                   self.total_exp_edge, self.total_fill_edge)
+        if signal_error is not None:
+            raise signal_error
+        if callback_error is not None:
+            raise callback_error
 
     async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
         """Wait for every submitted execution; shutdown never abandons a leg."""
