@@ -376,6 +376,13 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
     )
 
+    minute_csv = os.path.normcase(os.path.abspath(cfg.recorder_csv))
+    signal_csv = os.path.normcase(os.path.abspath(cfg.recorder_signal_csv))
+    if minute_csv == signal_csv:
+        raise ConfigError(
+            "recorder.csv and recorder.signal_csv must use different paths / "
+            "分钟数据与信号明细必须写入不同文件")
+
     nonnegative = (
         ("entropy.taker_fee_bps", cfg.entropy.fee_bps),
         ("hedge.taker_fee_bps", cfg.hedge.fee_bps),

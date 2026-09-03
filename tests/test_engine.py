@@ -486,6 +486,14 @@ def test_record_only_propagates_synchronous_signal_calculation_error():
             engine_module.create_venue = original_create_venue
 
         assert all(venue.closed for venue in venues.values())
+        with open(cfg.recorder_signal_csv, newline="",
+                  encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        start_ids = {row["event_id"] for row in rows
+                     if row["event"] == "start"}
+        end_ids = {row["event_id"] for row in rows
+                   if row["event"] == "end"}
+        assert end_ids <= start_ids
 
     asyncio.run(go())
 

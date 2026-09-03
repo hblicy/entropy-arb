@@ -94,6 +94,16 @@ def test_recorder_signal_csv_can_be_overridden():
     assert cfg.recorder_signal_csv == "data/custom-signals.csv"
 
 
+def test_recorder_csv_paths_must_be_distinct_after_normalization():
+    with pytest.raises(ConfigError, match="must use different paths"):
+        load(
+            MINIMAL
+            + "\nrecorder:\n"
+            + "  csv: logs/shared.csv\n"
+            + "  signal_csv: logs/../logs/shared.csv\n"
+        )
+
+
 def test_tradexyz_hedge():
     cfg = load(MINIMAL, hedge="tradexyz")
     assert cfg.hedge.kind == "hl" and cfg.hedge.hl_dex == "xyz"

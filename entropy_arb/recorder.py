@@ -398,8 +398,8 @@ class SignalRecorder:
                     started_at=now,
                     last_written_at=now,
                 )
-                self._states[direction] = active
                 self._queue_row("start", direction, active, now)
+                self._states[direction] = active
             elif (qualifies and active is not None
                   and now - active.last_written_at >= self.sample_sec):
                 self._queue_row("sample", direction, active, now)
