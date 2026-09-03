@@ -97,8 +97,16 @@ in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
 row is written immediately on `start`, once per second as `sample`, and on
 disappearance, stale books, or shutdown as `end`. These rows are observation
 only: they do not gate entries or change live strategy behavior. The signal
-path can be changed with `recorder.signal_csv`. Every row includes the symbol,
-Entropy DEX, and hedge venue, so appended runs remain distinguishable.
+path can be changed with `recorder.signal_csv`. Both files include the symbol,
+Entropy DEX, and hedge venue on every row.
+
+Use a separate `recorder.csv` for each symbol/venue combination. The analyzer
+accepts a purely legacy file without market columns, but rejects a file that
+contains more than one identified market instead of producing unsafe combined
+thresholds. On the first start after upgrading, a legacy minute file is moved
+to the next free `.old`, `.old.1`, ... archive before the new schema is written.
+In `--record-only`, both recorder output files are opened at startup; an output
+creation or write failure stops the process with an error.
 
 **2. Analyze and set your thresholds:**
 
@@ -108,7 +116,8 @@ python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 
 It analyzes `logs/minutes.csv` and prints the premium distribution, how often
 each candidate band would have fired, and a ready-to-paste `thresholds:` block
-for `config.yaml`. It does not analyze `logs/signals.csv`.
+for `config.yaml`. It does not analyze `logs/signals.csv`, and it will not mix
+multiple identified markets from one minute file.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -143,6 +152,7 @@ Once per second it samples both live books; once per minute it writes a row:
 | column | meaning |
 |---|---|
 | `minute_ts`, `time_utc` | minute start (epoch seconds, ISO UTC) |
+| `symbol`, `entropy_dex`, `hedge_venue` | market identity; one file should contain one market |
 | `entropy_bid/ask`, `hedge_bid/ask` | last fresh top-of-book of the minute |
 | `premium_open/high/low/close/mean/std_bps` | mid-to-mid premium of Entropy over the hedge |
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |

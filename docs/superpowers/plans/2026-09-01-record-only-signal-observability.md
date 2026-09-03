@@ -8,6 +8,12 @@
 
 **Tech Stack:** Python 3、asyncio、csv、pytest、PyYAML、现有 `OrderBook` / `plan_arb()`。
 
+> **2026-09-04 完整性修订：** 后续实施计划
+> `2026-09-04-recorder-data-integrity-fixes.md` 为分钟行补充市场身份，要求每个
+> 市场使用独立文件，并让分析器拒绝混合市场；所有 CSV 采用不覆盖旧文件的递增
+> 归档。`--record-only` 启动即验证分钟和信号输出，任一记录器 I/O 失败均停止并
+> 上抛。Engine 清理时关闭全部交易所，且关闭异常不得覆盖更早的业务异常。
+
 ---
 
 ### Task 1: 扩展严格配置并保持向后兼容

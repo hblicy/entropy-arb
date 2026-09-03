@@ -87,8 +87,12 @@ execution:
 # ================== DATA RECORDER / 数据采集 ===============================
 # Always-on while the bot runs: samples both real order books 1/sec and
 # writes one CSV row per minute. This is the input for tools/analyze.py.
+# Use a different csv path for every symbol/venue combination. Record-only
+# opens both CSV outputs at startup and exits if either cannot be created.
 # 机器人运行期间自动开启：每秒采样两边真实盘口，每分钟写一行 CSV，
 # 供 tools/analyze.py 分析并设定上方 thresholds。
+# 每个交易标的与交易所组合使用不同的 csv 路径。仅采集模式会在启动时打开
+# 两个 CSV；任一文件无法创建都会直接退出。
 recorder:
   enabled: true
   csv: logs/minutes.csv

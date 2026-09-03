@@ -87,8 +87,14 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 `logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
 `logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
 `sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
-不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。每行
-包含交易标的、Entropy DEX 和对冲交易所，追加不同运行的数据时仍可区分。
+不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。两个
+文件的每行都包含交易标的、Entropy DEX 和对冲交易所。
+
+每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容完全不含
+市场字段的旧文件，但检测到一个文件中混有多个已标识市场时会直接拒绝分析，
+不会给出存在风险的合并阈值。升级后的首次启动会把旧表头分钟文件移到下一个
+未占用的 `.old`、`.old.1` 等归档，再写入新 schema。`--record-only` 启动时会
+立即打开两个采集文件；创建或写入失败会报错并停止进程。
 
 **第二步：分析数据、设定阈值：**
 
@@ -98,7 +104,7 @@ python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
 以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块；不会分析
-`logs/signals.csv`。
+`logs/signals.csv`，也不会把同一分钟文件中的多个已标识市场混合计算。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -130,6 +136,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | 列 | 含义 |
 |---|---|
 | `minute_ts`, `time_utc` | 分钟起点（epoch 秒 / ISO UTC） |
+| `symbol`, `entropy_dex`, `hedge_venue` | 市场身份；一个文件应只包含一个市场 |
 | `entropy_bid/ask`, `hedge_bid/ask` | 该分钟最后一次有效盘口 |
 | `premium_open/high/low/close/mean/std_bps` | Entropy 相对对冲腿的中间价溢价 |
 | `sell_edge_mean/max_bps` | 卖出 Entropy 方向的可成交溢价（Entropy 买一 / 对冲腿卖一 − 1） |
