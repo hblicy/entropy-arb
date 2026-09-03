@@ -158,6 +158,9 @@ class Engine:
                 size_step=self._step,
                 leg_slippage_bps=cfg.leg_slippage_bps,
                 staleness_sec=cfg.staleness_sec,
+                symbol=cfg.symbol,
+                entropy_dex=cfg.entropy.hl_dex,
+                hedge_venue=cfg.hedge_venue,
             )
             self._signal_task = asyncio.create_task(
                 self.signal_recorder.run(self.stop, self._update_evt),
@@ -265,10 +268,16 @@ class Engine:
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
                   self.total_exp_edge, self.total_fill_edge)
+        if callback_error is not None:
+            if signal_error is not None:
+                log.error(
+                    "signal recorder also failed while closing; preserving "
+                    "the original callback error",
+                    exc_info=(type(signal_error), signal_error,
+                              signal_error.__traceback__))
+            raise callback_error
         if signal_error is not None:
             raise signal_error
-        if callback_error is not None:
-            raise callback_error
 
     async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
         """Wait for every submitted execution; shutdown never abandons a leg."""

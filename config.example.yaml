@@ -30,11 +30,10 @@
 #
 # midline_bps is a number YOU derive from recorded data. Run the bot
 # (--record-only) to collect logs/minutes.csv, then:
-# python3 tools/analyze.py --fees-bps 0.9   # Entropy + Lighter
+# python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 #
 # midline_bps 是你根据采集数据设定的值。先运行机器人（--record-only）采集
-# logs/minutes.csv，再运行 python3 tools/analyze.py --fees-bps 0.9 获取建议值
-#（Entropy + Lighter）。
+# logs/minutes.csv，再运行上面的命令获取建议值（Entropy + Lighter）。
 # 两个方向的门槛都已扣除手续费（引擎会在此之上另加手续费），因此一次完整往返
 # 扣费后净赚 >= upper + lower bps。
 thresholds:

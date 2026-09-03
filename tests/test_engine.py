@@ -498,6 +498,38 @@ def test_record_only_propagates_synchronous_signal_calculation_error():
     asyncio.run(go())
 
 
+def test_signal_callback_error_remains_primary_when_close_also_fails():
+    class CloseFailSignalRecorder(engine_module.SignalRecorder):
+        def close(self, now=None):
+            super().close(now)
+            raise OSError("secondary close failure")
+
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": InvalidBurstVenue("entropy", "ENTROPY"),
+            "hedge": InvalidBurstVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original_create_venue = engine_module.create_venue
+        original_signal_recorder = engine_module.SignalRecorder
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        engine_module.SignalRecorder = CloseFailSignalRecorder
+        try:
+            with pytest.raises(ZeroDivisionError):
+                await eng._run_inner()
+        finally:
+            engine_module.create_venue = original_create_venue
+            engine_module.SignalRecorder = original_signal_recorder
+
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

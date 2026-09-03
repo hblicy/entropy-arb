@@ -48,7 +48,8 @@ HEADER = ["minute_ts", "time_utc",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
 
 SIGNAL_HEADER = [
-    "ts_ms", "time_utc", "event_id", "event", "direction",
+    "ts_ms", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+    "event_id", "event", "direction",
     "elapsed_ms", "end_reason", "entropy_bid", "entropy_ask",
     "hedge_bid", "hedge_ask", "entropy_book_age_ms",
     "hedge_book_age_ms", "book_update_skew_ms", "top_edge_bps",
@@ -65,6 +66,15 @@ class _SignalState:
     event_id: str
     started_at: float
     last_written_at: float
+
+
+def _next_archive_path(path: str) -> str:
+    candidate = path + ".old"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{path}.old.{suffix}"
+        suffix += 1
+    return candidate
 
 
 class _MinuteAgg:
@@ -212,6 +222,7 @@ class SignalRecorder:
                  max_order_notional: float, min_base: float,
                  min_notional: float, size_step: float,
                  leg_slippage_bps: float, staleness_sec: float,
+                 symbol: str, entropy_dex: str, hedge_venue: str,
                  sample_sec: float = 1.0) -> None:
         self.path = path
         self.entropy = entropy
@@ -227,6 +238,9 @@ class SignalRecorder:
         self.leg_slippage_bps = leg_slippage_bps
         self.staleness_sec = staleness_sec
         self.sample_sec = sample_sec
+        self.symbol = symbol
+        self.entropy_dex = entropy_dex
+        self.hedge_venue = hedge_venue
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
         self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
@@ -245,7 +259,7 @@ class SignalRecorder:
             with open(self.path, encoding="utf-8") as existing:
                 existing_header = existing.readline().strip()
             if existing_header != ",".join(SIGNAL_HEADER):
-                old_path = self.path + ".old"
+                old_path = _next_archive_path(self.path)
                 log.warning("%s has an old header — rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
@@ -264,7 +278,7 @@ class SignalRecorder:
         if any(book.best_bid() is None or book.best_ask() is None
                for book in books):
             return "empty_book"
-        if any(now - book.last_update_ts > self.staleness_sec
+        if any(now - book.alive_ts > self.staleness_sec
                for book in books):
             return "stale_book"
         return None
@@ -360,6 +374,9 @@ class SignalRecorder:
             "ts_ms": int(now * 1000),
             "time_utc": datetime.fromtimestamp(now, tz=timezone.utc)
             .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "symbol": self.symbol,
+            "entropy_dex": self.entropy_dex,
+            "hedge_venue": self.hedge_venue,
             "event_id": state.event_id,
             "event": event,
             "direction": direction,

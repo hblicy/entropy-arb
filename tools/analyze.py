@@ -12,7 +12,7 @@ and prints:
 以及可直接粘贴进 config.yaml 的 thresholds 建议值。
 
 Usage:
-    python3 tools/analyze.py --fees-bps 0.9     # Entropy + Lighter
+    python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
     python3 tools/analyze.py --csv path.csv --hours 24 --min-samples 10
 """
 from __future__ import annotations
@@ -36,6 +36,33 @@ def pctl(sorted_vals: list, q: float) -> float:
     if lo == hi:
         return sorted_vals[int(k)]
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
+
+
+def net_edge_bps(gross_edge_bps: float, *, buy_fee_bps: float,
+                 sell_fee_bps: float) -> float:
+    """Convert a gross sell/buy price ratio into executable net edge."""
+    gross_ratio = 1.0 + gross_edge_bps / 1e4
+    net_ratio = (gross_ratio * (1.0 - sell_fee_bps / 1e4)
+                 / (1.0 + buy_fee_bps / 1e4))
+    return (net_ratio - 1.0) * 1e4
+
+
+def fee_adjusted_rooms(rows: list, *, midline: float,
+                       entropy_fee_bps: float,
+                       hedge_fee_bps: float) -> tuple[list, list]:
+    sell_room = sorted((
+        net_edge_bps(
+            row["sell_max"], buy_fee_bps=hedge_fee_bps,
+            sell_fee_bps=entropy_fee_bps) - midline
+        for row in rows
+    ), reverse=True)
+    buy_room = sorted((
+        net_edge_bps(
+            row["buy_max"], buy_fee_bps=entropy_fee_bps,
+            sell_fee_bps=hedge_fee_bps) + midline
+        for row in rows
+    ), reverse=True)
+    return sell_room, buy_room
 
 
 def load_rows(path: str, hours: float, min_samples: int) -> list:
@@ -68,13 +95,26 @@ def main() -> None:
                    help="only use the last N hours (0 = all data)")
     p.add_argument("--min-samples", type=int, default=10,
                    help="skip minutes with fewer fresh samples than this")
-    p.add_argument("--fees-bps", type=float, default=0.0,
-                   help="SUM of both venues' taker fees in bps (each crossing "
-                        "pays both legs); recorded edges are pre-fee, so this "
-                        "is subtracted before counting firings (currently "
-                        "pass ~0.9 for Entropy + Lighter, ~1.9 for Entropy + "
-                        "tradexyz; verify your account rates)")
+    p.add_argument("--entropy-fee-bps", type=float,
+                   help="Entropy taker fee in bps; used with "
+                        "--hedge-fee-bps for exact execution math")
+    p.add_argument("--hedge-fee-bps", type=float,
+                   help="hedge-venue taker fee in bps; used with "
+                        "--entropy-fee-bps for exact execution math")
+    p.add_argument("--fees-bps", type=float,
+                   help="legacy approximate sum of both taker fees; cannot be "
+                        "combined with the exact per-venue options")
     args = p.parse_args()
+
+    exact_fees = (args.entropy_fee_bps is not None
+                  or args.hedge_fee_bps is not None)
+    if args.fees_bps is not None and exact_fees:
+        p.error("--fees-bps cannot be combined with per-venue fee options")
+    supplied_fees = [value for value in (
+        args.fees_bps, args.entropy_fee_bps, args.hedge_fee_bps)
+        if value is not None]
+    if any(not math.isfinite(value) or value < 0 for value in supplied_fees):
+        p.error("fee values must be finite and >= 0")
 
     try:
         rows = load_rows(args.csv, args.hours, args.min_samples)
@@ -108,15 +148,32 @@ def main() -> None:
     # room beyond the midline that was actually executable each minute, net
     # of taker fees (config thresholds are net-of-fee: the engine adds fees
     # on top, and recorded edges are pre-fee)
-    fees = args.fees_bps
-    sell_room = sorted((r["sell_max"] - midline - fees for r in rows),
-                       reverse=True)
-    buy_room = sorted((r["buy_max"] + midline - fees for r in rows),
-                      reverse=True)
+    if exact_fees:
+        entropy_fee = args.entropy_fee_bps or 0.0
+        hedge_fee = args.hedge_fee_bps or 0.0
+        sell_room, buy_room = fee_adjusted_rooms(
+            rows, midline=midline, entropy_fee_bps=entropy_fee,
+            hedge_fee_bps=hedge_fee)
+        fee_summary_en = (
+            f"exact taker fees entropy={entropy_fee:.3f} bps and "
+            f"hedge={hedge_fee:.3f} bps")
+        fee_summary_zh = (
+            f"精确吃单费 Entropy={entropy_fee:.3f} bps、"
+            f"对冲腿={hedge_fee:.3f} bps")
+    else:
+        fees = args.fees_bps or 0.0
+        sell_room = sorted(
+            (row["sell_max"] - midline - fees for row in rows),
+            reverse=True)
+        buy_room = sorted(
+            (row["buy_max"] + midline - fees for row in rows),
+            reverse=True)
+        fee_summary_en = f"legacy approximate combined fees={fees:.3f} bps"
+        fee_summary_zh = f"兼容近似两腿合计手续费={fees:.3f} bps"
 
-    print(f"\nwith midline_bps = {midline:+.1f} (median) and {fees:.1f} bps "
-          f"combined taker fees per crossing, minutes each band would have "
-          f"fired / 单次跨所成交两腿合计手续费，"
+    print(f"\nwith midline_bps = {midline:+.1f} (median) and "
+          f"{fee_summary_en}, minutes each band would have fired / "
+          f"{fee_summary_zh}，"
           f"各档净阈值触发的分钟数:")
     print(f"  {'band bps':>9} | {'SELL entropy':>17} | {'BUY entropy':>17}")
     print(f"  {'':>9} | {'minutes':>8} {'per day':>8} | "
@@ -134,11 +191,10 @@ def main() -> None:
     sug_lower = max(round(pctl(sorted(buy_room), 90) * 2) / 2, 1.0)
     print(f"""
 suggested starting point (fires ~10% of minutes, already net of the
-{fees:.1f} bps per-crossing fees passed via --fees-bps; after paying them
-on entry and exit, a full round trip nets >= upper+lower bps) /
-建议起点（约 10% 的分钟触发；每次跨所成交均已扣除 --fees-bps 传入的
-{fees:.1f} bps 两腿手续费，开仓和平仓分别扣费后，一次完整往返净赚
->= upper+lower bps）:
+configured {fee_summary_en}; after paying fees on entry and exit, a full
+round trip nets >= upper+lower bps) /
+建议起点（约 10% 的分钟触发；已使用{fee_summary_zh}，开仓和平仓分别扣费后，
+一次完整往返净赚 >= upper+lower bps）:
 
 thresholds:
   midline_bps: {midline}

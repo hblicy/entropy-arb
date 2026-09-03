@@ -43,7 +43,8 @@
 
 `logs/signals.csv` 每行包含：
 
-- `ts_ms`、`time_utc`、`event_id`、`event`、`direction`、`elapsed_ms`、`end_reason`
+- `ts_ms`、`time_utc`、`symbol`、`entropy_dex`、`hedge_venue`
+- `event_id`、`event`、`direction`、`elapsed_ms`、`end_reason`
 - `entropy_bid`、`entropy_ask`、`hedge_bid`、`hedge_ask`
 - `entropy_book_age_ms`、`hedge_book_age_ms`、`book_update_skew_ms`
 - `top_edge_bps`、`net_threshold_bps`、`total_fee_bps`
@@ -52,7 +53,7 @@
 - `buy_depth_slippage_bps`、`sell_depth_slippage_bps`
 - `leg_slippage_limit_bps`、`expected_edge_usd`
 
-盘口年龄使用各自 `last_update_ts`，而不是连接心跳 `alive_ts`。更新时间差为两边 `last_update_ts` 的绝对差。深度滑点分别衡量计划最差买价相对买一、计划最差卖价相对卖一的偏离。
+信号生命周期是否过期与实盘一致，使用各自 `alive_ts`；输出的盘口年龄和更新时间差仍使用 `last_update_ts`，用于观察真实价格更新时间和两边错位程度。深度滑点分别衡量计划最差买价相对买一、计划最差卖价相对卖一的偏离。
 
 ## 配置
 
@@ -66,10 +67,13 @@ recorder:
 ```
 
 `signal_csv` 有默认值，现有配置无需修改即可继续运行。配置仍执行严格未知键校验。
+仅在 `--record-only` 下，分钟 CSV、信号 CSV 与日志文件必须解析为三个不同文件；
+校验会识别规范化路径、符号链接和已存在的硬链接。实盘不会因未使用的
+`signal_csv` 与其他路径相同而拒绝启动。
 
 ## 错误处理
 
-- 旧信号文件表头与新 schema 不一致时，沿用分钟记录器规则旋转为 `.old`，避免不同 schema 混写。
+- 旧信号文件表头与新 schema 不一致时旋转为未占用的 `.old`、`.old.1` 等归档，避免不同 schema 混写或覆盖已有归档。
 - 文件创建、写入或 flush 失败时记录完整异常、设置停止事件并让任务失败；不得继续运行并假装数据已落盘。
 - 预期的无盘口、盘口失效和计划不足通过 `end_reason` 或 `plan_status` 表达，不作为异常吞掉。
 

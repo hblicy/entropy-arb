@@ -53,7 +53,8 @@ def set_signal_levels(venue, *, bids, asks, ts):
     venue.book.alive_ts = ts
 
 
-def make_signal_recorder(path, sample_sec=1.0):
+def make_signal_recorder(path, sample_sec=1.0, *, symbol="SNDK",
+                         entropy_dex="io", hedge_venue="lighter-rh"):
     entropy = SignalVenue("entropy")
     hedge = SignalVenue("hedge")
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
@@ -65,6 +66,8 @@ def make_signal_recorder(path, sample_sec=1.0):
         min_base=0.0, min_notional=0.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
         sample_sec=sample_sec,
+        symbol=symbol, entropy_dex=entropy_dex,
+        hedge_venue=hedge_venue,
     )
     return rec, entropy, hedge
 
@@ -220,6 +223,7 @@ def test_signal_metrics_use_plan_and_book_update_times():
         take_fraction=1.0, max_order_notional=150.0,
         min_base=0.0, min_notional=0.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
+        symbol="SNDK", entropy_dex="io", hedge_venue="lighter-rh",
     )
 
     rec.observe(now=2001.0)
@@ -285,6 +289,7 @@ def test_signal_below_minimum_plan_is_still_recorded():
         take_fraction=1.0, max_order_notional=100_000.0,
         min_base=0.0, min_notional=100.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
+        symbol="SNDK", entropy_dex="io", hedge_venue="lighter-rh",
     )
 
     rec.observe(now=3000.0)
@@ -334,6 +339,24 @@ def test_signal_rotates_old_header_before_writing():
         assert fh.read() == "old,header\n1,2\n"
 
 
+def test_signal_rotation_preserves_existing_archive():
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "signals.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("previous,header\n1,2\n")
+    with open(path + ".old", "w", encoding="utf-8", newline="") as fh:
+        fh.write("older archive\n")
+    rec, _, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    rec.close(now=1000.1)
+
+    with open(path + ".old", encoding="utf-8") as fh:
+        assert fh.read() == "older archive\n"
+    with open(path + ".old.1", encoding="utf-8") as fh:
+        assert fh.read() == "previous,header\n1,2\n"
+
+
 def test_signal_async_samples_without_another_book_update():
     async def go():
         path = os.path.join(tempfile.mkdtemp(), "signals.csv")
@@ -344,10 +367,21 @@ def test_signal_async_samples_without_another_book_update():
         stop, update_evt = asyncio.Event(), asyncio.Event()
 
         task = asyncio.create_task(rec.run(stop, update_evt))
-        await asyncio.sleep(0.055)
-        stop.set()
-        update_evt.set()
-        await task
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 1.0
+            while loop.time() < deadline:
+                if os.path.exists(path):
+                    events = [row["event"] for row in read_signal_rows(path)]
+                    if "sample" in events:
+                        break
+                await asyncio.sleep(0.005)
+            else:
+                pytest.fail("signal recorder did not emit a sample before the deadline")
+        finally:
+            stop.set()
+            update_evt.set()
+            await task
 
         events = [row["event"] for row in read_signal_rows(path)]
         assert events[0] == "start"
@@ -524,6 +558,29 @@ def test_signal_event_ids_are_unique_across_appended_runs_same_millisecond():
     assert len(set(start_ids)) == 2
 
 
+def test_signal_rows_identify_market_across_appended_runs():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+
+    for symbol, entropy_dex, hedge_venue in (
+            ("SNDK", "io", "lighter-rh"),
+            ("XYZ100", "io", "tradexyz")):
+        rec, entropy, hedge = make_signal_recorder(
+            path, symbol=symbol, entropy_dex=entropy_dex,
+            hedge_venue=hedge_venue)
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=5000.0)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=5000.0)
+        rec.observe(now=5000.0)
+        rec.close(now=5000.1)
+
+    starts = [row for row in read_signal_rows(path)
+              if row["event"] == "start"]
+    assert [(row["symbol"], row["entropy_dex"], row["hedge_venue"])
+            for row in starts] == [
+        ("SNDK", "io", "lighter-rh"),
+        ("XYZ100", "io", "tradexyz"),
+    ]
+
+
 def test_signal_ends_immediately_when_book_is_not_ready():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, _ = make_signal_recorder(path)
@@ -536,6 +593,21 @@ def test_signal_ends_immediately_when_book_is_not_ready():
     rows = read_signal_rows(path)
     assert [row["event"] for row in rows] == ["start", "end"]
     assert rows[-1]["end_reason"] == "book_not_ready"
+
+
+def test_signal_stays_active_while_books_are_alive_without_price_updates():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    entropy.book.last_update_ts = hedge.book.last_update_ts = 900.0
+    entropy.book.alive_ts = hedge.book.alive_ts = 1001.0
+    rec.observe(now=1001.0)
+    rec.close(now=1001.1)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "sample", "end"]
+    assert rows[-1]["end_reason"] == "shutdown"
 
 
 if __name__ == "__main__":

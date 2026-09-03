@@ -33,9 +33,12 @@ thresholds:
 """
 
 
-def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh"):
-    return load_config(write_tmp(yaml_text), NO_ENV,
-                       symbol=symbol, hedge_venue=hedge)
+def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh",
+         record_only=False):
+    kwargs = {"symbol": symbol, "hedge_venue": hedge}
+    if record_only:
+        kwargs["record_only"] = True
+    return load_config(write_tmp(yaml_text), NO_ENV, **kwargs)
 
 
 def test_example_config_loads():
@@ -100,7 +103,50 @@ def test_recorder_csv_paths_must_be_distinct_after_normalization():
             MINIMAL
             + "\nrecorder:\n"
             + "  csv: logs/shared.csv\n"
-            + "  signal_csv: logs/../logs/shared.csv\n"
+            + "  signal_csv: logs/../logs/shared.csv\n",
+            record_only=True,
+        )
+
+
+def test_live_config_allows_unused_signal_path_to_match_minute_path():
+    cfg = load(
+        MINIMAL
+        + "\nrecorder:\n"
+        + "  enabled: false\n"
+        + "  csv: logs/signals.csv\n"
+    )
+    assert cfg.recorder_csv == cfg.recorder_signal_csv
+
+
+def test_record_only_rejects_signal_and_log_path_collision():
+    with pytest.raises(ConfigError, match="must use different paths"):
+        load(
+            MINIMAL
+            + "\nrecorder:\n"
+            + "  signal_csv: logs/shared.csv\n"
+            + "logging:\n"
+            + "  file: ./logs/shared.csv\n",
+            record_only=True,
+        )
+
+
+def test_record_only_rejects_hardlinked_output_files():
+    directory = tempfile.mkdtemp()
+    minute_path = os.path.join(directory, "minutes.csv")
+    signal_path = os.path.join(directory, "signals.csv")
+    with open(minute_path, "w", encoding="utf-8") as fh:
+        fh.write("existing")
+    os.link(minute_path, signal_path)
+    minute_yaml = minute_path.replace("\\", "/")
+    signal_yaml = signal_path.replace("\\", "/")
+
+    with pytest.raises(ConfigError, match="must use different paths"):
+        load(
+            MINIMAL
+            + "\nrecorder:\n"
+            + f'  csv: "{minute_yaml}"\n'
+            + f'  signal_csv: "{signal_yaml}"\n',
+            record_only=True,
         )
 
 

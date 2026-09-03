@@ -97,12 +97,13 @@ in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
 row is written immediately on `start`, once per second as `sample`, and on
 disappearance, stale books, or shutdown as `end`. These rows are observation
 only: they do not gate entries or change live strategy behavior. The signal
-path can be changed with `recorder.signal_csv`.
+path can be changed with `recorder.signal_csv`. Every row includes the symbol,
+Entropy DEX, and hedge venue, so appended runs remain distinguishable.
 
 **2. Analyze and set your thresholds:**
 
 ```bash
-python3 tools/analyze.py --fees-bps 0.9
+python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 It analyzes `logs/minutes.csv` and prints the premium distribution, how often
@@ -148,10 +149,12 @@ Once per second it samples both live books; once per minute it writes a row:
 | `buy_edge_mean/max_bps` | executable premium for BUY entropy (hedge bid / entropy ask − 1) |
 | `samples` | how many of the ~60 seconds both books were fresh |
 
-Recorded edges are pre-fee; the analyzer subtracts `--fees-bps` (pass the
-**sum** of both venues' taker fees — currently about 0.9 for Entropy +
-Lighter, or about 1.9 for Entropy + `tradexyz`) before counting firings, so
-its table and suggestions translate directly into config values.
+Recorded edges are pre-fee. Pass each venue's taker fee separately with
+`--entropy-fee-bps` and `--hedge-fee-bps`; the analyzer then applies the same
+buy/sell ratio formula as live execution before counting firings. For example,
+use `0.9` and `0.0` for Entropy + Lighter, or `0.9` and `1.0` for Entropy +
+`tradexyz`. The legacy `--fees-bps` combined value remains accepted as an
+approximation for existing scripts.
 Fees can vary by account or venue; verify them before deployment. `--hours 24`
 restricts to recent data; premiums drift, so re-run it regularly and update
 `config.yaml`.

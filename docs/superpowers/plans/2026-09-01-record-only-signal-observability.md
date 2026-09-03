@@ -148,7 +148,8 @@ Expected: FAIL，`SignalRecorder` 尚不存在。
 
 ```python
 SIGNAL_HEADER = [
-    "ts_ms", "time_utc", "event_id", "event", "direction",
+    "ts_ms", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+    "event_id", "event", "direction",
     "elapsed_ms", "end_reason", "entropy_bid", "entropy_ask",
     "hedge_bid", "hedge_ask", "entropy_book_age_ms",
     "hedge_book_age_ms", "book_update_skew_ms", "top_edge_bps",
@@ -320,7 +321,7 @@ git commit -m "功能：记录信号执行质量指标"
 
 测试一：创建记录器、写一组事件、关闭，再对同一路径创建记录器写第二组事件；断言文件只有一个 `SIGNAL_HEADER`。
 
-测试二：先写入 `old,header\n1,2\n`，再创建记录器并观察合格信号；断言新文件首行等于 `SIGNAL_HEADER`，旁边产生 `signals.csv.old` 且保留旧内容。
+测试二：先写入 `old,header\n1,2\n`，再创建记录器并观察合格信号；断言新文件首行等于 `SIGNAL_HEADER`，旁边产生未占用的 `signals.csv.old`、`.old.1` 等归档且保留所有旧内容。
 
 - [ ] **Step 2: 写异步每秒采样和错误传播失败测试**
 
@@ -344,7 +345,7 @@ Expected: FAIL。
 
 - [ ] **Step 4: 实现文件初始化和异步运行循环**
 
-沿用 `MinuteRecorder` 的父目录创建、表头检查及 `.old` 旋转规则，但使用独立 `SIGNAL_HEADER`。打开文件时采用 append/newline/UTF-8；每行 `writerow()` 后立即 `flush()`。
+沿用 `MinuteRecorder` 的父目录创建和表头检查规则，但使用独立 `SIGNAL_HEADER`；旋转时选择未占用的 `.old`、`.old.1` 等路径，不能覆盖已有归档。打开文件时采用 append/newline/UTF-8；每行 `writerow()` 后立即 `flush()`。
 
 `run(stop, update_evt)` 必须先清事件再读取盘口，从而避免行情更新发生在观察与等待之间时丢失唤醒：
 
@@ -431,6 +432,9 @@ self.signal_recorder = SignalRecorder(
     self.cfg.recorder_signal_csv,
     self.entropy,
     self.hedge,
+    symbol=self.cfg.symbol,
+    entropy_dex=self.cfg.entropy.hl_dex,
+    hedge_venue=self.cfg.hedge_venue,
     midline_bps=self.cfg.midline_bps,
     upper_bps=self.cfg.upper_bps,
     lower_bps=self.cfg.lower_bps,
@@ -531,7 +535,7 @@ Run: `git diff origin/codex/multi-hedge-foundation...HEAD -- entropy_arb/engine.
 - `_scan()`、订单发送、仓位管理和风控门槛没有变化。
 - 实盘模式不创建 `SignalRecorder`。
 - 信号判断使用与 `plan_arb()` 一致的手续费语义。
-- 盘口年龄只读 `last_update_ts`，不读 `alive_ts`。
+- 生命周期过期判断与实盘一致地读取 `alive_ts`；观测字段中的盘口年龄和更新时间差读取 `last_update_ts`。
 - 所有 CSV 写入/flush 异常都会停止并向上传播。
 - 不包含密钥、凭据或服务器环境文件。
 

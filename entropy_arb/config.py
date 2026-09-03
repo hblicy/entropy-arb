@@ -255,8 +255,21 @@ def _env_i(name: str) -> Optional[int]:
 
 # -------------------------------------------------------------------- loading
 
+def _same_output_file(left: str, right: str) -> bool:
+    left_path = os.path.normcase(os.path.realpath(os.path.abspath(left)))
+    right_path = os.path.normcase(os.path.realpath(os.path.abspath(right)))
+    if left_path == right_path:
+        return True
+    try:
+        return (os.path.exists(left_path) and os.path.exists(right_path)
+                and os.path.samefile(left_path, right_path))
+    except OSError:
+        return False
+
+
 def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
-                symbol: str, hedge_venue: str) -> Config:
+                symbol: str, hedge_venue: str,
+                record_only: bool = False) -> Config:
     load_dotenv(env_file)
     try:
         with open(config_file, encoding="utf-8") as fh:
@@ -376,12 +389,19 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
     )
 
-    minute_csv = os.path.normcase(os.path.abspath(cfg.recorder_csv))
-    signal_csv = os.path.normcase(os.path.abspath(cfg.recorder_signal_csv))
-    if minute_csv == signal_csv:
-        raise ConfigError(
-            "recorder.csv and recorder.signal_csv must use different paths / "
-            "分钟数据与信号明细必须写入不同文件")
+    if record_only:
+        outputs = (
+            ("recorder.csv", cfg.recorder_csv),
+            ("recorder.signal_csv", cfg.recorder_signal_csv),
+            ("logging.file", cfg.log_file),
+        )
+        for index, (left_name, left_path) in enumerate(outputs):
+            for right_name, right_path in outputs[index + 1:]:
+                if _same_output_file(left_path, right_path):
+                    raise ConfigError(
+                        f"{left_name} and {right_name} must use different "
+                        "paths in --record-only / 仅采集模式下各输出文件路径"
+                        "必须不同")
 
     nonnegative = (
         ("entropy.taker_fee_bps", cfg.entropy.fee_bps),

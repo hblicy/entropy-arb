@@ -87,12 +87,13 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 `logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
 `logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
 `sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
-不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。
+不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。每行
+包含交易标的、Entropy DEX 和对冲交易所，追加不同运行的数据时仍可区分。
 
 **第二步：分析数据、设定阈值：**
 
 ```bash
-python3 tools/analyze.py --fees-bps 0.9
+python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
@@ -135,9 +136,11 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `buy_edge_mean/max_bps` | 买入 Entropy 方向的可成交溢价（对冲腿买一 / Entropy 卖一 − 1） |
 | `samples` | 该分钟约 60 秒中两边盘口同时有效的秒数 |
 
-采集的 edge 为费前口径；分析工具在统计触发频率前会先扣除 `--fees-bps`
-（请传入**两边吃单费之和**——目前 Entropy + Lighter 约为 0.9，
-Entropy + `tradexyz` 约为 1.9），因此其表格与建议值可直接填入配置。
+采集的 edge 为费前口径。请分别用 `--entropy-fee-bps` 和
+`--hedge-fee-bps` 传入两边吃单费；分析工具会按实盘相同的买卖价格比公式
+扣费后再统计触发频率。例如 Entropy + Lighter 使用 `0.9` 和 `0.0`，
+Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
+`--fees-bps`，但它只是近似计算。
 费率可能因账户或交易所调整，上线前应核对实际费率。`--hours 24` 可只分析
 最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
 
