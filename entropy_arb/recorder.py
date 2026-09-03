@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -229,10 +230,12 @@ class SignalRecorder:
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
         self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
+        self._run_id = uuid.uuid4().hex
         self._pending_rows = deque()
         self._fh = None
         self._writer = None
         self._closed = False
+        self._serialization_failed = False
 
     def _open(self) -> None:
         directory = os.path.dirname(self.path)
@@ -371,8 +374,12 @@ class SignalRecorder:
         if self._writer is None:
             self._open()
         while self._pending_rows:
-            self._writer.writerow(self._pending_rows[0])
-            self._pending_rows.popleft()
+            row = self._pending_rows.popleft()
+            try:
+                self._writer.writerow(row)
+            except BaseException:
+                self._serialization_failed = True
+                raise
             self._fh.flush()
             self.rows_written += 1
 
@@ -386,6 +393,7 @@ class SignalRecorder:
                 self._event_seq[direction] += 1
                 active = _SignalState(
                     event_id=(f"{direction}-{int(now * 1000)}-"
+                              f"{self._run_id}-"
                               f"{self._event_seq[direction]}"),
                     started_at=now,
                     last_written_at=now,
@@ -406,17 +414,33 @@ class SignalRecorder:
     def close(self, now: Optional[float] = None) -> None:
         if self._closed:
             return
-        now = time.time() if now is None else now
-        for direction, active in self._states.items():
-            if active is not None:
-                self._queue_row(
-                    "end", direction, active, now, "shutdown")
-                self._states[direction] = None
-        self._flush_pending()
-        if self._fh is not None:
-            self._fh.close()
+        primary_error = None
+        try:
+            if not self._serialization_failed:
+                now = time.time() if now is None else now
+                for direction, active in self._states.items():
+                    if active is not None:
+                        self._queue_row(
+                            "end", direction, active, now, "shutdown")
+                        self._states[direction] = None
+                self._flush_pending()
+        except BaseException as exc:
+            primary_error = exc
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+            else:
+                log.exception(
+                    "signal file also failed while closing; preserving the "
+                    "original error")
+        finally:
             self._fh = self._writer = None
-        self._closed = True
+            self._closed = True
+        if primary_error is not None:
+            raise primary_error
 
     def _seconds_until_next_sample(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now

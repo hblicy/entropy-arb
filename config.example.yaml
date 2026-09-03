@@ -50,7 +50,7 @@ entropy:
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
-  taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
+  # taker_fee_bps: 0.0       # optional override; Lighter: 0, tradexyz: ~1.0
   max_position_usd: 1000
   max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 

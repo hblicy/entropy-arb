@@ -53,6 +53,17 @@ def test_example_config_loads():
     assert cfg.dashboard and cfg.log_file
 
 
+def test_example_config_uses_venue_specific_hedge_fee_defaults():
+    lighter = load_config(EXAMPLE, NO_ENV,
+                          symbol="SNDK", hedge_venue="lighter-rh")
+    tradexyz = load_config(EXAMPLE, NO_ENV,
+                           symbol="SNDK", hedge_venue="tradexyz")
+
+    assert lighter.hedge.fee_bps == 0.0
+    assert tradexyz.hedge.fee_bps == 1.0
+    assert tradexyz.entropy.fee_bps + tradexyz.hedge.fee_bps == 1.9
+
+
 def test_utf8_config_loads_independently_of_system_locale():
     cfg = load("""
 # 中文配置注释必须在 Windows 和 Linux 上一致读取

@@ -416,6 +416,79 @@ def test_signal_flush_failure_does_not_serialize_pending_row_twice():
     asyncio.run(go())
 
 
+def test_signal_persistent_flush_failure_still_closes_file():
+    class AlwaysFailFlushBuffer(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.fail_flush = False
+            self.close_called = False
+
+        def flush(self):
+            if self.fail_flush:
+                raise OSError("persistent flush failure")
+            return super().flush()
+
+        def close(self):
+            self.close_called = True
+            return super().close()
+
+    async def go():
+        rec, entropy, hedge = make_signal_recorder("unused.csv")
+        now = time.time()
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=now)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=now)
+        stream = AlwaysFailFlushBuffer()
+        writer = csv.DictWriter(stream, fieldnames=SIGNAL_HEADER)
+        writer.writeheader()
+        rec._fh = stream
+        rec._writer = writer
+        stream.fail_flush = True
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        with pytest.raises(OSError, match="persistent flush failure"):
+            await rec.run(stop, update_evt)
+
+        assert stream.close_called
+        assert stream.closed
+        assert rec._fh is None
+        assert rec._writer is None
+        assert stop.is_set()
+
+    asyncio.run(go())
+
+
+def test_signal_writerow_failure_is_not_retried_during_close():
+    class AlwaysFailWriter:
+        def __init__(self):
+            self.events = []
+
+        def writerow(self, row):
+            self.events.append(row["event"])
+            raise OSError("persistent writerow failure")
+
+    async def go():
+        rec, entropy, hedge = make_signal_recorder("unused.csv")
+        now = time.time()
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=now)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=now)
+        stream = io.StringIO()
+        writer = AlwaysFailWriter()
+        rec._fh = stream
+        rec._writer = writer
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        with pytest.raises(OSError, match="persistent writerow failure"):
+            await rec.run(stop, update_evt)
+
+        assert writer.events == ["start"]
+        assert stream.closed
+        assert rec._fh is None
+        assert rec._writer is None
+        assert stop.is_set()
+
+    asyncio.run(go())
+
+
 def test_signal_event_ids_are_unique_within_the_same_millisecond():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, hedge = make_signal_recorder(path)
@@ -428,6 +501,22 @@ def test_signal_event_ids_are_unique_within_the_same_millisecond():
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=4000.0008)
     rec.observe(now=4000.0008)
     rec.close(now=4000.001)
+
+    start_ids = [row["event_id"] for row in read_signal_rows(path)
+                 if row["event"] == "start"]
+    assert len(start_ids) == 2
+    assert len(set(start_ids)) == 2
+
+
+def test_signal_event_ids_are_unique_across_appended_runs_same_millisecond():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+
+    for _ in range(2):
+        rec, entropy, hedge = make_signal_recorder(path)
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=5000.0)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=5000.0)
+        rec.observe(now=5000.0)
+        rec.close(now=5000.1)
 
     start_ids = [row["event_id"] for row in read_signal_rows(path)
                  if row["event"] == "start"]

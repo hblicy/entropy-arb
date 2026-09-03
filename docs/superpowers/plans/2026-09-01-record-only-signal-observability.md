@@ -196,8 +196,11 @@ qualifies = sell_bid * (1 - sell_fee_bps / 1e4) >= (
 事件编号固定为：
 
 ```python
-event_id = f"{direction}-{int(now * 1000)}"
+event_id = f"{direction}-{int(now * 1000)}-{run_id}-{direction_seq}"
 ```
+
+其中 `run_id` 是每个记录器实例创建时生成的 UUID，`direction_seq` 是该方向
+在本次运行内递增的序号，避免同毫秒重入和跨运行追加时发生冲突。
 
 `close(now=None)` 对仍激活的两个方向各写一次 `shutdown` end，关闭文件，并保持幂等。
 
