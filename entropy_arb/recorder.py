@@ -68,7 +68,7 @@ class _SignalState:
     last_written_at: float
 
 
-def _next_archive_path(path: str) -> str:
+def next_archive_path(path: str) -> str:
     candidate = path + ".old"
     suffix = 1
     while os.path.exists(candidate):
@@ -156,11 +156,13 @@ class MinuteRecorder:
             os.makedirs(d, exist_ok=True)
         if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
             # never append rows under a different schema's header
-            with open(self.path) as fh0:
-                if fh0.readline().strip() != ",".join(HEADER):
-                    log.warning("%s has an old header — rotated to %s.old",
-                                self.path, self.path)
-                    os.replace(self.path, self.path + ".old")
+            with open(self.path, encoding="utf-8") as fh0:
+                existing_header = fh0.readline().strip()
+            if existing_header != ",".join(HEADER):
+                old_path = next_archive_path(self.path)
+                log.warning("%s has an old header — rotated to %s",
+                            self.path, old_path)
+                os.replace(self.path, old_path)
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
         self._fh = open(self.path, "a", newline="")
         self._writer = csv.writer(self._fh)
@@ -267,7 +269,7 @@ class SignalRecorder:
             with open(self.path, encoding="utf-8") as existing:
                 existing_header = existing.readline().strip()
             if existing_header != ",".join(SIGNAL_HEADER):
-                old_path = _next_archive_path(self.path)
+                old_path = next_archive_path(self.path)
                 log.warning("%s has an old header — rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
@@ -482,6 +484,8 @@ class SignalRecorder:
         primary_error = None
         try:
             try:
+                if self._writer is None:
+                    self._open()
                 while not stop.is_set():
                     update_evt.clear()
                     self.observe()

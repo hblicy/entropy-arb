@@ -27,7 +27,7 @@ import aiohttp
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .models import OrderResult
-from .recorder import MinuteRecorder, SignalRecorder
+from .recorder import MinuteRecorder, SignalRecorder, next_archive_path
 from .venues.base import VenueAdapter
 from .venues.registry import VenueRuntime, create_venue
 
@@ -883,8 +883,9 @@ class Engine:
                 os.makedirs(d, exist_ok=True)
             if os.path.exists(path):
                 with open(path) as fh0:
-                    if fh0.readline().strip() != ",".join(CSV_HEADER):
-                        os.replace(path, path + ".old")
+                    existing_header = fh0.readline().strip()
+                if existing_header != ",".join(CSV_HEADER):
+                    os.replace(path, next_archive_path(path))
             new = not os.path.exists(path)
             with open(path, "a", newline="") as fh:
                 w = csv.writer(fh)

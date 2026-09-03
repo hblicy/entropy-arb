@@ -533,6 +533,26 @@ def test_signal_callback_error_remains_primary_when_close_also_fails():
     asyncio.run(go())
 
 
+def test_trades_rotation_preserves_existing_archive():
+    eng = make_engine()
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "trades.csv")
+    eng.cfg.trades_csv = path
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("previous,header\n1,2\n")
+    with open(path + ".old", "w", encoding="utf-8", newline="") as fh:
+        fh.write("older archive\n")
+
+    eng._log_csv(
+        "sell_entropy", eng.hedge, eng.entropy, execution_plan(), True,
+        0.5, 0.5, "filled", "filled", 0.1, 0.0)
+
+    with open(path + ".old", encoding="utf-8") as fh:
+        assert fh.read() == "older archive\n"
+    with open(path + ".old.1", encoding="utf-8") as fh:
+        assert fh.read() == "previous,header\n1,2\n"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

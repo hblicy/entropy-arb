@@ -166,6 +166,25 @@ def test_append_keeps_single_header():
     assert lines[0].startswith("minute_ts,")
 
 
+def test_minute_rotation_preserves_existing_archive():
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "minutes.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("previous,header\n1,2\n")
+    with open(path + ".old", "w", encoding="utf-8", newline="") as fh:
+        fh.write("older archive\n")
+    rec = MinuteRecorder(
+        path, OrderBook(), OrderBook(), staleness_sec=1e9)
+
+    rec._open()
+    rec.close()
+
+    with open(path + ".old", encoding="utf-8") as fh:
+        assert fh.read() == "older archive\n"
+    with open(path + ".old.1", encoding="utf-8") as fh:
+        assert fh.read() == "previous,header\n1,2\n"
+
+
 def test_signal_lifecycle_writes_start_sample_and_end():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, _ = make_signal_recorder(path)
@@ -412,6 +431,26 @@ def test_signal_async_samples_without_another_book_update():
         assert events[0] == "start"
         assert "sample" in events
         assert events[-1] == "end"
+
+    asyncio.run(go())
+
+
+def test_signal_invalid_path_fails_before_any_signal():
+    async def go():
+        directory = tempfile.mkdtemp()
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("block")
+        rec, entropy, hedge = make_signal_recorder(
+            os.path.join(blocker, "signals.csv"))
+        set_signal_book(entropy, bid=100.00, ask=100.02, ts=time.time())
+        set_signal_book(hedge, bid=100.00, ask=100.02, ts=time.time())
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        with pytest.raises(OSError):
+            await asyncio.wait_for(
+                rec.run(stop, update_evt), timeout=0.2)
+        assert stop.is_set()
 
     asyncio.run(go())
 
