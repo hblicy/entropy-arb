@@ -235,12 +235,21 @@ class SignalRecorder:
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+            with open(self.path, encoding="utf-8") as existing:
+                existing_header = existing.readline().strip()
+            if existing_header != ",".join(SIGNAL_HEADER):
+                old_path = self.path + ".old"
+                log.warning("%s has an old header — rotated to %s",
+                            self.path, old_path)
+                os.replace(self.path, old_path)
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
         self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._fh, fieldnames=SIGNAL_HEADER)
         if new:
             self._writer.writeheader()
             self._fh.flush()
+        log.info("recording signal lifecycles -> %s", self.path)
 
     def _books_status(self, now: float) -> Optional[str]:
         books = (self.entropy.book, self.hedge.book)
@@ -388,3 +397,54 @@ class SignalRecorder:
             self._fh.close()
             self._fh = self._writer = None
         self._closed = True
+
+    def _seconds_until_next_sample(self, now: Optional[float] = None) -> float:
+        now = time.time() if now is None else now
+        active = [state for state in self._states.values()
+                  if state is not None]
+        if not active:
+            return 3600.0
+        due = min(state.last_written_at + self.sample_sec
+                  for state in active)
+        return max(due - now, 0.001)
+
+    async def run(self, stop: asyncio.Event,
+                  update_evt: asyncio.Event) -> None:
+        primary_error = None
+        try:
+            try:
+                while not stop.is_set():
+                    update_evt.clear()
+                    self.observe()
+                    if stop.is_set():
+                        break
+                    timeout = self._seconds_until_next_sample()
+                    if update_evt.is_set():
+                        continue
+                    try:
+                        await asyncio.wait_for(
+                            update_evt.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                primary_error = exc
+                log.exception("signal recorder failed")
+                stop.set()
+                update_evt.set()
+                raise
+        finally:
+            try:
+                self.close()
+            except Exception:
+                stop.set()
+                update_evt.set()
+                if primary_error is None:
+                    log.exception("signal recorder failed while closing")
+                    raise
+                log.exception(
+                    "signal recorder also failed while closing; preserving "
+                    "the original error")
+            log.info("signal recorder stopped — %d row(s) written to %s",
+                     self.rows_written, self.path)

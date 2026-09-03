@@ -3,9 +3,11 @@
 Run:  python3 -m pytest tests/  (or  python3 tests/test_recorder.py)
 """
 import csv
+import asyncio
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -15,6 +17,7 @@ from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
 from entropy_arb.recorder import (  # noqa: E402
     HEADER,
     MinuteRecorder,
+    SIGNAL_HEADER,
     SignalRecorder,
 )
 
@@ -49,7 +52,7 @@ def set_signal_levels(venue, *, bids, asks, ts):
     venue.book.alive_ts = ts
 
 
-def make_signal_recorder(path):
+def make_signal_recorder(path, sample_sec=1.0):
     entropy = SignalVenue("entropy")
     hedge = SignalVenue("hedge")
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
@@ -59,7 +62,8 @@ def make_signal_recorder(path):
         midline_bps=0.0, upper_bps=5.0, lower_bps=5.0,
         take_fraction=1.0, max_order_notional=100_000.0,
         min_base=0.0, min_notional=0.0, size_step=0.001,
-        leg_slippage_bps=20.0, staleness_sec=3.0, sample_sec=1.0,
+        leg_slippage_bps=20.0, staleness_sec=3.0,
+        sample_sec=sample_sec,
     )
     return rec, entropy, hedge
 
@@ -296,6 +300,81 @@ def test_signal_below_minimum_plan_is_still_recorded():
         assert row[field] == ""
     assert float(row["top_edge_bps"]) > 5.0
     assert row["entropy_bid"] and row["hedge_ask"]
+
+
+def test_signal_append_keeps_single_header():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    for start in (1000.0, 1001.0):
+        rec, entropy, hedge = make_signal_recorder(path)
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=start)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=start)
+        rec.observe(now=start)
+        rec.close(now=start + 0.1)
+
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    assert lines.count(",".join(SIGNAL_HEADER)) == 1
+    assert len(lines) == 5
+
+
+def test_signal_rotates_old_header_before_writing():
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "signals.csv")
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write("old,header\n1,2\n")
+    rec, _, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    rec.close(now=1000.1)
+
+    with open(path, encoding="utf-8") as fh:
+        assert fh.readline().strip() == ",".join(SIGNAL_HEADER)
+    with open(path + ".old", encoding="utf-8") as fh:
+        assert fh.read() == "old,header\n1,2\n"
+
+
+def test_signal_async_samples_without_another_book_update():
+    async def go():
+        path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+        rec, entropy, hedge = make_signal_recorder(path, sample_sec=0.02)
+        now = time.time()
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=now)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=now)
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        task = asyncio.create_task(rec.run(stop, update_evt))
+        await asyncio.sleep(0.055)
+        stop.set()
+        update_evt.set()
+        await task
+
+        events = [row["event"] for row in read_signal_rows(path)]
+        assert events[0] == "start"
+        assert "sample" in events
+        assert events[-1] == "end"
+
+    asyncio.run(go())
+
+
+def test_signal_io_error_stops_and_propagates():
+    async def go():
+        directory = tempfile.mkdtemp()
+        blocker = os.path.join(directory, "not-a-directory")
+        with open(blocker, "w", encoding="utf-8") as fh:
+            fh.write("block")
+        rec, entropy, hedge = make_signal_recorder(
+            os.path.join(blocker, "signals.csv")
+        )
+        now = time.time()
+        set_signal_book(entropy, bid=100.10, ask=100.11, ts=now)
+        set_signal_book(hedge, bid=99.99, ask=100.00, ts=now)
+        stop, update_evt = asyncio.Event(), asyncio.Event()
+
+        with pytest.raises(OSError):
+            await rec.run(stop, update_evt)
+        assert stop.is_set()
+
+    asyncio.run(go())
 
 
 if __name__ == "__main__":
