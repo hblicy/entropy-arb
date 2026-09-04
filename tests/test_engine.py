@@ -154,6 +154,37 @@ class BackgroundOutcomeVenue(LifecycleVenue):
         return [asyncio.create_task(finish(), name="book-entropy")]
 
 
+class BackgroundCloseFailVenue(BackgroundOutcomeVenue):
+    async def close(self):
+        self.closed = True
+        raise OSError("close failed")
+
+
+class LoadFailVenue(LifecycleVenue):
+    async def load_market(self):
+        if self.key == "entropy":
+            raise RuntimeError("market load failed")
+        await asyncio.sleep(0)
+        await super().load_market()
+
+
+class StartFailVenue(LifecycleVenue):
+    def __init__(self, key, label):
+        super().__init__(key, label)
+        self.started_task = None
+
+    def start_tasks(self, _stop, _notify, _live):
+        if self.key == "hedge":
+            raise RuntimeError("task startup failed")
+
+        async def wait_forever():
+            await asyncio.Event().wait()
+
+        self.started_task = asyncio.create_task(
+            wait_forever(), name="book-entropy")
+        return [self.started_task]
+
+
 def execution_plan():
     return ArbPlan(
         qty=0.5,
@@ -460,6 +491,116 @@ def test_background_task_failure_or_early_exit_stops_engine(outcome, match):
                 await asyncio.wait_for(eng._run_inner(), timeout=0.2)
         finally:
             eng.request_stop()
+            engine_module.create_venue = original
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_market_load_failure_closes_every_created_venue():
+    async def go():
+        cfg = make_cfg()
+        venues = {
+            "entropy": LoadFailVenue("entropy", "ENTROPY"),
+            "hedge": LoadFailVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(RuntimeError, match="market load failed"):
+                await eng._run_inner()
+        finally:
+            engine_module.create_venue = original
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_partial_task_start_failure_cancels_started_tasks_and_closes_venues():
+    async def go():
+        cfg = make_cfg()
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": StartFailVenue("entropy", "ENTROPY"),
+            "hedge": StartFailVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(RuntimeError, match="task startup failed"):
+                await eng._run_inner()
+        finally:
+            eng.request_stop()
+            engine_module.create_venue = original
+            leftovers = [task for task in (
+                venues["entropy"].started_task,
+                eng._recorder_task,
+                eng._signal_task,
+            ) if task is not None and not task.done()]
+            for task in leftovers:
+                task.cancel()
+            if leftovers:
+                await asyncio.gather(*leftovers, return_exceptions=True)
+
+        assert venues["entropy"].started_task.done()
+        assert venues["entropy"].started_task.cancelled()
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_external_cancellation_closes_venues_and_remains_cancelled():
+    async def go():
+        cfg = make_cfg()
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": LifecycleVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            while not eng.markets_ready:
+                await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            engine_module.create_venue = original
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_background_error_remains_primary_when_close_also_fails():
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": BackgroundCloseFailVenue(
+                "entropy", "ENTROPY", RuntimeError("book failed")),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(RuntimeError, match="book failed"):
+                await eng._run_inner()
+        finally:
             engine_module.create_venue = original
         assert all(venue.closed for venue in venues.values())
 

@@ -214,117 +214,147 @@ class Engine:
         finally:
             await self.session.close()
 
+    async def _load_markets(self) -> None:
+        tasks = [
+            asyncio.create_task(
+                self.entropy.load_market(), name="load-market-entropy"),
+            asyncio.create_task(
+                self.hedge.load_market(), name="load-market-hedge"),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
     async def _run_inner(self) -> None:
         cfg = self.cfg
-        runtime = VenueRuntime(
-            session=self.session,
-            hl_api_url=cfg.hl_api_url,
-            hl_ws_url=cfg.hl_ws_url,
-            settle_timeout_sec=cfg.settle_timeout_sec,
-        )
-        self.entropy = create_venue(cfg.entropy, runtime)
-        self.hedge = create_venue(cfg.hedge, runtime)
-        self.venues = {"entropy": self.entropy, "hedge": self.hedge}
-        await asyncio.gather(self.entropy.load_market(), self.hedge.load_market())
-        self.markets_ready = True
-
-        live = not self.record_only
-        if live:
-            if not cfg.creds_complete:
-                raise RuntimeError(
-                    "live trading needs credentials for both venues in .env "
-                    "(see .env.example); use --record-only to run without "
-                    "them / 实盘需要在 .env 中配置两个交易所的密钥，仅采集数据"
-                    "请用 --record-only")
-            self.entropy.init_signer()
-            self.hedge.init_signer()
-        self.entropy.configure_peer(self.hedge)
-
-        self._step = 10 ** -min(self.entropy.size_decimals,
-                                self.hedge.size_decimals)
-        self._min_base = max(self.entropy.min_base, self.hedge.min_base,
-                             self._step)
-        self._min_notional = max(cfg.min_order_notional,
-                                 self.entropy.min_quote, self.hedge.min_quote)
-        log.info("pair ENTROPY(%s)-%s(%s): midline=%+.2fbps band=[-%.2f, +%.2f] "
-                 "fees=%.2f+%.2f step=%g min_ntl=$%g",
-                 self.entropy.conf.symbol, self.hedge.name,
-                 self.hedge.conf.symbol, cfg.midline_bps, cfg.lower_bps,
-                 cfg.upper_bps, self.entropy.fee_bps, self.hedge.fee_bps,
-                 self._step, self._min_notional)
-
-        if self.record_only:
-            log.warning("RECORD-ONLY — collecting minute data, no strategy, "
-                        "no orders")
-        else:
-            log.warning("LIVE — real orders will be sent (use --record-only "
-                        "for credential-less data collection)")
-            await self._reconcile_positions(hedge=False, strict=True)
-            log.info("starting positions: %s (net %+.6g)",
-                     " ".join(f"{v.name}={v.position:+.6g}"
-                              for v in self.venues.values()),
-                     sum(v.position for v in self.venues.values()))
-
         tasks: List[asyncio.Task] = []
-        if self.record_only:
-            self._start_recorders(tasks)
-        notify = (self._record_only_book_update if self.record_only
-                  else self._update_evt.set)
-        for v in self.venues.values():
-            for task in v.start_tasks(self.stop, notify, live):
-                self._track_task(tasks, task)
-        if not self.record_only:
-            self._start_recorders(tasks)
-        if not self.record_only:
-            self._track_task(
-                tasks, asyncio.create_task(
-                    self._strategy_loop(), name="strategy"))
-            self._track_task(
-                tasks, asyncio.create_task(
-                    self._balance_loop(), name="balances"))
-            if cfg.http_keepalive_sec > 0:
+        try:
+            runtime = VenueRuntime(
+                session=self.session,
+                hl_api_url=cfg.hl_api_url,
+                hl_ws_url=cfg.hl_ws_url,
+                settle_timeout_sec=cfg.settle_timeout_sec,
+            )
+            self.entropy = create_venue(cfg.entropy, runtime)
+            self.venues["entropy"] = self.entropy
+            self.hedge = create_venue(cfg.hedge, runtime)
+            self.venues["hedge"] = self.hedge
+            await self._load_markets()
+            self.markets_ready = True
+
+            live = not self.record_only
+            if live:
+                if not cfg.creds_complete:
+                    raise RuntimeError(
+                        "live trading needs credentials for both venues in "
+                        ".env (see .env.example); use --record-only to run "
+                        "without them / 实盘需要在 .env 中配置两个交易所的"
+                        "密钥，仅采集数据请用 --record-only")
+                self.entropy.init_signer()
+                self.hedge.init_signer()
+            self.entropy.configure_peer(self.hedge)
+
+            self._step = 10 ** -min(
+                self.entropy.size_decimals, self.hedge.size_decimals)
+            self._min_base = max(
+                self.entropy.min_base, self.hedge.min_base, self._step)
+            self._min_notional = max(
+                cfg.min_order_notional,
+                self.entropy.min_quote, self.hedge.min_quote)
+            log.info(
+                "pair ENTROPY(%s)-%s(%s): midline=%+.2fbps "
+                "band=[-%.2f, +%.2f] fees=%.2f+%.2f step=%g min_ntl=$%g",
+                self.entropy.conf.symbol, self.hedge.name,
+                self.hedge.conf.symbol, cfg.midline_bps, cfg.lower_bps,
+                cfg.upper_bps, self.entropy.fee_bps, self.hedge.fee_bps,
+                self._step, self._min_notional)
+
+            if self.record_only:
+                log.warning(
+                    "RECORD-ONLY — collecting minute data, no strategy, "
+                    "no orders")
+            else:
+                log.warning(
+                    "LIVE — real orders will be sent (use --record-only "
+                    "for credential-less data collection)")
+                await self._reconcile_positions(hedge=False, strict=True)
+                log.info(
+                    "starting positions: %s (net %+.6g)",
+                    " ".join(f"{v.name}={v.position:+.6g}"
+                             for v in self.venues.values()),
+                    sum(v.position for v in self.venues.values()))
+
+            if self.record_only:
+                self._start_recorders(tasks)
+            notify = (self._record_only_book_update if self.record_only
+                      else self._update_evt.set)
+            for venue in self.venues.values():
+                for task in venue.start_tasks(self.stop, notify, live):
+                    self._track_task(tasks, task)
+            if not self.record_only:
+                self._start_recorders(tasks)
                 self._track_task(
                     tasks, asyncio.create_task(
-                        self._http_keepalive_loop(), name="keepalive"))
-        self._track_task(
-            tasks, asyncio.create_task(self._status_loop(), name="status"))
-        if live:
+                        self._strategy_loop(), name="strategy"))
+                self._track_task(
+                    tasks, asyncio.create_task(
+                        self._balance_loop(), name="balances"))
+                if cfg.http_keepalive_sec > 0:
+                    self._track_task(
+                        tasks, asyncio.create_task(
+                            self._http_keepalive_loop(), name="keepalive"))
             self._track_task(
-                tasks, asyncio.create_task(
-                    self._reconcile_loop(), name="reconcile"))
+                tasks,
+                asyncio.create_task(self._status_loop(), name="status"))
+            if live:
+                self._track_task(
+                    tasks, asyncio.create_task(
+                        self._reconcile_loop(), name="reconcile"))
 
-        await self.stop.wait()
-        await self._drain_executions()
-        for t in tasks:
-            t.cancel()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for task, result in zip(tasks, results):
-            if (isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)
-                    and task not in self._task_failures):
-                self._task_failures[task] = result
-                self._remember_error(
-                    f"background task {task.get_name()}", result)
-
-        venue_close_error = None
-        for v in self.venues.values():
+            await self.stop.wait()
+        except BaseException as exc:
+            self._remember_error("engine lifecycle", exc)
+        finally:
+            self.request_stop()
+            if self._primary_error is None:
+                for task in tasks:
+                    if task.done() and not task.cancelled():
+                        error = task.exception()
+                        if error is not None:
+                            self._remember_error(
+                                f"background task {task.get_name()}", error)
+                            break
             try:
-                await v.close()
-            except Exception as exc:
-                if self._primary_error is None and venue_close_error is None:
-                    venue_close_error = exc
-                else:
-                    log.error(
-                        "[%s] also failed while closing; preserving the "
-                        "primary error", v.name,
-                        exc_info=(type(exc), exc, exc.__traceback__))
+                await self._drain_executions()
+            except BaseException as exc:
+                self._remember_error("execution drain", exc)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for task, result in zip(tasks, results):
+                if (isinstance(result, BaseException)
+                        and not isinstance(result, asyncio.CancelledError)
+                        and task not in self._task_failures):
+                    self._task_failures[task] = result
+                    self._remember_error(
+                        f"background task {task.get_name()}", result)
+            for venue in self.venues.values():
+                try:
+                    await venue.close()
+                except BaseException as exc:
+                    self._remember_error(f"[{venue.name}] close", exc)
+
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
-                  self.total_exp_edge, self.total_fill_edge)
+                 self.total_exp_edge, self.total_fill_edge)
         if self._primary_error is not None:
             raise self._primary_error
-        if venue_close_error is not None:
-            raise venue_close_error
 
     async def _drain_executions(self, poll_sec: Optional[float] = None) -> None:
         """Wait for every submitted execution; shutdown never abandons a leg."""
