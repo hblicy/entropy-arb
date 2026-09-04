@@ -137,6 +137,23 @@ class CloseFailVenue(InvalidBurstVenue):
         raise OSError(f"{self.key} close failed")
 
 
+class BackgroundOutcomeVenue(LifecycleVenue):
+    def __init__(self, key, label, outcome):
+        super().__init__(key, label)
+        self.outcome = outcome
+
+    def start_tasks(self, _stop, _notify, _live):
+        if self.key != "entropy":
+            return []
+
+        async def finish():
+            await asyncio.sleep(0)
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+
+        return [asyncio.create_task(finish(), name="book-entropy")]
+
+
 def execution_plan():
     return ArbPlan(
         qty=0.5,
@@ -415,6 +432,36 @@ def test_signal_recorder_starts_only_in_record_only_mode():
         assert live_engine.signal_recorder is None
         assert all(task.get_name() != "signal-recorder"
                    for task in live_tasks)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    "outcome,match",
+    [(RuntimeError("book failed"), "book failed"),
+     (None, "book-entropy.*exited unexpectedly")],
+)
+def test_background_task_failure_or_early_exit_stops_engine(outcome, match):
+    async def go():
+        cfg = make_cfg(midline=0.0, upper=5.0, lower=5.0)
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": BackgroundOutcomeVenue(
+                "entropy", "ENTROPY", outcome),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(RuntimeError, match=match):
+                await asyncio.wait_for(eng._run_inner(), timeout=0.2)
+        finally:
+            eng.request_stop()
+            engine_module.create_venue = original
+        assert all(venue.closed for venue in venues.values())
 
     asyncio.run(go())
 

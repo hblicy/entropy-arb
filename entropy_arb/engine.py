@@ -53,7 +53,8 @@ class Engine:
         self.signal_recorder: Optional[SignalRecorder] = None
         self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
-        self._signal_callback_error: Optional[BaseException] = None
+        self._primary_error: Optional[BaseException] = None
+        self._task_failures: Dict[asyncio.Task, BaseException] = {}
         self.markets_ready = False
         self.stop = asyncio.Event()
         self._update_evt = asyncio.Event()
@@ -125,15 +126,43 @@ class Engine:
         self._update_evt.set()
         self._reconcile_evt.set()
 
+    def _remember_error(self, label: str, error: BaseException) -> None:
+        if error is self._primary_error:
+            return
+        if self._primary_error is None:
+            self._primary_error = error
+            log.error("%s failed", label,
+                      exc_info=(type(error), error, error.__traceback__))
+        else:
+            log.error("%s also failed; preserving the primary error", label,
+                      exc_info=(type(error), error, error.__traceback__))
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is None:
+            if self.stop.is_set():
+                return
+            error = RuntimeError(
+                f"background task {task.get_name()} exited unexpectedly")
+        self._task_failures[task] = error
+        self._remember_error(f"background task {task.get_name()}", error)
+        self.request_stop()
+
+    def _track_task(self, tasks: List[asyncio.Task],
+                    task: asyncio.Task) -> None:
+        tasks.append(task)
+        task.add_done_callback(self._task_done)
+
     def _record_only_book_update(self) -> None:
         self._update_evt.set()
         if self.signal_recorder is not None:
             try:
                 self.signal_recorder.observe(flush=False)
             except Exception as exc:
-                if self._signal_callback_error is None:
-                    self._signal_callback_error = exc
-                    log.exception("signal recorder failed during book update")
+                self._remember_error(
+                    "signal recorder book callback", exc)
                 self.request_stop()
 
     def _start_recorders(self, tasks: List[asyncio.Task]) -> None:
@@ -148,7 +177,7 @@ class Engine:
                 self.recorder.run(
                     self.stop, fail_fast=self.record_only),
                 name="recorder")
-            tasks.append(self._recorder_task)
+            self._track_task(tasks, self._recorder_task)
         if self.record_only:
             self.signal_recorder = SignalRecorder(
                 cfg.recorder_signal_csv,
@@ -171,7 +200,7 @@ class Engine:
             self._signal_task = asyncio.create_task(
                 self.signal_recorder.run(self.stop, self._update_evt),
                 name="signal-recorder")
-            tasks.append(self._signal_task)
+            self._track_task(tasks, self._signal_task)
 
     # ------------------------------------------------------------- lifecycle
 
@@ -242,61 +271,47 @@ class Engine:
         notify = (self._record_only_book_update if self.record_only
                   else self._update_evt.set)
         for v in self.venues.values():
-            tasks += v.start_tasks(self.stop, notify, live)
+            for task in v.start_tasks(self.stop, notify, live):
+                self._track_task(tasks, task)
         if not self.record_only:
             self._start_recorders(tasks)
         if not self.record_only:
-            tasks.append(asyncio.create_task(self._strategy_loop(),
-                                             name="strategy"))
-            tasks.append(asyncio.create_task(self._balance_loop(),
-                                             name="balances"))
-            tasks.append(asyncio.create_task(self._http_keepalive_loop(),
-                                             name="keepalive"))
-        tasks.append(asyncio.create_task(self._status_loop(), name="status"))
+            self._track_task(
+                tasks, asyncio.create_task(
+                    self._strategy_loop(), name="strategy"))
+            self._track_task(
+                tasks, asyncio.create_task(
+                    self._balance_loop(), name="balances"))
+            if cfg.http_keepalive_sec > 0:
+                self._track_task(
+                    tasks, asyncio.create_task(
+                        self._http_keepalive_loop(), name="keepalive"))
+        self._track_task(
+            tasks, asyncio.create_task(self._status_loop(), name="status"))
         if live:
-            tasks.append(asyncio.create_task(self._reconcile_loop(),
-                                             name="reconcile"))
+            self._track_task(
+                tasks, asyncio.create_task(
+                    self._reconcile_loop(), name="reconcile"))
 
         await self.stop.wait()
         await self._drain_executions()
         for t in tasks:
             t.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        signal_error = None
-        if self._signal_task is not None:
-            result = results[tasks.index(self._signal_task)]
+        for task, result in zip(tasks, results):
             if (isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)):
-                signal_error = result
-        minute_error = None
-        if self.record_only and self._recorder_task is not None:
-            result = results[tasks.index(self._recorder_task)]
-            if (isinstance(result, BaseException)
-                    and not isinstance(result, asyncio.CancelledError)):
-                minute_error = result
-        callback_error = self._signal_callback_error
-        recorder_errors = [
-            ("signal recorder task", signal_error),
-            ("minute recorder task", minute_error),
-        ]
-        primary_error = callback_error
-        if primary_error is None:
-            for _, error in recorder_errors:
-                if error is not None:
-                    primary_error = error
-                    break
-        for label, error in recorder_errors:
-            if error is not None and error is not primary_error:
-                log.error(
-                    "%s also failed; preserving the primary error", label,
-                    exc_info=(type(error), error, error.__traceback__))
+                    and not isinstance(result, asyncio.CancelledError)
+                    and task not in self._task_failures):
+                self._task_failures[task] = result
+                self._remember_error(
+                    f"background task {task.get_name()}", result)
 
         venue_close_error = None
         for v in self.venues.values():
             try:
                 await v.close()
             except Exception as exc:
-                if primary_error is None and venue_close_error is None:
+                if self._primary_error is None and venue_close_error is None:
                     venue_close_error = exc
                 else:
                     log.error(
@@ -306,8 +321,8 @@ class Engine:
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
                   self.total_exp_edge, self.total_fill_edge)
-        if primary_error is not None:
-            raise primary_error
+        if self._primary_error is not None:
+            raise self._primary_error
         if venue_close_error is not None:
             raise venue_close_error
 
