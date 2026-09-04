@@ -282,17 +282,28 @@ class LighterVenue:
         base_amount = int(round(qty * 10 ** self.size_decimals))
         price = int(round(limit_px * 10 ** self.price_decimals))
         try:
-            _tx, resp, err = await self.signer.create_order(
-                market_index=self.market_id,
-                client_order_index=coi,
-                base_amount=base_amount,
-                price=price,
-                is_ask=not is_buy,
-                order_type=SignerClient.ORDER_TYPE_MARKET,
-                time_in_force=SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=reduce_only,
-                order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
+            _tx, resp, err = await asyncio.wait_for(
+                self.signer.create_order(
+                    market_index=self.market_id,
+                    client_order_index=coi,
+                    base_amount=base_amount,
+                    price=price,
+                    is_ask=not is_buy,
+                    order_type=SignerClient.ORDER_TYPE_MARKET,
+                    time_in_force=(
+                        SignerClient
+                        .ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL),
+                    reduce_only=reduce_only,
+                    order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
+                ),
+                timeout=self.settle_timeout,
             )
+        except asyncio.TimeoutError:
+            if fut is not None:
+                self.orders_feed.unwatch(coi)
+            log.error("[%s] order submission timed out for coi %d after %.1fs",
+                      self.name, coi, self.settle_timeout)
+            return OrderResult.unknown("order submission timed out")
         except Exception as e:
             if fut is not None:
                 self.orders_feed.unwatch(coi)

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import tempfile
 from types import SimpleNamespace
 
@@ -144,5 +145,60 @@ def test_hip3_unknown_response_does_not_poll_by_cloid():
 
         assert result.unresolved is True
         assert info_calls == 0
+
+    asyncio.run(go())
+
+
+def test_lighter_submission_timeout_returns_unknown_and_unwatches(
+        monkeypatch):
+    class Constants:
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 2
+        DEFAULT_IOC_EXPIRY = 3
+
+    class HangingSigner:
+        def __init__(self):
+            self.cancelled = False
+
+        async def create_order(self, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+
+    class OrdersFeed:
+        def __init__(self):
+            self.future = None
+            self.unwatched = []
+
+        def watch(self, coi):
+            self.future = asyncio.get_running_loop().create_future()
+            return self.future
+
+        def unwatch(self, coi):
+            self.unwatched.append(coi)
+            if self.future is not None and not self.future.done():
+                self.future.cancel()
+
+    monkeypatch.setitem(
+        sys.modules, "lighter", SimpleNamespace(SignerClient=Constants))
+
+    async def go():
+        cfg = make_cfg("lighter")
+        venue = LighterVenue(cfg.hedge, object(), 0.01)
+        venue.market_id = 7
+        signer = HangingSigner()
+        orders = OrdersFeed()
+        venue.signer = signer
+        venue.orders_feed = orders
+
+        result = await asyncio.wait_for(
+            venue.send_taker(is_buy=True, qty=0.5, limit_px=100.0),
+            timeout=0.05)
+
+        assert result.unresolved is True
+        assert result.status == "order submission timed out"
+        assert orders.unwatched
+        assert signer.cancelled is True
 
     asyncio.run(go())
