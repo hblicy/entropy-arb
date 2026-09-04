@@ -227,14 +227,17 @@ class LighterVenue:
         return
 
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
+        orders_feed = None
+        if live:
+            orders_feed = AccountOrdersFeed(
+                self.name, self.profile.ws_url, self.market_id,
+                self.conf.lighter_creds.account_index, self.signer)
         tasks = [asyncio.create_task(
             LighterBookFeed(self.name, self.profile.ws_url, self.market_id,
                             self.book, notify).run(stop),
             name=f"book-{self.key}")]
-        if live:
-            self.orders_feed = AccountOrdersFeed(
-                self.name, self.profile.ws_url, self.market_id,
-                self.conf.lighter_creds.account_index, self.signer)
+        if orders_feed is not None:
+            self.orders_feed = orders_feed
             tasks.append(asyncio.create_task(self.orders_feed.run(stop),
                                              name=f"acct-{self.key}"))
         return tasks

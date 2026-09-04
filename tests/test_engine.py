@@ -185,6 +185,37 @@ class StartFailVenue(LifecycleVenue):
         return [self.started_task]
 
 
+class CleanupBlockingVenue(LifecycleVenue):
+    def __init__(self, key, label, fail=False):
+        super().__init__(key, label)
+        self.fail = fail
+        self.cancellation_started = asyncio.Event()
+        self.release_cancellation = asyncio.Event()
+
+    def start_tasks(self, _stop, _notify, _live):
+        if self.key != "entropy":
+            return []
+
+        async def block_during_cancellation():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancellation_started.set()
+                await self.release_cancellation.wait()
+                raise
+
+        tasks = [asyncio.create_task(
+            block_during_cancellation(), name="slow-cancel-entropy")]
+        if self.fail:
+            async def fail_after_start():
+                await asyncio.sleep(0)
+                raise RuntimeError("background failed")
+
+            tasks.append(asyncio.create_task(
+                fail_after_start(), name="fail-entropy"))
+        return tasks
+
+
 def execution_plan():
     return ArbPlan(
         qty=0.5,
@@ -602,6 +633,76 @@ def test_background_error_remains_primary_when_close_also_fails():
                 await eng._run_inner()
         finally:
             engine_module.create_venue = original
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_cancellation_during_cleanup_still_closes_venues():
+    async def go():
+        cfg = make_cfg()
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": CleanupBlockingVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            while not eng.markets_ready:
+                await asyncio.sleep(0)
+            eng.request_stop()
+            await asyncio.wait_for(
+                venues["entropy"].cancellation_started.wait(), timeout=0.2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            venues["entropy"].release_cancellation.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            venues["entropy"].release_cancellation.set()
+            engine_module.create_venue = original
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_background_error_precedes_cancellation_during_cleanup():
+    async def go():
+        cfg = make_cfg()
+        directory = tempfile.mkdtemp()
+        cfg.recorder_csv = os.path.join(directory, "minutes.csv")
+        cfg.recorder_signal_csv = os.path.join(directory, "signals.csv")
+        venues = {
+            "entropy": CleanupBlockingVenue(
+                "entropy", "ENTROPY", fail=True),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                venues["entropy"].cancellation_started.wait(), timeout=0.2)
+            task.cancel()
+            venues["entropy"].release_cancellation.set()
+            with pytest.raises(RuntimeError, match="background failed"):
+                await task
+        finally:
+            venues["entropy"].release_cancellation.set()
+            engine_module.create_venue = original
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         assert all(venue.closed for venue in venues.values())
 
     asyncio.run(go())

@@ -4,8 +4,11 @@ import sys
 import tempfile
 from types import SimpleNamespace
 
+import pytest
+
 from entropy_arb.config import load_config
 from entropy_arb.models import OrderResult
+import entropy_arb.venue_lighter as lighter_module
 from entropy_arb.venue_hl import HLVenue, NonceAllocator
 from entropy_arb.venue_lighter import LighterVenue
 from entropy_arb.venues.base import VenueAdapter
@@ -200,5 +203,35 @@ def test_lighter_submission_timeout_returns_unknown_and_unwatches(
         assert result.status == "order submission timed out"
         assert orders.unwatched
         assert signer.cancelled is True
+
+    asyncio.run(go())
+
+
+def test_lighter_start_failure_does_not_leave_book_task(monkeypatch):
+    class BrokenAccountFeed:
+        def __init__(self, *_args):
+            raise RuntimeError("account feed init failed")
+
+    monkeypatch.setattr(lighter_module, "AccountOrdersFeed", BrokenAccountFeed)
+
+    async def go():
+        cfg = make_cfg("lighter")
+        cfg.hedge.lighter_creds = SimpleNamespace(account_index=7)
+        venue = LighterVenue(cfg.hedge, object(), 0.01)
+        venue.market_id = 7
+        before = set(asyncio.all_tasks())
+        leaked = []
+        try:
+            with pytest.raises(RuntimeError, match="account feed init failed"):
+                venue.start_tasks(
+                    asyncio.Event(), lambda: None, live=True)
+            leaked = [task for task in asyncio.all_tasks()
+                      if task not in before and not task.done()]
+            assert leaked == []
+        finally:
+            for task in leaked:
+                task.cancel()
+            if leaked:
+                await asyncio.gather(*leaked, return_exceptions=True)
 
     asyncio.run(go())

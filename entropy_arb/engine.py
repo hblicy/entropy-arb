@@ -230,6 +230,50 @@ class Engine:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
+    async def _cleanup(self, tasks: List[asyncio.Task]) -> None:
+        self.request_stop()
+        if self._primary_error is None:
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    error = task.exception()
+                    if error is not None:
+                        self._remember_error(
+                            f"background task {task.get_name()}", error)
+                        break
+        try:
+            await self._drain_executions()
+        except BaseException as exc:
+            self._remember_error("execution drain", exc)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results):
+            if (isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)
+                    and task not in self._task_failures):
+                self._task_failures[task] = result
+                self._remember_error(
+                    f"background task {task.get_name()}", result)
+        for venue in self.venues.values():
+            try:
+                await venue.close()
+            except BaseException as exc:
+                self._remember_error(f"[{venue.name}] close", exc)
+
+    async def _finish_cleanup(self, tasks: List[asyncio.Task]) -> None:
+        cleanup_task = asyncio.create_task(
+            self._cleanup(tasks), name="engine-cleanup")
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                self._remember_error("engine cleanup cancellation", exc)
+        try:
+            cleanup_task.result()
+        except BaseException as exc:
+            self._remember_error("engine cleanup", exc)
+
     async def _run_inner(self) -> None:
         cfg = self.cfg
         tasks: List[asyncio.Task] = []
@@ -320,35 +364,7 @@ class Engine:
         except BaseException as exc:
             self._remember_error("engine lifecycle", exc)
         finally:
-            self.request_stop()
-            if self._primary_error is None:
-                for task in tasks:
-                    if task.done() and not task.cancelled():
-                        error = task.exception()
-                        if error is not None:
-                            self._remember_error(
-                                f"background task {task.get_name()}", error)
-                            break
-            try:
-                await self._drain_executions()
-            except BaseException as exc:
-                self._remember_error("execution drain", exc)
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for task, result in zip(tasks, results):
-                if (isinstance(result, BaseException)
-                        and not isinstance(result, asyncio.CancelledError)
-                        and task not in self._task_failures):
-                    self._task_failures[task] = result
-                    self._remember_error(
-                        f"background task {task.get_name()}", result)
-            for venue in self.venues.values():
-                try:
-                    await venue.close()
-                except BaseException as exc:
-                    self._remember_error(f"[{venue.name}] close", exc)
+            await self._finish_cleanup(tasks)
 
         log.info("shutdown — %d trades, %d hedges, exp edge $%.4f, "
                  "fill edge $%.4f", self.trades, self.hedges,
