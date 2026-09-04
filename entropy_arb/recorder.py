@@ -177,11 +177,12 @@ class MinuteRecorder:
             return
         if self._writer is None:
             self._open()
-        self._writer.writerow(self._agg.row(
+        agg = self._agg
+        self._agg = None
+        self._writer.writerow(agg.row(
             self.symbol, self.entropy_dex, self.hedge_venue))
         self._fh.flush()
         self.rows_written += 1
-        self._agg = None
 
     def sample(self, now: Optional[float] = None) -> None:
         """Take one sample; call ~1/sec. Rolls the minute over as needed."""

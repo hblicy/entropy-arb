@@ -222,6 +222,45 @@ def test_minute_flush_failure_still_closes_file():
     assert rec._writer is None
 
 
+def test_minute_transient_flush_failure_does_not_duplicate_row():
+    class FailOnceAfterFlushBuffer(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_flush = False
+
+        def flush(self):
+            super().flush()
+            if self.fail_next_flush:
+                self.fail_next_flush = False
+                raise OSError("transient flush failure")
+
+        def close(self):
+            pass
+
+    entropy, hedge = OrderBook(), OrderBook()
+    set_book(entropy, 100.0, 100.02)
+    set_book(hedge, 100.0, 100.02)
+    rec = MinuteRecorder(
+        "unused.csv", entropy, hedge, staleness_sec=1e9)
+    t0 = 1_700_000_000.0
+    rec.sample(t0)
+
+    stream = FailOnceAfterFlushBuffer()
+    writer = csv.writer(stream)
+    writer.writerow(HEADER)
+    rec._fh = stream
+    rec._writer = writer
+    stream.fail_next_flush = True
+
+    with pytest.raises(OSError, match="transient flush failure"):
+        rec.sample(t0 + 60)
+    rec.close()
+
+    rows = list(csv.reader(io.StringIO(stream.getvalue())))
+    assert len(rows) == 2
+    assert rec.rows_written == 0
+
+
 def test_signal_lifecycle_writes_start_sample_and_end():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, _ = make_signal_recorder(path)
