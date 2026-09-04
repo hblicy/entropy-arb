@@ -106,7 +106,10 @@ contains more than one identified market instead of producing unsafe combined
 thresholds. On the first start after upgrading, a legacy minute file is moved
 to the next free `.old`, `.old.1`, ... archive before the new schema is written.
 In `--record-only`, both recorder output files are opened at startup; an output
-creation or write failure stops the process with an error.
+creation or write failure stops the process with an error. If a minute row has
+already been handed to the CSV writer when `flush()` reports an ambiguous I/O
+failure, that minute aggregate is not blindly written again; this prevents
+duplicates but cannot guarantee delivery after a failed flush.
 
 **2. Analyze and set your thresholds:**
 
@@ -212,7 +215,9 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   websocket; Hyperliquid HIP-3 IOC limits settle synchronously and omit
   `cloid` because HIP-3 currently rejects it. A timeout/5xx stays explicitly
   unresolved and triggers position reconciliation; the order is never
-  blindly resent.
+  blindly resent. Lighter submission and settlement each get a separate
+  `settle_timeout_sec` window; a submission timeout is also treated as
+  unresolved because the order may already have reached the venue.
 - A **persistence gate** (`premium_persist_sec`) arms each direction and only
   fires if the edge survives — one-tick phantoms are filtered.
 - **Inventory ladder**: past `floor_frac` of a venue's cap, adding to the
@@ -227,7 +232,10 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as
-  critical rather than cancelling the in-flight order tasks.
+  critical rather than cancelling the in-flight order tasks. Initialization
+  failures still close every venue and task already created. Any supervised
+  background task that fails or exits unexpectedly stops the engine and makes
+  the process exit nonzero after cleanup.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 

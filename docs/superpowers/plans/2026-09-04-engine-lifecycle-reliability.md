@@ -16,7 +16,7 @@
 - Modify: `entropy_arb/recorder.py:174-184`
 - Test: `tests/test_recorder.py`
 
-- [ ] **Step 1: 写瞬态 flush 失败回归测试**
+- [x] **Step 1: 写瞬态 flush 失败回归测试**
 
 在 `tests/test_recorder.py` 增加一次性失败流。真实 `flush()` 先执行，再抛一次错误，随后允许成功；跨分钟采样触发第一次写入，关闭触发潜在重试：
 
@@ -61,13 +61,13 @@ def test_minute_transient_flush_failure_does_not_duplicate_row():
     assert rec.rows_written == 0
 ```
 
-- [ ] **Step 2: 运行测试并确认重复行失败**
+- [x] **Step 2: 运行测试并确认重复行失败**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_recorder.py -k transient_flush`
 
 Expected: FAIL，`len(rows) == 3`，证明同一聚合被第二次序列化。
 
-- [ ] **Step 3: 在序列化前移走待写聚合**
+- [x] **Step 3: 在序列化前移走待写聚合**
 
 把 `_flush_agg()` 改为：文件打开失败时保留聚合；文件成功打开后，在任何可能部分写入的 `writerow()` 之前清除待写引用，禁止错误后的盲重试：
 
@@ -86,13 +86,13 @@ def _flush_agg(self) -> None:
     self.rows_written += 1
 ```
 
-- [ ] **Step 4: 运行 recorder 测试**
+- [x] **Step 4: 运行 recorder 测试**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_recorder.py`
 
 Expected: PASS，包括永久 flush 失败仍关闭句柄、瞬态失败不重复行。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add entropy_arb/recorder.py tests/test_recorder.py
@@ -105,7 +105,7 @@ git commit -m "修复：防止分钟记录重复写入"
 - Modify: `entropy_arb/venue_lighter.py:275-314`
 - Test: `tests/test_venue_contract.py`
 
-- [ ] **Step 1: 写挂起提交超时测试**
+- [x] **Step 1: 写挂起提交超时测试**
 
 在 `tests/test_venue_contract.py` 增加 `sys`、`pytest` 导入和以下测试；使用真实 `LighterVenue.send_taker()`，只替换 SDK 边界：
 
@@ -165,13 +165,13 @@ def test_lighter_submission_timeout_returns_unknown_and_unwatches(monkeypatch):
     asyncio.run(go())
 ```
 
-- [ ] **Step 2: 运行测试并确认超时失败**
+- [x] **Step 2: 运行测试并确认超时失败**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_venue_contract.py -k submission_timeout`
 
 Expected: FAIL，外层 `asyncio.wait_for()` 在 0.05 秒后抛 `TimeoutError`，而不是返回 unknown。
 
-- [ ] **Step 3: 使用现有 settle timeout 包住 create_order**
+- [x] **Step 3: 使用现有 settle timeout 包住 create_order**
 
 将调用改为 `asyncio.wait_for()` 并在普通异常分支前处理超时：
 
@@ -207,13 +207,13 @@ except Exception as e:
     return OrderResult.send_failed(msg)
 ```
 
-- [ ] **Step 4: 运行 venue contract 测试**
+- [x] **Step 4: 运行 venue contract 测试**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_venue_contract.py tests/test_venue_registry.py`
 
 Expected: PASS，原有 HLVenue 与 registry 合约不变。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add entropy_arb/venue_lighter.py tests/test_venue_contract.py
@@ -226,7 +226,7 @@ git commit -m "修复：限制 Lighter 订单提交等待"
 - Modify: `entropy_arb/engine.py:44-175`
 - Test: `tests/test_engine.py`
 
-- [ ] **Step 1: 写后台异常和意外返回测试**
+- [x] **Step 1: 写后台异常和意外返回测试**
 
 在 `tests/test_engine.py` 增加两个 venue stub。测试必须在 `finally` 中取消红灯阶段遗留任务：
 
@@ -278,13 +278,13 @@ def test_background_task_failure_or_early_exit_stops_engine(outcome, match):
     asyncio.run(go())
 ```
 
-- [ ] **Step 2: 运行测试并确认 Engine 超时失败**
+- [x] **Step 2: 运行测试并确认 Engine 超时失败**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py -k background_task_failure_or_early_exit`
 
 Expected: FAIL；当前 Engine 不监督普通任务，外层得到 `TimeoutError` 或正常返回而非原错误。
 
-- [ ] **Step 3: 增加首错槽和任务完成回调**
+- [x] **Step 3: 增加首错槽和任务完成回调**
 
 在 `Engine.__init__` 增加：
 
@@ -340,7 +340,7 @@ except Exception as exc:
 所有 `_start_recorders()`、venue `start_tasks()` 和 Engine 自建长期任务都通过
 `_track_task()` 加入列表。`http_keepalive_sec <= 0` 时不创建 keepalive 任务。
 
-- [ ] **Step 4: 让现有停机结果使用统一首错槽**
+- [x] **Step 4: 让现有停机结果使用统一首错槽**
 
 在当前清理末尾，遍历全部 `tasks/results`，把尚未由回调记录的非取消异常交给
 `_remember_error()`；venue close 失败也交给该方法。最终只传播
@@ -360,13 +360,13 @@ if self._primary_error is not None:
     raise self._primary_error
 ```
 
-- [ ] **Step 5: 运行 Engine 测试**
+- [x] **Step 5: 运行 Engine 测试**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py`
 
 Expected: PASS；普通任务错误、意外退出和原 recorder 错误都可见。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add entropy_arb/engine.py tests/test_engine.py
@@ -379,7 +379,7 @@ git commit -m "修复：监督引擎后台任务"
 - Modify: `entropy_arb/engine.py:178-312`
 - Test: `tests/test_engine.py`
 
-- [ ] **Step 1: 写 load_market 失败清理测试**
+- [x] **Step 1: 写 load_market 失败清理测试**
 
 ```python
 class LoadFailVenue(LifecycleVenue):
@@ -410,24 +410,20 @@ def test_market_load_failure_closes_every_created_venue():
     asyncio.run(go())
 ```
 
-- [ ] **Step 2: 写部分 start_tasks 失败清理测试**
+- [x] **Step 2: 写部分 start_tasks 失败清理测试**
 
 ```python
 class StartFailVenue(LifecycleVenue):
     def __init__(self, key, label):
         super().__init__(key, label)
         self.started_task = None
-        self.started_task_cancelled = False
 
     def start_tasks(self, _stop, _notify, _live):
         if self.key == "hedge":
             raise RuntimeError("task startup failed")
 
         async def wait_forever():
-            try:
-                await asyncio.Event().wait()
-            finally:
-                self.started_task_cancelled = True
+            await asyncio.Event().wait()
 
         self.started_task = asyncio.create_task(
             wait_forever(), name="book-entropy")
@@ -463,13 +459,14 @@ def test_partial_task_start_failure_cancels_started_tasks_and_closes_venues():
             if leftovers:
                 await asyncio.gather(*leftovers, return_exceptions=True)
 
-        assert venues["entropy"].started_task_cancelled is True
+        assert venues["entropy"].started_task.done()
+        assert venues["entropy"].started_task.cancelled()
         assert all(venue.closed for venue in venues.values())
 
     asyncio.run(go())
 ```
 
-- [ ] **Step 3: 写外部取消仍清理并重新传播测试**
+- [x] **Step 3: 写外部取消仍清理并重新传播测试**
 
 ```python
 def test_external_cancellation_closes_venues_and_remains_cancelled():
@@ -502,13 +499,13 @@ def test_external_cancellation_closes_venues_and_remains_cancelled():
     asyncio.run(go())
 ```
 
-- [ ] **Step 4: 运行测试并确认清理失败**
+- [x] **Step 4: 运行测试并确认清理失败**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py -k "market_load_failure or partial_task_start_failure or external_cancellation"`
 
 Expected: FAIL，venue 未关闭或已启动任务未由 Engine 取消。
 
-- [ ] **Step 5: 增加有界 startup gather**
+- [x] **Step 5: 增加有界 startup gather**
 
 增加 helper，任一市场加载失败时取消并收集另一加载任务：
 
@@ -530,7 +527,7 @@ async def _load_markets(self) -> None:
         raise
 ```
 
-- [ ] **Step 6: 用单一 finally 包住 venue 全生命周期**
+- [x] **Step 6: 用单一 finally 包住 venue 全生命周期**
 
 在 `_run_inner()` 开头创建 `tasks = []`。第一个 venue 创建后立即写入
 `self.venues["entropy"]`，第二个同理；调用 `_load_markets()`。把现有市场计算、
@@ -581,7 +578,7 @@ if self._primary_error is not None:
 不得保留旧的 recorder 专用结果索引或第二套 venue close 循环。停机汇总日志放在
 venue close 之后、最终 raise 之前。
 
-- [ ] **Step 7: 增加后台错误优先于 close 错误的断言并运行测试**
+- [x] **Step 7: 增加后台错误优先于 close 错误的断言并运行测试**
 
 扩展 Task 3 的异常 venue，让 entropy `close()` 抛 `OSError("close failed")`，
 hedge 正常关闭；断言最终仍是 `RuntimeError("book failed")` 且两个 venue 的
@@ -591,7 +588,7 @@ Run: `python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py test
 
 Expected: PASS，无未完成任务或未读取异常 warning。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add entropy_arb/engine.py tests/test_engine.py
@@ -606,14 +603,14 @@ git commit -m "修复：统一引擎生命周期清理"
 - Modify: `docs/superpowers/specs/2026-09-04-engine-lifecycle-reliability-design.md`
 - Modify: `docs/superpowers/plans/2026-09-04-engine-lifecycle-reliability.md`
 
-- [ ] **Step 1: 更新运行与停机说明**
+- [x] **Step 1: 更新运行与停机说明**
 
 在中英文 README 的安全停机部分明确：后台任务异常会使进程非零退出；启动失败
 同样关闭已创建 venue 和任务；Lighter 提交超过 `settle_timeout_sec` 按未知结果
 对账。不要承诺 CSV 在 I/O 错误时事务式 exactly-once，只说明不会盲目重写同一
 分钟聚合。
 
-- [ ] **Step 2: 严格全量验证**
+- [x] **Step 2: 严格全量验证**
 
 Run: `python -m pytest -q -p no:cacheprovider -W error`
 
@@ -627,7 +624,7 @@ Run: `git diff --check`
 
 Expected: exit 0。
 
-- [ ] **Step 3: 检查计划不变量**
+- [x] **Step 3: 检查计划不变量**
 
 人工核对完整 diff：
 
@@ -637,14 +634,23 @@ Expected: exit 0。
 - 已提交订单在 timeout 内不被 shutdown 取消；Lighter 超时结果进入 reconcile。
 - 所有已创建长期任务被 gather，所有已登记 venue 都尝试关闭。
 
-- [ ] **Step 4: 独立只读复审**
+- [x] **Step 4: 独立只读复审**
 
 复审完整 diff，重点验证四个原始复现、异常优先级、外部取消和无任务泄漏；复审
 代理不得修改文件。
 
-- [ ] **Step 5: 提交文档**
+- [x] **Step 5: 提交文档**
 
 ```bash
 git add README.md README.zh-CN.md docs/superpowers/specs/2026-09-04-engine-lifecycle-reliability-design.md docs/superpowers/plans/2026-09-04-engine-lifecycle-reliability.md
 git commit -m "文档：说明引擎故障清理语义"
 ```
+
+### 复审补充修复
+
+- [x] 清理阶段再次取消 Engine 的测试先失败，随后用独立 shielded cleanup task
+  修复；清理完成后按首错规则传播。
+- [x] 已有后台错误与清理阶段取消并发时，保留后台错误为首错。
+- [x] Lighter 账户 feed 初始化失败的测试先复现 book task 泄漏，随后改为先完成
+  同步 feed 构造、再创建长期任务。
+- [x] 修复后严格全量验证：`124 passed`，`compileall` 与 `git diff --check` 通过。

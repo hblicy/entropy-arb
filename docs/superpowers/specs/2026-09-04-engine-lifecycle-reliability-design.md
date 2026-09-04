@@ -1,5 +1,7 @@
 # Engine 生命周期与记录可靠性设计
 
+实现状态：已按本设计完成，验证记录见对应实施计划。
+
 ## 背景
 
 当前记录器和 Engine 正常停机路径已经能传播 recorder 错误并关闭全部 venue，
@@ -75,7 +77,13 @@ recorder。
 5. 传播首要错误；只有不存在运行错误时才传播第一个清理错误。
 
 若 Engine 协程本身收到 `CancelledError`，仍执行上述清理，完成后重新传播该
-取消，不把它转换成普通运行错误。
+取消，不把它转换成普通运行错误。清理本身运行在独立 task 中并由 shield 保护；
+即使清理期间再次收到取消，Engine 也会记录该取消并继续等待清理完成，避免
+跳过长期任务收集或 venue close。
+
+适配器必须在创建长期 task 之前完成所有可能失败的同步初始化。Lighter live
+启动会先构造账户订单 feed，再创建 book/account tasks，避免账户 feed 初始化
+失败后遗留 Engine 尚未取得引用的 book task。
 
 ### 4. Lighter 发送 deadline
 
@@ -115,6 +123,9 @@ HTTP 429 的现有语义保持不变。
   `RuntimeError`。
 - 后台任务错误与 venue close 错误同时发生时，传播后台任务错误并关闭全部
   venue。
+- 清理等待后台 task 取消期间再次取消 Engine，断言清理仍完成；若已有后台
+  错误，该错误仍优先于后到的取消。
+- Lighter 账户 feed 构造失败时，断言不会先创建并泄漏 book task。
 - Lighter `create_order()` 永不返回时，在 `settle_timeout_sec` 后返回 unknown、
   清除订单 watch，且不会留下未完成协程。
 - 完整测试在 warning-as-error 下通过，并检查无泄漏异步任务和未读取异常。
