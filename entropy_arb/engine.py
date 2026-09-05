@@ -331,8 +331,10 @@ class Engine:
         if cfg.recorder_enabled or self.record_only:
             self.recorder = MinuteRecorder(
                 cfg.recorder_csv, self.entropy.book, self.hedge.book,
-                cfg.staleness_sec, symbol=cfg.symbol,
+                cfg.staleness_sec,
+                entropy_symbol=cfg.entropy.symbol,
                 entropy_dex=cfg.entropy.hl_dex,
+                hedge_symbol=cfg.hedge.symbol,
                 hedge_venue=cfg.hedge_venue)
             self._recorder_task = asyncio.create_task(
                 self.recorder.run(
@@ -354,8 +356,9 @@ class Engine:
                 size_step=self._step,
                 leg_slippage_bps=cfg.leg_slippage_bps,
                 staleness_sec=cfg.staleness_sec,
-                symbol=cfg.symbol,
+                entropy_symbol=cfg.entropy.symbol,
                 entropy_dex=cfg.entropy.hl_dex,
+                hedge_symbol=cfg.hedge.symbol,
                 hedge_venue=cfg.hedge_venue,
             )
             self._signal_task = asyncio.create_task(

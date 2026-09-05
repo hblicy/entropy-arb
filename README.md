@@ -77,9 +77,10 @@ cp .env.example .env                     # credentials — required to trade
 ```
 
 The markets are **not** in the config file — you state them explicitly on
-every start: `--symbol` (traded on both venues) and `--hedge` (one of
-`lighter`, `lighter-rh`, `tradexyz`; Entropy is always the
-other leg).
+every start: `--symbol` selects the Entropy market and `--hedge` selects one
+of `lighter`, `lighter-rh`, or `tradexyz`. If the hedge venue uses a different
+name for the same asset, add `--hedge-symbol`; it defaults to `--symbol` when
+omitted.
 
 There is **no paper mode** — the bot either collects data (`--record-only`)
 or trades live. Validate with recorded data and tiny position caps, not with
@@ -91,21 +92,29 @@ simulated fills.
 python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
+For example, Entropy `ANTH` and Robinhood Lighter `ANTHROPIC` are selected
+with:
+
+```bash
+python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
+  --hedge-symbol ANTHROPIC --no-dashboard
+```
+
 Let it run for at least a few hours (a day is better — premiums have
 intraday regimes). It writes minute aggregates to `logs/minutes.csv` and,
 in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
 row is written immediately on `start`, once per second as `sample`, and on
 disappearance, stale books, or shutdown as `end`. These rows are observation
 only: they do not gate entries or change live strategy behavior. The signal
-path can be changed with `recorder.signal_csv`. Both files include the symbol,
-Entropy DEX, and hedge venue on every row.
+path can be changed with `recorder.signal_csv`. Both files include each leg's
+native symbol, the Entropy DEX, and the hedge venue on every row.
 
 Use a separate `recorder.csv` for each symbol/venue combination. The analyzer
-accepts a purely legacy file without market columns, but rejects a file that
-contains more than one identified market instead of producing unsafe combined
-thresholds. A legacy schema or incomplete/invalid final CSV row causes the file
-to be preserved at the next free `.old`, `.old.1`, ... archive before a clean
-file is written.
+accepts legacy files with the old `symbol` identity or with no market columns,
+but rejects a file that contains more than one identified market instead of
+producing unsafe combined thresholds. A legacy schema or incomplete/invalid
+final CSV row causes the file to be preserved at the next free `.old`,
+`.old.1`, ... archive before a clean file is written.
 In `--record-only`, both recorder output files are opened at startup; an output
 creation or write failure stops the process with an error. If a minute row has
 already been handed to the CSV writer when `flush()` reports an ambiguous I/O
@@ -158,7 +167,7 @@ Once per second it samples both live books; once per minute it writes a row:
 | column | meaning |
 |---|---|
 | `minute_ts`, `time_utc` | minute start (epoch seconds, ISO UTC) |
-| `symbol`, `entropy_dex`, `hedge_venue` | market identity; one file should contain one market |
+| `entropy_symbol`, `entropy_dex`, `hedge_symbol`, `hedge_venue` | native market identity for both legs; one file should contain one pair |
 | `entropy_bid/ask`, `hedge_bid/ask` | last fresh top-of-book of the minute |
 | `premium_open/high/low/close/mean/std_bps` | mid-to-mid premium of Entropy over the hedge |
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |
@@ -180,7 +189,7 @@ restricts to recent data; premiums drift, so re-run it regularly and update
 
 Strategy lives in `config.yaml` (validated — unknown keys, non-finite values,
 and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.env`, and the markets on the command line
-(`--symbol`, `--hedge`). Full commented reference:
+(`--symbol`, optional `--hedge-symbol`, and `--hedge`). Full commented reference:
 [config.example.yaml](config.example.yaml). The essentials:
 
 | key | meaning | default |

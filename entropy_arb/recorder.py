@@ -40,7 +40,8 @@ from .book import OrderBook, plan_arb
 
 log = logging.getLogger("recorder")
 
-HEADER = ["minute_ts", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+HEADER = ["minute_ts", "time_utc", "entropy_symbol", "entropy_dex",
+          "hedge_symbol", "hedge_venue",
           "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
           "premium_open_bps", "premium_high_bps", "premium_low_bps",
           "premium_close_bps", "premium_mean_bps", "premium_std_bps",
@@ -48,7 +49,8 @@ HEADER = ["minute_ts", "time_utc", "symbol", "entropy_dex", "hedge_venue",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
 
 SIGNAL_HEADER = [
-    "ts_ms", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+    "ts_ms", "time_utc", "entropy_symbol", "entropy_dex",
+    "hedge_symbol", "hedge_venue",
     "event_id", "event", "direction",
     "elapsed_ms", "end_reason", "entropy_bid", "entropy_ask",
     "hedge_bid", "hedge_ask", "entropy_book_age_ms",
@@ -139,8 +141,10 @@ def _valid_signal_tail(path: str) -> bool:
         timestamp_ok = math.isfinite(float(row[0]))
     except ValueError:
         return False
-    return bool(timestamp_ok and row[5]
-                and row[6] in {"start", "sample", "end"})
+    event_id_index = SIGNAL_HEADER.index("event_id")
+    event_index = SIGNAL_HEADER.index("event")
+    return bool(timestamp_ok and row[event_id_index]
+                and row[event_index] in {"start", "sample", "end"})
 
 
 class _MinuteAgg:
@@ -179,15 +183,15 @@ class _MinuteAgg:
         self.b_max = max(self.b_max, buy_edge)
         self.e_bid, self.e_ask, self.h_bid, self.h_ask = e_bid, e_ask, h_bid, h_ask
 
-    def row(self, symbol: str, entropy_dex: str,
-            hedge_venue: str) -> list:
+    def row(self, entropy_symbol: str, entropy_dex: str,
+            hedge_symbol: str, hedge_venue: str) -> list:
         mean = self.p_sum / self.n
         var = max(self.p_sumsq / self.n - mean * mean, 0.0)
         ts = self.minute * 60
         return [ts,
                 datetime.fromtimestamp(ts, tz=timezone.utc)
                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
-                symbol, entropy_dex, hedge_venue,
+                entropy_symbol, entropy_dex, hedge_symbol, hedge_venue,
                 f"{self.e_bid:.10g}", f"{self.e_ask:.10g}",
                 f"{self.h_bid:.10g}", f"{self.h_ask:.10g}",
                 f"{self.p_open:.3f}", f"{self.p_high:.3f}",
@@ -201,15 +205,16 @@ class _MinuteAgg:
 class MinuteRecorder:
     def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
                  staleness_sec: float, interval_sec: float = 1.0, *,
-                 symbol: str = "", entropy_dex: str = "",
-                 hedge_venue: str = "") -> None:
+                 entropy_symbol: str = "", entropy_dex: str = "",
+                 hedge_symbol: str = "", hedge_venue: str = "") -> None:
         self.path = path
         self.entropy_book = entropy_book
         self.hedge_book = hedge_book
         self.staleness_sec = staleness_sec
         self.interval_sec = interval_sec
-        self.symbol = symbol
+        self.entropy_symbol = entropy_symbol
         self.entropy_dex = entropy_dex
+        self.hedge_symbol = hedge_symbol
         self.hedge_venue = hedge_venue
         self.rows_written = 0
         self._agg: Optional[_MinuteAgg] = None
@@ -246,7 +251,8 @@ class MinuteRecorder:
         agg = self._agg
         self._agg = None
         self._writer.writerow(agg.row(
-            self.symbol, self.entropy_dex, self.hedge_venue))
+            self.entropy_symbol, self.entropy_dex,
+            self.hedge_symbol, self.hedge_venue))
         self._fh.flush()
         self.rows_written += 1
 
@@ -337,7 +343,8 @@ class SignalRecorder:
                  max_order_notional: float, min_base: float,
                  min_notional: float, size_step: float,
                  leg_slippage_bps: float, staleness_sec: float,
-                 symbol: str, entropy_dex: str, hedge_venue: str,
+                 entropy_symbol: str, entropy_dex: str,
+                 hedge_symbol: str, hedge_venue: str,
                  sample_sec: float = 1.0) -> None:
         self.path = path
         self.entropy = entropy
@@ -353,8 +360,9 @@ class SignalRecorder:
         self.leg_slippage_bps = leg_slippage_bps
         self.staleness_sec = staleness_sec
         self.sample_sec = sample_sec
-        self.symbol = symbol
+        self.entropy_symbol = entropy_symbol
         self.entropy_dex = entropy_dex
+        self.hedge_symbol = hedge_symbol
         self.hedge_venue = hedge_venue
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
@@ -490,8 +498,9 @@ class SignalRecorder:
             "ts_ms": int(wall_now * 1000),
             "time_utc": datetime.fromtimestamp(wall_now, tz=timezone.utc)
             .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-            "symbol": self.symbol,
+            "entropy_symbol": self.entropy_symbol,
             "entropy_dex": self.entropy_dex,
+            "hedge_symbol": self.hedge_symbol,
             "hedge_venue": self.hedge_venue,
             "event_id": state.event_id,
             "event": event,

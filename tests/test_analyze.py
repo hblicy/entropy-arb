@@ -14,19 +14,30 @@ import tools.analyze as analyze  # noqa: E402
 def test_validate_single_market_rejects_mixed_minute_rows():
     with pytest.raises(ValueError, match="multiple markets"):
         analyze.validate_single_market([
-            {"symbol": "SNDK", "entropy_dex": "io",
-             "hedge_venue": "lighter-rh"},
-            {"symbol": "SNDK", "entropy_dex": "io",
-             "hedge_venue": "tradexyz"},
+            {"entropy_symbol": "ANTH", "entropy_dex": "io",
+             "hedge_symbol": "ANTHROPIC", "hedge_venue": "lighter-rh"},
+            {"entropy_symbol": "ANTH", "entropy_dex": "io",
+             "hedge_symbol": "ANTH", "hedge_venue": "lighter-rh"},
         ])
 
 
 def test_validate_single_market_accepts_legacy_rows_without_identity():
     market = analyze.validate_single_market([
-        {"symbol": "", "entropy_dex": "", "hedge_venue": ""},
-        {"symbol": "", "entropy_dex": "", "hedge_venue": ""},
+        {"entropy_symbol": "", "entropy_dex": "", "hedge_symbol": "",
+         "hedge_venue": ""},
+        {"entropy_symbol": "", "entropy_dex": "", "hedge_symbol": "",
+         "hedge_venue": ""},
     ])
-    assert market == ("", "", "")
+    assert market == ("", "", "", "")
+
+
+def test_validate_single_market_normalizes_legacy_identity():
+    market = analyze.validate_single_market([
+        {"symbol": "SNDK", "entropy_dex": "io",
+         "hedge_venue": "lighter-rh"},
+    ])
+
+    assert market == ("SNDK", "io", "SNDK", "lighter-rh")
 
 
 def test_fee_adjusted_rooms_match_execution_formula_in_both_directions():
@@ -76,6 +87,46 @@ def test_load_rows_merges_duplicate_minute_fragments_before_filtering(tmp_path):
     assert merged["prem_mean"] == pytest.approx(2.0)
     assert merged["sell_max"] == 4.0
     assert merged["buy_max"] == 3.0
+
+
+def test_load_rows_accepts_distinct_symbols_in_new_schema(tmp_path):
+    path = tmp_path / "minutes.csv"
+    fields = [
+        "minute_ts", "samples", "entropy_symbol", "entropy_dex",
+        "hedge_symbol", "hedge_venue", "premium_close_bps",
+        "premium_mean_bps", "sell_edge_max_bps", "buy_edge_max_bps",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(fields)
+        writer.writerow(
+            [60, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+             1, 1, 2, 3])
+
+    loaded = analyze.load_rows(str(path), hours=0.0, min_samples=10)
+
+    assert len(loaded) == 1
+    assert (
+        loaded[0]["entropy_symbol"], loaded[0]["entropy_dex"],
+        loaded[0]["hedge_symbol"], loaded[0]["hedge_venue"],
+    ) == ("ANTH", "io", "ANTHROPIC", "lighter-rh")
+
+
+def test_load_rows_rejects_partial_new_market_identity_schema(tmp_path):
+    path = tmp_path / "minutes.csv"
+    fields = [
+        "minute_ts", "samples", "entropy_symbol", "entropy_dex",
+        "hedge_venue", "premium_close_bps", "premium_mean_bps",
+        "sell_edge_max_bps", "buy_edge_max_bps",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(fields)
+        writer.writerow(
+            [60, 60, "ANTH", "io", "lighter-rh", 1, 1, 2, 3])
+
+    with pytest.raises(ValueError, match="market identity columns"):
+        analyze.load_rows(str(path), hours=0.0, min_samples=10)
 
 
 @pytest.mark.parametrize("hidden_by", ["hours", "min_samples"])

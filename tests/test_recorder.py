@@ -55,8 +55,9 @@ def set_signal_levels(venue, *, bids, asks, ts):
     venue.book.alive_ts = ts
 
 
-def make_signal_recorder(path, sample_sec=1.0, *, symbol="SNDK",
-                         entropy_dex="io", hedge_venue="lighter-rh"):
+def make_signal_recorder(path, sample_sec=1.0, *, entropy_symbol="SNDK",
+                         entropy_dex="io", hedge_symbol="SNDK",
+                         hedge_venue="lighter-rh"):
     entropy = SignalVenue("entropy")
     hedge = SignalVenue("hedge")
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
@@ -68,7 +69,8 @@ def make_signal_recorder(path, sample_sec=1.0, *, symbol="SNDK",
         min_base=0.0, min_notional=0.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
         sample_sec=sample_sec,
-        symbol=symbol, entropy_dex=entropy_dex,
+        entropy_symbol=entropy_symbol, entropy_dex=entropy_dex,
+        hedge_symbol=hedge_symbol,
         hedge_venue=hedge_venue,
     )
     return rec, entropy, hedge
@@ -121,26 +123,51 @@ def test_recorder_never_rotates_an_existing_directory(tmp_path, kind):
 def test_minute_rows_identify_market_across_appended_runs():
     path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
 
-    for minute, symbol, entropy_dex, hedge_venue in (
-            (1_700_000_000.0, "SNDK", "io", "lighter-rh"),
-            (1_700_000_060.0, "XYZ100", "io", "tradexyz")):
+    for minute, entropy_symbol, entropy_dex, hedge_symbol, hedge_venue in (
+            (1_700_000_000.0, "ANTH", "io", "ANTHROPIC", "lighter-rh"),
+            (1_700_000_060.0, "XYZ100", "io", "XYZ100", "tradexyz")):
         e_book, h_book = OrderBook(), OrderBook()
         set_book(e_book, 100.0, 100.02)
         set_book(h_book, 100.0, 100.02)
         rec = MinuteRecorder(
             path, e_book, h_book, staleness_sec=1e9,
-            symbol=symbol, entropy_dex=entropy_dex,
+            entropy_symbol=entropy_symbol, entropy_dex=entropy_dex,
+            hedge_symbol=hedge_symbol,
             hedge_venue=hedge_venue)
         rec.sample(minute)
         rec.close()
 
     with open(path, newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
-    assert [(row["symbol"], row["entropy_dex"], row["hedge_venue"])
+    assert [(row["entropy_symbol"], row["entropy_dex"],
+             row["hedge_symbol"], row["hedge_venue"])
             for row in rows] == [
-        ("SNDK", "io", "lighter-rh"),
-        ("XYZ100", "io", "tradexyz"),
+        ("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        ("XYZ100", "io", "XYZ100", "tradexyz"),
     ]
+
+
+def test_minute_recorder_rotates_legacy_identity_schema(tmp_path):
+    path = tmp_path / "minutes.csv"
+    legacy_header = [
+        "minute_ts", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+        *HEADER[6:],
+    ]
+    path.write_text(
+        ",".join(legacy_header) + "\n",
+        encoding="utf-8",
+    )
+    rec = MinuteRecorder(
+        str(path), OrderBook(), OrderBook(), staleness_sec=1e9,
+        entropy_symbol="ANTH", entropy_dex="io",
+        hedge_symbol="ANTHROPIC", hedge_venue="lighter-rh")
+
+    rec._open()
+    rec.close()
+
+    assert (tmp_path / "minutes.csv.old").exists()
+    with path.open(newline="", encoding="utf-8") as fh:
+        assert next(csv.reader(fh)) == HEADER
 
 
 def test_minute_aggregation_and_rollover():
@@ -497,7 +524,8 @@ def test_signal_metrics_use_plan_and_book_update_times(monkeypatch):
         take_fraction=1.0, max_order_notional=150.0,
         min_base=0.0, min_notional=0.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
-        symbol="SNDK", entropy_dex="io", hedge_venue="lighter-rh",
+        entropy_symbol="SNDK", entropy_dex="io", hedge_symbol="SNDK",
+        hedge_venue="lighter-rh",
     )
 
     rec.observe(now=2001.0)
@@ -592,7 +620,8 @@ def test_signal_below_minimum_plan_is_still_recorded():
         take_fraction=1.0, max_order_notional=100_000.0,
         min_base=0.0, min_notional=100.0, size_step=0.001,
         leg_slippage_bps=20.0, staleness_sec=3.0,
-        symbol="SNDK", entropy_dex="io", hedge_venue="lighter-rh",
+        entropy_symbol="SNDK", entropy_dex="io", hedge_symbol="SNDK",
+        hedge_venue="lighter-rh",
     )
 
     rec.observe(now=3000.0)
@@ -952,11 +981,12 @@ def test_signal_event_ids_are_unique_across_appended_runs_same_millisecond():
 def test_signal_rows_identify_market_across_appended_runs():
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
 
-    for symbol, entropy_dex, hedge_venue in (
-            ("SNDK", "io", "lighter-rh"),
-            ("XYZ100", "io", "tradexyz")):
+    for entropy_symbol, entropy_dex, hedge_symbol, hedge_venue in (
+            ("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+            ("XYZ100", "io", "XYZ100", "tradexyz")):
         rec, entropy, hedge = make_signal_recorder(
-            path, symbol=symbol, entropy_dex=entropy_dex,
+            path, entropy_symbol=entropy_symbol, entropy_dex=entropy_dex,
+            hedge_symbol=hedge_symbol,
             hedge_venue=hedge_venue)
         set_signal_book(entropy, bid=100.10, ask=100.11, ts=5000.0)
         set_signal_book(hedge, bid=99.99, ask=100.00, ts=5000.0)
@@ -965,10 +995,11 @@ def test_signal_rows_identify_market_across_appended_runs():
 
     starts = [row for row in read_signal_rows(path)
               if row["event"] == "start"]
-    assert [(row["symbol"], row["entropy_dex"], row["hedge_venue"])
+    assert [(row["entropy_symbol"], row["entropy_dex"],
+             row["hedge_symbol"], row["hedge_venue"])
             for row in starts] == [
-        ("SNDK", "io", "lighter-rh"),
-        ("XYZ100", "io", "tradexyz"),
+        ("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        ("XYZ100", "io", "XYZ100", "tradexyz"),
     ]
 
 
