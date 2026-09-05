@@ -65,11 +65,7 @@ def fee_adjusted_rooms(rows: list, *, midline: float,
     return sell_room, buy_room
 
 
-def validate_single_market(rows: list) -> tuple[str, str, str]:
-    markets = {
-        (row["symbol"], row["entropy_dex"], row["hedge_venue"])
-        for row in rows
-    }
+def _validate_market_set(markets: set) -> tuple[str, str, str]:
     if len(markets) > 1:
         raise ValueError(
             "multiple markets found in one minute CSV; use a separate file "
@@ -77,29 +73,81 @@ def validate_single_market(rows: list) -> tuple[str, str, str]:
     return next(iter(markets), ("", "", ""))
 
 
+def validate_single_market(rows: list) -> tuple[str, str, str]:
+    return _validate_market_set({
+        (row["symbol"], row["entropy_dex"], row["hedge_venue"])
+        for row in rows
+    })
+
+
 def load_rows(path: str, hours: float, min_samples: int) -> list:
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
-    rows = []
-    with open(path, newline="") as fh:
-        for r in csv.DictReader(fh):
+    merged = {}
+    markets = set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        identity_fields = {"symbol", "entropy_dex", "hedge_venue"}
+        present_identity = identity_fields.intersection(
+            reader.fieldnames or [])
+        if present_identity and present_identity != identity_fields:
+            raise ValueError(
+                "market identity columns must be all present or all absent")
+        has_identity = present_identity == identity_fields
+        for r in reader:
+            identity = tuple(
+                (r.get(field) or "").strip()
+                for field in ("symbol", "entropy_dex", "hedge_venue")
+            ) if has_identity else ("", "", "")
+            if has_identity and not all(identity):
+                raise ValueError(
+                    "market identity values must not be empty")
+            markets.add(identity)
+            _validate_market_set(markets)
             try:
-                if float(r["minute_ts"]) < cutoff:
-                    continue
-                if int(r["samples"]) < min_samples:
-                    continue
-                rows.append({
-                    "ts": float(r["minute_ts"]),
-                    "symbol": r.get("symbol", ""),
-                    "entropy_dex": r.get("entropy_dex", ""),
-                    "hedge_venue": r.get("hedge_venue", ""),
+                ts = float(r["minute_ts"])
+                samples = int(r["samples"])
+                row = {
+                    "ts": ts,
+                    "symbol": identity[0],
+                    "entropy_dex": identity[1],
+                    "hedge_venue": identity[2],
                     "prem": float(r["premium_close_bps"]),
                     "prem_mean": float(r["premium_mean_bps"]),
                     "sell_max": float(r["sell_edge_max_bps"]),
                     "buy_max": float(r["buy_edge_max_bps"]),
-                })
+                    "samples": samples,
+                }
             except (KeyError, ValueError):
                 continue
-    return rows
+            metrics = (
+                row["ts"], row["prem"], row["prem_mean"],
+                row["sell_max"], row["buy_max"],
+            )
+            if samples <= 0 or not all(math.isfinite(v) for v in metrics):
+                continue
+            if ts < cutoff:
+                continue
+            key = (row["symbol"], row["entropy_dex"],
+                   row["hedge_venue"], ts)
+            previous = merged.get(key)
+            if previous is None:
+                merged[key] = row
+                continue
+            total_samples = previous["samples"] + samples
+            if total_samples > 0:
+                previous["prem_mean"] = (
+                    previous["prem_mean"] * previous["samples"]
+                    + row["prem_mean"] * samples) / total_samples
+            previous["samples"] = total_samples
+            previous["prem"] = row["prem"]
+            previous["sell_max"] = max(
+                previous["sell_max"], row["sell_max"])
+            previous["buy_max"] = max(
+                previous["buy_max"], row["buy_max"])
+    return sorted(
+        (row for row in merged.values()
+         if row["samples"] >= min_samples),
+        key=lambda row: row["ts"])
 
 
 def main() -> None:
@@ -121,8 +169,11 @@ def main() -> None:
                         "combined with the exact per-venue options")
     args = p.parse_args()
 
-    exact_fees = (args.entropy_fee_bps is not None
-                  or args.hedge_fee_bps is not None)
+    if ((args.entropy_fee_bps is None)
+            != (args.hedge_fee_bps is None)):
+        p.error("--entropy-fee-bps and --hedge-fee-bps must be supplied "
+                "together")
+    exact_fees = (args.entropy_fee_bps is not None)
     if args.fees_bps is not None and exact_fees:
         p.error("--fees-bps cannot be combined with per-venue fee options")
     supplied_fees = [value for value in (
@@ -138,19 +189,16 @@ def main() -> None:
               f"collect data first / 未找到数据文件，请先运行机器人采集数据",
               file=sys.stderr)
         sys.exit(1)
+    except ValueError as exc:
+        print(f"{exc} / 一个分钟文件中包含多个市场，请按品种和对冲交易所"
+              f"分别采集", file=sys.stderr)
+        sys.exit(2)
     if len(rows) < 30:
         print(f"only {len(rows)} usable minute(s) in {args.csv} — collect at "
               f"least a few hours before trusting the numbers / 数据太少，"
               f"建议至少采集数小时", file=sys.stderr)
         if not rows:
             sys.exit(1)
-    try:
-        validate_single_market(rows)
-    except ValueError as exc:
-        print(f"{exc} / 一个分钟文件中包含多个市场，请按品种和对冲交易所"
-              f"分别采集", file=sys.stderr)
-        sys.exit(2)
-
     span_h = (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0 + 1 / 60.0
     prem = sorted(r["prem"] for r in rows)
     mean = sum(prem) / len(prem)

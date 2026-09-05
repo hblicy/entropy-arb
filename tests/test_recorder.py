@@ -14,12 +14,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import entropy_arb.recorder as recorder_module  # noqa: E402
 from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
 from entropy_arb.recorder import (  # noqa: E402
     HEADER,
     MinuteRecorder,
     SIGNAL_HEADER,
     SignalRecorder,
+    csv_header_matches,
 )
 
 
@@ -75,6 +77,45 @@ def make_signal_recorder(path, sample_sec=1.0, *, symbol="SNDK",
 def read_signal_rows(path):
     with open(path, newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
+
+
+def row_with_unclosed_final_quote(header, values):
+    row = ["0"] * len(header)
+    for index, value in values.items():
+        row[index] = value
+    return ",".join(row[:-1]) + ',"' + row[-1] + "\n"
+
+
+def test_csv_header_check_propagates_filesystem_errors(tmp_path):
+    with pytest.raises(OSError):
+        csv_header_matches(str(tmp_path), HEADER)
+
+
+def test_csv_header_check_rejects_unclosed_quote(tmp_path):
+    path = tmp_path / "minutes.csv"
+    path.write_text(
+        ",".join(HEADER[:-1]) + ',"' + HEADER[-1] + "\n",
+        encoding="utf-8",
+    )
+
+    assert csv_header_matches(str(path), HEADER) is False
+
+
+@pytest.mark.parametrize("kind", ["minute", "signal"])
+def test_recorder_never_rotates_an_existing_directory(tmp_path, kind):
+    output = tmp_path / f"{kind}.csv"
+    output.mkdir()
+    if kind == "minute":
+        rec = MinuteRecorder(
+            str(output), OrderBook(), OrderBook(), staleness_sec=1e9)
+    else:
+        rec, _, _ = make_signal_recorder(str(output))
+
+    with pytest.raises(OSError):
+        rec._open()
+
+    assert output.is_dir()
+    assert not (tmp_path / f"{kind}.csv.old").exists()
 
 
 def test_minute_rows_identify_market_across_appended_runs():
@@ -185,6 +226,63 @@ def test_minute_rotation_preserves_existing_archive():
         assert fh.read() == "previous,header\n1,2\n"
 
 
+@pytest.mark.parametrize("tail", ["BROKEN", "BROKEN\n"])
+def test_minute_recorder_rotates_file_with_invalid_tail_before_append(tail):
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "minutes.csv")
+    e_book, h_book = OrderBook(), OrderBook()
+    set_book(e_book, 100.0, 100.02)
+    set_book(h_book, 100.0, 100.02)
+    first = MinuteRecorder(path, e_book, h_book, staleness_sec=1e9)
+    first.sample(1_700_000_000.0)
+    first.close()
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        fh.write(tail)
+
+    second = MinuteRecorder(path, e_book, h_book, staleness_sec=1e9)
+    second.sample(1_700_000_060.0)
+    second.close()
+
+    assert os.path.exists(path + ".old")
+    with open(path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1
+    assert float(rows[0]["minute_ts"]) == 1_700_000_040.0
+
+
+def test_minute_recorder_rotates_invalid_utf8_tail_without_decoding_file():
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "minutes.csv")
+    original = ",".join(HEADER).encode("utf-8") + b"\ninvalid\xff\n"
+    with open(path, "wb") as fh:
+        fh.write(original)
+    rec = MinuteRecorder(
+        path, OrderBook(), OrderBook(), staleness_sec=1e9)
+
+    rec._open()
+    rec.close()
+
+    with open(path + ".old", "rb") as fh:
+        assert fh.read() == original
+    with open(path, encoding="utf-8") as fh:
+        assert next(csv.reader(fh)) == HEADER
+
+
+def test_minute_recorder_rotates_tail_with_unclosed_quote(tmp_path):
+    path = tmp_path / "minutes.csv"
+    original = ",".join(HEADER) + "\n" + row_with_unclosed_final_quote(
+        HEADER, {0: "1700000000", len(HEADER) - 1: "1"})
+    path.write_text(original, encoding="utf-8")
+    rec = MinuteRecorder(
+        str(path), OrderBook(), OrderBook(), staleness_sec=1e9)
+
+    rec._open()
+    rec.close()
+
+    assert (tmp_path / "minutes.csv.old").read_text(
+        encoding="utf-8") == original
+
+
 def test_minute_flush_failure_still_closes_file():
     class AlwaysFailFlushBuffer(io.StringIO):
         def __init__(self):
@@ -261,14 +359,20 @@ def test_minute_transient_flush_failure_does_not_duplicate_row():
     assert rec.rows_written == 0
 
 
-def test_signal_lifecycle_writes_start_sample_and_end():
+def test_signal_lifecycle_writes_start_sample_and_end(monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, _ = make_signal_recorder(path)
+    monotonic_clock = [1000.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
 
     rec.observe(now=1000.0)
+    monotonic_clock[0] = 1000.5
     rec.observe(now=1000.5)
+    monotonic_clock[0] = 1001.0
     rec.observe(now=1001.0)
     set_signal_book(entropy, bid=100.00, ask=100.01, ts=1001.2)
+    monotonic_clock[0] = 1001.2
     rec.observe(now=1001.2)
     rec.close(now=1001.2)
 
@@ -280,12 +384,58 @@ def test_signal_lifecycle_writes_start_sample_and_end():
     assert rows[-1]["end_reason"] == "edge_below_threshold"
 
 
-def test_signal_shutdown_closes_active_event_once():
+def test_signal_lifecycle_uses_monotonic_time_when_wall_clock_rolls_back(
+        monkeypatch):
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    wall_clock = [100.0]
+    monotonic_clock = [10.0]
+    entropy.book.alive_mono = hedge.book.alive_mono = 10.0
+    entropy.book.last_update_mono = hedge.book.last_update_mono = 10.0
+    monkeypatch.setattr(
+        recorder_module.time, "time", lambda: wall_clock[0])
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+
+    rec.observe()
+    wall_clock[0] = 5.0
+    monotonic_clock[0] = 11.0
+    rec.observe()
+    wall_clock[0] = 5.2
+    monotonic_clock[0] = 11.2
+    rec.close()
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "sample", "end"]
+    assert [int(row["elapsed_ms"]) for row in rows] == [0, 1000, 1200]
+
+
+def test_signal_explicit_wall_time_and_default_close_keep_nonnegative_elapsed():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    wall_now = time.time()
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=wall_now)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=wall_now)
+
+    rec.observe(now=wall_now)
+    rec.close()
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "end"]
+    assert all(int(row["elapsed_ms"]) >= 0 for row in rows)
+
+
+def test_signal_shutdown_closes_active_event_once(monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, _, _ = make_signal_recorder(path)
+    monotonic_clock = [1000.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
 
     rec.observe(now=1000.0)
+    monotonic_clock[0] = 1002.0
     rec.close(now=1002.0)
+    monotonic_clock[0] = 1003.0
     rec.close(now=1003.0)
 
     rows = read_signal_rows(path)
@@ -320,7 +470,7 @@ def test_signal_directions_have_independent_lifecycles():
     assert sell_id != buy_id
 
 
-def test_signal_metrics_use_plan_and_book_update_times():
+def test_signal_metrics_use_plan_and_book_update_times(monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     entropy = SignalVenue("entropy", fee_bps=0.3)
     hedge = SignalVenue("hedge", fee_bps=0.6)
@@ -337,6 +487,10 @@ def test_signal_metrics_use_plan_and_book_update_times():
         ts=2000.5,
     )
     entropy.book.alive_ts = hedge.book.alive_ts = 2000.99
+    entropy.book.last_update_mono = 2000.8
+    hedge.book.last_update_mono = 2000.5
+    entropy.book.alive_mono = hedge.book.alive_mono = 2000.99
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: 2001.0)
     rec = SignalRecorder(
         path, entropy, hedge,
         midline_bps=0.0, upper_bps=5.0, lower_bps=5.0,
@@ -390,6 +544,35 @@ def test_signal_metrics_use_plan_and_book_update_times():
     assert float(row["expected_edge_usd"]) == pytest.approx(
         expected_plan.exp_edge_usd
     )
+
+
+def test_signal_freshness_uses_monotonic_time_when_wall_clock_rolls_back(
+        monkeypatch):
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    entropy.book.alive_ts = hedge.book.alive_ts = 100.0
+    entropy.book.alive_mono = hedge.book.alive_mono = 10.0
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: 14.0)
+
+    assert rec._books_status(5.0) == "stale_book"
+
+
+def test_signal_book_age_metrics_use_monotonic_time_when_wall_clock_rolls_back(
+        monkeypatch):
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    rec.staleness_sec = 10.0
+    entropy.book.last_update_ts = hedge.book.last_update_ts = 100.0
+    entropy.book.last_update_mono = 10.0
+    hedge.book.last_update_mono = 11.0
+    entropy.book.alive_mono = hedge.book.alive_mono = 11.0
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: 14.0)
+
+    row = rec._snapshot("sell_entropy", now=5.0)
+
+    assert row["entropy_book_age_ms"] == pytest.approx(4000.0)
+    assert row["hedge_book_age_ms"] == pytest.approx(3000.0)
+    assert row["book_update_skew_ms"] == pytest.approx(1000.0)
 
 
 def test_signal_below_minimum_plan_is_still_recorded():
@@ -475,6 +658,56 @@ def test_signal_rotation_preserves_existing_archive():
         assert fh.read() == "older archive\n"
     with open(path + ".old.1", encoding="utf-8") as fh:
         assert fh.read() == "previous,header\n1,2\n"
+
+
+@pytest.mark.parametrize("tail", ["BROKEN", "BROKEN\n"])
+def test_signal_recorder_rotates_file_with_invalid_tail_before_append(tail):
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "signals.csv")
+    first, _, _ = make_signal_recorder(path)
+    first.observe(now=1000.0)
+    first.close(now=1000.1)
+    with open(path, "a", encoding="utf-8", newline="") as fh:
+        fh.write(tail)
+
+    second, _, _ = make_signal_recorder(path)
+    second.observe(now=1001.0)
+    second.close(now=1001.1)
+
+    assert os.path.exists(path + ".old")
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["start", "end"]
+
+
+def test_signal_recorder_rotates_invalid_utf8_tail_without_decoding_file():
+    directory = tempfile.mkdtemp()
+    path = os.path.join(directory, "signals.csv")
+    original = ",".join(SIGNAL_HEADER).encode("utf-8") + b"\ninvalid\xff\n"
+    with open(path, "wb") as fh:
+        fh.write(original)
+    rec, _, _ = make_signal_recorder(path)
+
+    rec._open()
+    rec.close(now=1000.0)
+
+    with open(path + ".old", "rb") as fh:
+        assert fh.read() == original
+    with open(path, encoding="utf-8") as fh:
+        assert next(csv.reader(fh)) == SIGNAL_HEADER
+
+
+def test_signal_recorder_rotates_tail_with_unclosed_quote(tmp_path):
+    path = tmp_path / "signals.csv"
+    original = ",".join(SIGNAL_HEADER) + "\n" + row_with_unclosed_final_quote(
+        SIGNAL_HEADER, {0: "1700000000", 5: "event-id", 6: "start"})
+    path.write_text(original, encoding="utf-8")
+    rec, _, _ = make_signal_recorder(str(path))
+
+    rec._open()
+    rec.close(now=1000.0)
+
+    assert (tmp_path / "signals.csv.old").read_text(
+        encoding="utf-8") == original
 
 
 def test_signal_async_samples_without_another_book_update():
@@ -753,14 +986,20 @@ def test_signal_ends_immediately_when_book_is_not_ready():
     assert rows[-1]["end_reason"] == "book_not_ready"
 
 
-def test_signal_stays_active_while_books_are_alive_without_price_updates():
+def test_signal_stays_active_while_books_are_alive_without_price_updates(
+        monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     rec, entropy, hedge = make_signal_recorder(path)
+    monotonic_clock = [1000.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
 
     rec.observe(now=1000.0)
     entropy.book.last_update_ts = hedge.book.last_update_ts = 900.0
     entropy.book.alive_ts = hedge.book.alive_ts = 1001.0
+    monotonic_clock[0] = 1001.0
     rec.observe(now=1001.0)
+    monotonic_clock[0] = 1001.1
     rec.close(now=1001.1)
 
     rows = read_signal_rows(path)

@@ -92,8 +92,8 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 
 每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容完全不含
 市场字段的旧文件，但检测到一个文件中混有多个已标识市场时会直接拒绝分析，
-不会给出存在风险的合并阈值。升级后的首次启动会把旧表头分钟文件移到下一个
-未占用的 `.old`、`.old.1` 等归档，再写入新 schema。`--record-only` 启动时会
+不会给出存在风险的合并阈值。旧 schema 或末行不完整、无效时，原文件会保留到
+下一个未占用的 `.old`、`.old.1` 等归档，再写入干净的新文件。`--record-only` 启动时会
 立即打开两个采集文件；创建或写入失败会报错并停止进程。如果分钟行已经交给
 CSV writer 后 `flush()` 才报告结果不确定的 I/O 错误，采集器不会盲目重写同一
 分钟聚合；这能避免重复行，但无法在 flush 失败时保证该行一定落盘。
@@ -105,7 +105,8 @@ python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
-以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块；不会分析
+以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块。同一市场、同一分钟的
+重启片段会先合并再做样本数过滤，因此每分钟只计一次；它不会分析
 `logs/signals.csv`，也不会把同一分钟文件中的多个已标识市场混合计算。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
@@ -149,7 +150,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 `--hedge-fee-bps` 传入两边吃单费；分析工具会按实盘相同的买卖价格比公式
 扣费后再统计触发频率。例如 Entropy + Lighter 使用 `0.9` 和 `0.0`，
 Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
-`--fees-bps`，但它只是近似计算。
+`--fees-bps`，但它只是近似计算；两个精确费率参数必须同时提供。
 费率可能因账户或交易所调整，上线前应核对实际费率。`--hours 24` 可只分析
 最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
 
@@ -187,14 +188,17 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
 - **Lighter** —— `LIGHTER_ACCOUNT_INDEX`、`LIGHTER_API_KEY_INDEX`、
   `LIGHTER_API_PRIVATE_KEY`，必须注册在与启动参数 `--hedge` **相同的部署**上
   （主网与 Robinhood 链是两套独立的账户和密钥——参见
-  [lighter-python](https://github.com/elliottech/lighter-python)）。
+  [lighter-python](https://github.com/elliottech/lighter-python)）。同一账户上同时运行的
+  每个进程必须使用独立的 API key index/私钥；共用 key 也会共用 nonce 序列，
+  不受支持。
 
 ## 执行机制
 
 - 两条腿**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
   上异步确认成交；Hyperliquid HIP-3 用 IOC 限价单同步结算。HIP-3 当前不兼容
-  `cloid`，因此请求不会携带它；超时或 5xx 会保持为明确的“结果未知”并触发
-  仓位对账，绝不会盲目重发订单。Lighter 的提交与成交确认分别拥有一个完整的
+  `cloid`，因此请求不会携带它；超时或 5xx 会保持为明确的“结果未知”。由于没有
+  订单引用，引擎会停机并要求人工核验仓位/恢复，不会自动提交修复单，也绝不会
+  盲目重发原订单。Lighter 的提交与成交确认分别拥有一个完整的
   `settle_timeout_sec` 窗口；提交超时也按“结果未知”处理，因为订单可能已经到达
   交易所。
 - **持续性闸门**（`premium_persist_sec`）：信号先"武装"，持续存在才触发，
@@ -249,8 +253,8 @@ tests/                   python3 -m pytest tests/
   但部分成交后对冲腿的滑点是真实存在的。
 - **交易时段**：股票类永续（如 SNDK）盘后各所预言机行为不同，建议加宽带宽
   或避开盘后。
-- **单腿风险**：一条腿成交后另一条可能失败。机器人会自动对冲并对账，但
-  仍需人工关注。
+- **单腿风险**：一条腿成交后另一条可能失败。通常会自动对冲并对账；但无订单
+  引用的 Hyperliquid 超时/5xx 会故意停机等待人工恢复，因此必须持续监控。
 
 风险自负。本软件直接操作真实资金，本文档不构成任何投资建议。请从最小的
 仓位上限开始。

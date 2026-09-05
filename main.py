@@ -21,14 +21,21 @@ README.zh-CN.md (中文).
 """
 import argparse
 import asyncio
-import contextlib
 import logging
 import os
 import signal
 import sys
 
-from entropy_arb.config import HEDGE_VENUES, ConfigError, load_config
+from entropy_arb.config import (
+    HEDGE_VENUES,
+    ConfigError,
+    load_config,
+    validate_output_paths,
+)
 from entropy_arb.engine import Engine
+
+DASHBOARD_STOP_TIMEOUT_SEC = 5.0
+log = logging.getLogger("main")
 
 
 def setup_logging(level: str, log_file: str = None,
@@ -52,8 +59,112 @@ def setup_logging(level: str, log_file: str = None,
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
 
+async def _run_with_dashboard(eng, dash) -> None:
+    stopped_engine = False
+
+    def dashboard_done(_task) -> None:
+        nonlocal stopped_engine
+        if not _task.cancelled():
+            _task.exception()
+        if not eng.stop.is_set():
+            stopped_engine = True
+            eng.request_stop()
+
+    dash_task = asyncio.create_task(dash.run(), name="dashboard")
+    dash_task.add_done_callback(dashboard_done)
+    engine_error = None
+    dashboard_error = None
+
+    async def finish_dashboard():
+        done, _ = await asyncio.wait(
+            {dash_task}, timeout=DASHBOARD_STOP_TIMEOUT_SEC)
+        if not done:
+            dash_task.cancel()
+            done, _ = await asyncio.wait(
+                {dash_task}, timeout=DASHBOARD_STOP_TIMEOUT_SEC)
+        if not done:
+            return RuntimeError(
+                "dashboard did not stop within the cleanup deadline")
+        if dash_task.cancelled():
+            return asyncio.CancelledError()
+        return dash_task.exception()
+
+    try:
+        await eng.run()
+    except BaseException as exc:
+        engine_error = exc
+    finally:
+        eng.request_stop()
+        finish_task = asyncio.create_task(
+            finish_dashboard(), name="dashboard-cleanup")
+        try:
+            dashboard_error = await asyncio.shield(finish_task)
+        except asyncio.CancelledError as exc:
+            dash_task.cancel()
+            dashboard_error = await finish_task
+            if engine_error is None:
+                engine_error = exc
+
+    if (engine_error is not None and dashboard_error is not None
+            and not isinstance(dashboard_error, asyncio.CancelledError)):
+        log.error(
+            "dashboard also failed while preserving the engine error",
+            exc_info=(type(dashboard_error), dashboard_error,
+                      dashboard_error.__traceback__))
+    if engine_error is not None:
+        raise engine_error
+    if dashboard_error is not None:
+        if isinstance(dashboard_error, asyncio.CancelledError):
+            if stopped_engine:
+                raise RuntimeError(
+                    "dashboard was cancelled unexpectedly") from dashboard_error
+        else:
+            raise dashboard_error
+    if stopped_engine:
+        raise RuntimeError("dashboard exited unexpectedly")
+
+
+def _run_application(awaitable):
+    """Run the application without letting a broken UI task block exit.
+
+    Engine cleanup completes inside ``amain``.  Any task still alive here is
+    therefore an abnormal auxiliary task (not an order operation), and gets a
+    final bounded cancellation window before the loop is closed.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(awaitable)
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            done, _ = loop.run_until_complete(asyncio.wait(
+                pending, timeout=DASHBOARD_STOP_TIMEOUT_SEC))
+            for task in done:
+                if task.cancelled():
+                    continue
+                error = task.exception()
+                if error is not None:
+                    log.error(
+                        "task %s failed during final loop cleanup",
+                        task.get_name(),
+                        exc_info=(type(error), error, error.__traceback__))
+        abandoned = asyncio.all_tasks(loop)
+        for task in abandoned:
+            log.critical(
+                "abandoning non-cooperative task %s after cleanup deadline",
+                task.get_name())
+            # asyncio cannot forcibly terminate a coroutine that suppresses
+            # every cancellation.  The loop is about to close deliberately.
+            task._log_destroy_pending = False
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
-                log_buffer, lang: str) -> None:
+                 log_buffer, lang: str) -> None:
     eng = Engine(cfg, record_only=record_only)
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -64,15 +175,7 @@ async def amain(cfg, record_only: bool, use_dashboard: bool, force_tty: bool,
     from entropy_arb.dashboard import Dashboard
     dash = Dashboard(eng, log_buffer, cfg.log_file, force_terminal=force_tty,
                      lang=lang)
-    dash_task = asyncio.create_task(dash.run(), name="dashboard")
-    try:
-        await eng.run()
-    finally:
-        eng.request_stop()
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(dash_task, timeout=5)
-        if not dash_task.done():
-            dash_task.cancel()
+    await _run_with_dashboard(eng, dash)
 
 
 def main() -> None:
@@ -106,7 +209,8 @@ def main() -> None:
     try:
         cfg = load_config(args.config, args.env_file,
                           symbol=args.symbol, hedge_venue=args.hedge,
-                          record_only=args.record_only)
+                          record_only=args.record_only,
+                          validate_outputs=False)
     except ConfigError as e:
         print(f"config error: {e}", file=sys.stderr)
         sys.exit(2)
@@ -126,16 +230,24 @@ def main() -> None:
             use_dashboard = False
     if use_dashboard:
         log_buffer = BufferLogHandler()
+    try:
+        validate_output_paths(
+            cfg, record_only=args.record_only,
+            log_file_active=use_dashboard)
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        sys.exit(2)
+    if use_dashboard:
         setup_logging(cfg.log_level, log_file=cfg.log_file,
                       extra_handler=log_buffer)
     else:
         setup_logging(cfg.log_level)
 
     try:
-        asyncio.run(amain(cfg, record_only=args.record_only,
-                          use_dashboard=use_dashboard, force_tty=force_tty,
-                          log_buffer=log_buffer,
-                          lang="zh" if args.cn else "en"))
+        _run_application(amain(
+            cfg, record_only=args.record_only,
+            use_dashboard=use_dashboard, force_tty=force_tty,
+            log_buffer=log_buffer, lang="zh" if args.cn else "en"))
     except RuntimeError as e:
         # startup failures (missing credentials, market not found, venue
         # unreachable) — a clean message, not a traceback

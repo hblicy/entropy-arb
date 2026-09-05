@@ -37,7 +37,7 @@ class VenueAdapter(Protocol):
     def configure_peer(self, other: "VenueAdapter") -> None: ...
 
     def start_tasks(
-            self, stop: asyncio.Event, notify: Callable[[], None],
+            self, stop: asyncio.Event, notify: Callable[..., None],
             live: bool) -> List[asyncio.Task]: ...
 
     def ready_to_trade(self) -> bool: ...
@@ -49,6 +49,10 @@ class VenueAdapter(Protocol):
     async def send_taker(
             self, *, is_buy: bool, qty: float, limit_px: float,
             reduce_only: bool = False) -> OrderResult: ...
+
+    async def resolve_order(self, order_ref: str) -> Optional[OrderResult]:
+        """Return a terminal result, or None while the order is still unknown."""
+        ...
 
     async def fetch_equity(self): ...
 

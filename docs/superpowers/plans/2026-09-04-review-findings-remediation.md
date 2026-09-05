@@ -466,21 +466,21 @@ the Engine suite, then the strict full suite, compileall, and diff checks.**
 - Modify: `tests/test_engine.py`
 - Modify: `entropy_arb/engine.py:111-113,1399-1487`
 
-- [ ] **Step 1: Add a failing regression** with three pending references: the
+- [x] **Step 1: Add a failing regression** with three pending references: the
 first resolves to a filled terminal result, the second returns a non-terminal
 `OrderResult`, and the third is not inspected.  Assert that the first fill is
 applied exactly once and the remaining two confirmations retain their complete
 metadata for manual recovery.
-- [ ] **Step 2: Run the focused test** with
+- [x] **Step 2: Run the focused test** with
 `python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py::test_contract_failure_preserves_atomic_pending_order_progress`
 and verify that the current code leaves the first position unchanged and loses
 all pending references.
-- [ ] **Step 3: Consume validated terminal confirmations one at a time.**
+- [x] **Step 3: Consume validated terminal confirmations one at a time.**
 After each terminal result, update position/cash/volume and remove only that
 confirmation from the active list.  On a contract invariant, move the current
 and unprocessed confirmations into `_manual_order_confirmations`, log their
 venue/reference metadata, disable automatic repair, and stop shutdown polling.
-- [ ] **Step 4: Re-run the focused test and existing pending-order recovery
+- [x] **Step 4: Re-run the focused test and existing pending-order recovery
 tests** and verify the terminal fill is applied once, manual references remain,
 and shutdown drain does not loop.
 
@@ -490,16 +490,16 @@ and shutdown drain does not loop.
 - Modify: `tests/test_engine.py`
 - Modify: `entropy_arb/engine.py:885-917`
 
-- [ ] **Step 1: Add failing regressions** that arm a direction, make a book
+- [x] **Step 1: Add failing regressions** that arm a direction, make a book
 stale or a venue unready/down for longer than `premium_persist_sec`, restore a
 fresh executable book, and assert the first restored scan only starts a new
 arm interval.
-- [ ] **Step 2: Run the focused tests** and verify the current code immediately
+- [x] **Step 2: Run the focused tests** and verify the current code immediately
 returns an execution plan after restoration.
-- [ ] **Step 3: Clear the affected direction's `_armed` timestamp** before
+- [x] **Step 3: Clear the affected direction's `_armed` timestamp** before
 continuing from stale-book, unready-venue, or outage branches.  Do not reset it
 for execution-lock or rate-budget deferrals.
-- [ ] **Step 4: Re-run persistence and strategy tests** and verify an execution
+- [x] **Step 4: Re-run persistence and strategy tests** and verify an execution
 plan appears only after a new continuous interval.
 
 ### Task 30: Separate recorder wall and monotonic clocks
@@ -508,16 +508,16 @@ plan appears only after a new continuous interval.
 - Modify: `tests/test_recorder.py`
 - Modify: `entropy_arb/recorder.py:520-560`
 
-- [ ] **Step 1: Add a failing regression** that starts a signal with
+- [x] **Step 1: Add a failing regression** that starts a signal with
 `observe(now=time.time())`, closes it with `close()`, and asserts all
 `elapsed_ms` values are non-negative.
-- [ ] **Step 2: Run the focused test** and verify the current code writes a
+- [x] **Step 2: Run the focused test** and verify the current code writes a
 large negative shutdown duration.
-- [ ] **Step 3: Make `now` wall-clock-only** in `observe()` and `close()` and
+- [x] **Step 3: Make `now` wall-clock-only** in `observe()` and `close()` and
 always obtain lifecycle time from `time.monotonic()`.  Update deterministic
 duration tests to patch `entropy_arb.recorder.time.monotonic` rather than using
 the wall-time argument as a second clock.
-- [ ] **Step 4: Re-run all recorder tests** and verify timestamps, sampling,
+- [x] **Step 4: Re-run all recorder tests** and verify timestamps, sampling,
 shutdown rows, and mixed explicit/default calls remain correct.
 
 ### Task 31: Final state-continuity verification
@@ -528,8 +528,8 @@ shutdown rows, and mixed explicit/default calls remain correct.
 - Review: `tests/test_engine.py`
 - Review: `tests/test_recorder.py`
 
-- [ ] **Step 1: Run the three focused regression groups.**
-- [ ] **Step 2: Run `python -m pytest -q -p no:cacheprovider -W error`.**
-- [ ] **Step 3: Run `python -m compileall -q entropy_arb tools main.py tests`.**
-- [ ] **Step 4: Run `git diff --check HEAD`, inspect `git status --short`, and
+- [x] **Step 1: Run the three focused regression groups.**
+- [x] **Step 2: Run `python -m pytest -q -p no:cacheprovider -W error`.**
+- [x] **Step 3: Run `python -m compileall -q entropy_arb tools main.py tests`.**
+- [x] **Step 4: Run `git diff --check HEAD`, inspect `git status --short`, and
 review the final recovery/disarming/clock paths for regression risk.**

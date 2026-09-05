@@ -64,8 +64,8 @@ SIGNAL_HEADER = [
 @dataclass
 class _SignalState:
     event_id: str
-    started_at: float
-    last_written_at: float
+    started_mono: float
+    last_written_mono: float
 
 
 def next_archive_path(path: str) -> str:
@@ -75,6 +75,72 @@ def next_archive_path(path: str) -> str:
         candidate = f"{path}.old.{suffix}"
         suffix += 1
     return candidate
+
+
+def csv_header_matches(path: str, expected: list[str]) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.readline().rstrip(b"\r\n")
+        return next(csv.reader(
+            [raw.decode("utf-8")], strict=True)) == expected
+    except (UnicodeDecodeError, csv.Error, StopIteration):
+        return False
+
+
+def _last_csv_row(path: str) -> Optional[list[str]]:
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        if end == 0:
+            return []
+        fh.seek(end - 1)
+        if fh.read(1) != b"\n":
+            return None
+        pos = end - 2
+        while pos >= 0:
+            fh.seek(pos)
+            if fh.read(1) == b"\n":
+                pos += 1
+                break
+            pos -= 1
+        start = max(pos, 0)
+        fh.seek(start)
+        raw = fh.read(end - start).rstrip(b"\r\n")
+    try:
+        return next(csv.reader([raw.decode("utf-8")], strict=True))
+    except (UnicodeDecodeError, csv.Error, StopIteration):
+        return None
+
+
+def csv_tail_complete(path: str, expected: list[str]) -> bool:
+    row = _last_csv_row(path)
+    return row == expected or (row is not None and len(row) == len(expected))
+
+
+def _valid_minute_tail(path: str) -> bool:
+    row = _last_csv_row(path)
+    if row == HEADER:
+        return True
+    if row is None or len(row) != len(HEADER):
+        return False
+    try:
+        return math.isfinite(float(row[0])) and int(row[-1]) > 0
+    except ValueError:
+        return False
+
+
+def _valid_signal_tail(path: str) -> bool:
+    row = _last_csv_row(path)
+    if row == SIGNAL_HEADER:
+        return True
+    if row is None or len(row) != len(SIGNAL_HEADER):
+        return False
+    try:
+        timestamp_ok = math.isfinite(float(row[0]))
+    except ValueError:
+        return False
+    return bool(timestamp_ok and row[5]
+                and row[6] in {"start", "sample", "end"})
 
 
 class _MinuteAgg:
@@ -156,15 +222,15 @@ class MinuteRecorder:
             os.makedirs(d, exist_ok=True)
         if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
             # never append rows under a different schema's header
-            with open(self.path, encoding="utf-8") as fh0:
-                existing_header = fh0.readline().strip()
-            if existing_header != ",".join(HEADER):
+            if (not csv_header_matches(self.path, HEADER)
+                    or not _valid_minute_tail(self.path)):
                 old_path = next_archive_path(self.path)
-                log.warning("%s has an old header — rotated to %s",
+                log.warning("%s has an incompatible or invalid tail — "
+                            "rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
-        self._fh = open(self.path, "a", newline="")
+        self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
         if new:
             self._writer.writerow(HEADER)
@@ -305,11 +371,11 @@ class SignalRecorder:
         if directory:
             os.makedirs(directory, exist_ok=True)
         if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
-            with open(self.path, encoding="utf-8") as existing:
-                existing_header = existing.readline().strip()
-            if existing_header != ",".join(SIGNAL_HEADER):
+            if (not csv_header_matches(self.path, SIGNAL_HEADER)
+                    or not _valid_signal_tail(self.path)):
                 old_path = next_archive_path(self.path)
-                log.warning("%s has an old header — rotated to %s",
+                log.warning("%s has an incompatible or invalid tail — "
+                            "rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
@@ -327,8 +393,7 @@ class SignalRecorder:
         if any(book.best_bid() is None or book.best_ask() is None
                for book in books):
             return "empty_book"
-        if any(now - book.alive_ts > self.staleness_sec
-               for book in books):
+        if any(not book.is_fresh(self.staleness_sec) for book in books):
             return "stale_book"
         return None
 
@@ -342,6 +407,7 @@ class SignalRecorder:
     def _snapshot(self, direction: str, now: float) -> dict:
         buy, sell, threshold = self._direction(direction)
         e_book, h_book = self.entropy.book, self.hedge.book
+        mono_now = time.monotonic()
         e_bid, e_ask = e_book.best_bid(), e_book.best_ask()
         h_bid, h_ask = h_book.best_bid(), h_book.best_ask()
         buy_ask, sell_bid = buy.book.best_ask(), sell.book.best_bid()
@@ -370,16 +436,16 @@ class SignalRecorder:
             "hedge_bid": "" if h_bid is None else h_bid,
             "hedge_ask": "" if h_ask is None else h_ask,
             "entropy_book_age_ms": (
-                max((now - e_book.last_update_ts) * 1000.0, 0.0)
-                if e_book.last_update_ts else ""
+                max((mono_now - e_book.last_update_mono) * 1000.0, 0.0)
+                if e_book.last_update_mono else ""
             ),
             "hedge_book_age_ms": (
-                max((now - h_book.last_update_ts) * 1000.0, 0.0)
-                if h_book.last_update_ts else ""
+                max((mono_now - h_book.last_update_mono) * 1000.0, 0.0)
+                if h_book.last_update_mono else ""
             ),
             "book_update_skew_ms": (
-                abs(e_book.last_update_ts - h_book.last_update_ts) * 1000.0
-                if e_book.last_update_ts and h_book.last_update_ts else ""
+                abs(e_book.last_update_mono - h_book.last_update_mono) * 1000.0
+                if e_book.last_update_mono and h_book.last_update_mono else ""
             ),
             "top_edge_bps": top_edge,
             "net_threshold_bps": threshold,
@@ -416,12 +482,13 @@ class SignalRecorder:
         return qualifies, "" if qualifies else "edge_below_threshold"
 
     def _queue_row(self, event: str, direction: str, state: _SignalState,
-                   now: float, end_reason: str = "") -> None:
+                   wall_now: float, mono_now: float,
+                   end_reason: str = "") -> None:
         row = {name: "" for name in SIGNAL_HEADER}
-        row.update(self._snapshot(direction, now))
+        row.update(self._snapshot(direction, wall_now))
         row.update({
-            "ts_ms": int(now * 1000),
-            "time_utc": datetime.fromtimestamp(now, tz=timezone.utc)
+            "ts_ms": int(wall_now * 1000),
+            "time_utc": datetime.fromtimestamp(wall_now, tz=timezone.utc)
             .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
             "symbol": self.symbol,
             "entropy_dex": self.entropy_dex,
@@ -429,7 +496,8 @@ class SignalRecorder:
             "event_id": state.event_id,
             "event": event,
             "direction": direction,
-            "elapsed_ms": int(round((now - state.started_at) * 1000)),
+            "elapsed_ms": int(round(
+                (mono_now - state.started_mono) * 1000)),
             "end_reason": end_reason,
         })
         self._pending_rows.append(row)
@@ -451,28 +519,33 @@ class SignalRecorder:
 
     def observe(self, now: Optional[float] = None, *,
                 flush: bool = True) -> None:
-        now = time.time() if now is None else now
+        wall_now = time.time() if now is None else now
+        mono_now = time.monotonic()
         for direction in self._states:
             active = self._states[direction]
-            qualifies, end_reason = self._qualifies(direction, now)
+            qualifies, end_reason = self._qualifies(direction, wall_now)
             if qualifies and active is None:
                 self._event_seq[direction] += 1
                 active = _SignalState(
-                    event_id=(f"{direction}-{int(now * 1000)}-"
+                    event_id=(f"{direction}-{int(wall_now * 1000)}-"
                               f"{self._run_id}-"
                               f"{self._event_seq[direction]}"),
-                    started_at=now,
-                    last_written_at=now,
+                    started_mono=mono_now,
+                    last_written_mono=mono_now,
                 )
-                self._queue_row("start", direction, active, now)
+                self._queue_row(
+                    "start", direction, active, wall_now, mono_now)
                 self._states[direction] = active
             elif (qualifies and active is not None
-                  and now - active.last_written_at >= self.sample_sec):
-                self._queue_row("sample", direction, active, now)
-                active.last_written_at = now
+                  and mono_now - active.last_written_mono
+                  >= self.sample_sec):
+                self._queue_row(
+                    "sample", direction, active, wall_now, mono_now)
+                active.last_written_mono = mono_now
             elif not qualifies and active is not None:
                 self._queue_row(
-                    "end", direction, active, now, end_reason)
+                    "end", direction, active, wall_now, mono_now,
+                    end_reason)
                 self._states[direction] = None
         if flush:
             self._flush_pending()
@@ -483,11 +556,13 @@ class SignalRecorder:
         primary_error = None
         try:
             if not self._serialization_failed:
-                now = time.time() if now is None else now
+                wall_now = time.time() if now is None else now
+                mono_now = time.monotonic()
                 for direction, active in self._states.items():
                     if active is not None:
                         self._queue_row(
-                            "end", direction, active, now, "shutdown")
+                            "end", direction, active, wall_now, mono_now,
+                            "shutdown")
                         self._states[direction] = None
                 self._flush_pending()
         except BaseException as exc:
@@ -509,14 +584,14 @@ class SignalRecorder:
             raise primary_error
 
     def _seconds_until_next_sample(self, now: Optional[float] = None) -> float:
-        now = time.time() if now is None else now
+        mono_now = time.monotonic() if now is None else now
         active = [state for state in self._states.values()
                   if state is not None]
         if not active:
             return 3600.0
-        due = min(state.last_written_at + self.sample_sec
+        due = min(state.last_written_mono + self.sample_sec
                   for state in active)
-        return max(due - now, 0.001)
+        return max(due - mono_now, 0.001)
 
     async def run(self, stop: asyncio.Event,
                   update_evt: asyncio.Event) -> None:

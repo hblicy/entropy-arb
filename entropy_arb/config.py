@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import os
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -250,14 +251,24 @@ def _env_s(name: str) -> Optional[str]:
 
 def _env_i(name: str) -> Optional[int]:
     v = os.getenv(name)
-    return int(v) if v not in (None, "") else None
+    if v in (None, ""):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        raise ConfigError(
+            f"{name} must be an integer / 环境变量必须是整数") from None
 
 
 # -------------------------------------------------------------------- loading
 
+def _normalized_output_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 def _same_output_file(left: str, right: str) -> bool:
-    left_path = os.path.normcase(os.path.realpath(os.path.abspath(left)))
-    right_path = os.path.normcase(os.path.realpath(os.path.abspath(right)))
+    left_path = _normalized_output_path(left)
+    right_path = _normalized_output_path(right)
     if left_path == right_path:
         return True
     try:
@@ -267,9 +278,127 @@ def _same_output_file(left: str, right: str) -> bool:
         return False
 
 
+def _output_paths_conflict(left: str, right: str) -> bool:
+    if _same_output_file(left, right):
+        return True
+    left_path = _normalized_output_path(left)
+    right_path = _normalized_output_path(right)
+    try:
+        common = os.path.commonpath((left_path, right_path))
+    except ValueError:
+        return False  # e.g. different Windows drive letters
+    return common == left_path or common == right_path
+
+
+_WINDOWS_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"}
+_WINDOWS_RESERVED_NAMES.update(f"COM{i}" for i in range(1, 10))
+_WINDOWS_RESERVED_NAMES.update(f"LPT{i}" for i in range(1, 10))
+
+
+def _validate_identity(name: str, value: str) -> None:
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        raise ConfigError(
+            f"{name} must not contain control characters / 标识不得包含控制字符")
+
+
+def _validate_windows_path_components(name: str, absolute: str) -> None:
+    _drive, tail = os.path.splitdrive(absolute)
+    for component in tail.replace("\\", "/").split("/"):
+        if not component:
+            continue
+        normalized = component.rstrip(" .")
+        device_stem = normalized.split(".", 1)[0].upper()
+        if device_stem in _WINDOWS_RESERVED_NAMES:
+            raise ConfigError(
+                f"{name} uses a reserved device name / 输出路径使用了保留设备名")
+        if os.name == "nt" and (
+                normalized != component
+                or any(char in '<>:"|?*' for char in component)):
+            raise ConfigError(
+                f"{name} is not a valid Windows path / 输出路径在 Windows 上无效")
+
+
+def _validate_output_target(name: str, path: str) -> None:
+    if not path or not path.strip():
+        raise ConfigError(
+            f"{name} must not be empty / 输出文件路径不能为空")
+    absolute = os.path.abspath(path)
+    _validate_windows_path_components(name, absolute)
+    if os.path.lexists(absolute) and not os.path.isfile(absolute):
+        raise ConfigError(
+            f"{name} must be a regular file path / 必须指向普通文件")
+
+    target_parent = os.path.dirname(absolute)
+    ancestor = target_parent
+    while not os.path.lexists(ancestor):
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+    if not os.path.isdir(ancestor):
+        raise ConfigError(
+            f"{name} parent path must be a directory / 父路径必须是目录")
+    created = False
+    descriptor = None
+    try:
+        os.makedirs(target_parent, exist_ok=True)
+        if os.path.lexists(absolute):
+            descriptor = os.open(absolute, os.O_WRONLY | os.O_APPEND)
+        else:
+            try:
+                descriptor = os.open(
+                    absolute, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+            except FileExistsError:
+                descriptor = os.open(absolute, os.O_WRONLY | os.O_APPEND)
+        os.close(descriptor)
+        descriptor = None
+        if created:
+            os.unlink(absolute)
+            created = False
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created:
+            try:
+                os.unlink(absolute)
+            except OSError:
+                pass
+        raise ConfigError(
+            f"{name} must be writable / 输出文件或其父目录不可写") from exc
+
+
+def validate_output_paths(cfg: Config, *, record_only: bool,
+                          log_file_active: bool) -> None:
+    if record_only:
+        outputs = [
+            ("recorder.csv", cfg.recorder_csv),
+            ("recorder.signal_csv", cfg.recorder_signal_csv),
+        ]
+    else:
+        outputs = [("logging.trades_csv", cfg.trades_csv)]
+        if cfg.recorder_enabled:
+            outputs.append(("recorder.csv", cfg.recorder_csv))
+    if log_file_active:
+        outputs.append(("logging.file", cfg.log_file))
+    for name, path in outputs:
+        if not path or not path.strip():
+            raise ConfigError(
+                f"{name} must not be empty / 输出文件路径不能为空")
+    for index, (left_name, left_path) in enumerate(outputs):
+        for right_name, right_path in outputs[index + 1:]:
+            if _output_paths_conflict(left_path, right_path):
+                raise ConfigError(
+                    f"{left_name} and {right_name} must use different "
+                    "paths / 各输出文件路径必须不同")
+    for name, path in outputs:
+        _validate_output_target(name, path)
+
+
 def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
-                symbol: str, hedge_venue: str,
-                record_only: bool = False) -> Config:
+                 symbol: str, hedge_venue: str,
+                 record_only: bool = False,
+                 validate_outputs: bool = True) -> Config:
     load_dotenv(env_file)
     try:
         with open(config_file, encoding="utf-8") as fh:
@@ -285,6 +414,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if not symbol:
         raise ConfigError("--symbol is required, e.g. --symbol SNDK / "
                           "必须用 --symbol 指定交易品种")
+    _validate_identity("--symbol", symbol)
     if hedge_venue not in HEDGE_VENUES:
         raise ConfigError(
             f"--hedge must be one of {list(HEDGE_VENUES)}, got "
@@ -311,6 +441,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                           "tail / 必须在 (0, 1] 之间")
 
     entropy_dex = _get(raw, "entropy", "dex", "io")
+    _validate_identity("entropy.dex", entropy_dex)
     if hedge_venue == "tradexyz" and entropy_dex == "xyz":
         raise ConfigError("entropy.dex 'xyz' with hedge_venue 'tradexyz' is "
                           "the same market on both legs / 两条腿是同一个市场")
@@ -389,19 +520,9 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         log_file=_get(raw, "logging", "file", "logs/engine.log"),
     )
 
-    if record_only:
-        outputs = (
-            ("recorder.csv", cfg.recorder_csv),
-            ("recorder.signal_csv", cfg.recorder_signal_csv),
-            ("logging.file", cfg.log_file),
-        )
-        for index, (left_name, left_path) in enumerate(outputs):
-            for right_name, right_path in outputs[index + 1:]:
-                if _same_output_file(left_path, right_path):
-                    raise ConfigError(
-                        f"{left_name} and {right_name} must use different "
-                        "paths in --record-only / 仅采集模式下各输出文件路径"
-                        "必须不同")
+    if validate_outputs:
+        validate_output_paths(
+            cfg, record_only=record_only, log_file_active=cfg.dashboard)
 
     nonnegative = (
         ("entropy.taker_fee_bps", cfg.entropy.fee_bps),
@@ -448,4 +569,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if cfg.log_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
         raise ConfigError("'logging.level' must be one of CRITICAL, ERROR, "
                           "WARNING, INFO, DEBUG")
+    if cfg.hedge.kind == "lighter":
+        api_key_index = cfg.hedge.lighter_creds.api_key_index
+        if api_key_index is not None and not 2 <= api_key_index <= 254:
+            raise ConfigError(
+                "LIGHTER_API_KEY_INDEX must be in [2, 254] / "
+                "Lighter 签名密钥索引必须在 [2, 254] 范围内")
     return cfg
