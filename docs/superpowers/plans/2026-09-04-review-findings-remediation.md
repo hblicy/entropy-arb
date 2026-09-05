@@ -307,13 +307,13 @@ report any remaining operational limitation.**
 - Modify: `tests/test_engine.py`
 - Modify: `entropy_arb/engine.py`
 
-- [ ] **Step 1: Add a regression** that makes a residual hedge raise after a
+- [x] **Step 1: Add a regression** that makes a residual hedge raise after a
 possible write and asserts strict recovery cannot submit a second order.
-- [ ] **Step 2: Run the focused test and verify the extra submission or
+- [x] **Step 2: Run the focused test and verify the extra submission or
 recovery-loop behavior fails the assertion.**
-- [ ] **Step 3: Mark the outcome unreferenced, disable automatic repair,
+- [x] **Step 3: Mark the outcome unreferenced, disable automatic repair,
 preserve the original exception, and stop without snapshot-based resubmission.**
-- [ ] **Step 4: Re-run the focused Engine tests.**
+- [x] **Step 4: Re-run the focused Engine tests.**
 
 ### Task 19: Strengthen Lighter order identity and terminal convergence
 
@@ -324,14 +324,14 @@ preserve the original exception, and stop without snapshot-based resubmission.**
 - Modify: `entropy_arb/venue_hl.py`
 - Modify: `entropy_arb/engine.py`
 
-- [ ] **Step 1: Add regressions** for distinct API-key namespaces, retained
-unknown terminal entries, and authenticated inactive-order lookup on cache miss.
-- [ ] **Step 2: Run the focused tests and verify collisions/eviction/miss
+- [x] **Step 1: Add regressions** for distinct API-key namespaces, retained
+unknown terminal entries, and authenticated exact-order lookup on cache miss.
+- [x] **Step 2: Run the focused tests and verify collisions/eviction/miss
 handling fail.**
-- [ ] **Step 3: Allocate uint48 client indexes from API-key namespace plus a
+- [x] **Step 3: Allocate uint48 client indexes from API-key namespace plus a
 monotonic counter; retain pending terminal entries and make order resolution
 asynchronous with REST fallback.**
-- [ ] **Step 4: Re-run venue-contract and Engine recovery tests.**
+- [x] **Step 4: Re-run venue-contract and Engine recovery tests.**
 
 ### Task 20: Reject fills without execution prices
 
@@ -341,12 +341,12 @@ asynchronous with REST fallback.**
 - Modify: `entropy_arb/models.py`
 - Modify: `entropy_arb/venue_hl.py`
 
-- [ ] **Step 1: Add regressions** for positive fills without an average price
+- [x] **Step 1: Add regressions** for positive fills without an average price
 and malformed Hyperliquid filled responses.
-- [ ] **Step 2: Run the focused tests and verify both are currently accepted.**
-- [ ] **Step 3: Enforce the normalized fill invariant and convert malformed
+- [x] **Step 2: Run the focused tests and verify both are currently accepted.**
+- [x] **Step 3: Enforce the normalized fill invariant and convert malformed
 Hyperliquid payloads to an unreferenced unknown result.**
-- [ ] **Step 4: Re-run model, venue, and Engine execution tests.**
+- [x] **Step 4: Re-run model, venue, and Engine execution tests.**
 
 ### Task 21: Refuse unversioned stale Lighter position mismatches
 
@@ -354,12 +354,12 @@ Hyperliquid payloads to an unreferenced unknown result.**
 - Modify: `tests/test_engine.py`
 - Modify: `entropy_arb/engine.py`
 
-- [ ] **Step 1: Add a regression** where only the Lighter REST leg returns a
+- [x] **Step 1: Add a regression** where only the Lighter REST leg returns a
 post-trade stale position and assert no automatic hedge is sent.
-- [ ] **Step 2: Run it and verify the stale value currently creates a hedge.**
-- [ ] **Step 3: Treat a post-trade Lighter mismatch as incomplete recovery,
+- [x] **Step 2: Run it and verify the stale value currently creates a hedge.**
+- [x] **Step 3: Treat a post-trade Lighter mismatch as incomplete recovery,
 pause entries, retain local state, and retry without submitting an order.**
-- [ ] **Step 4: Re-run reconciliation tests.**
+- [x] **Step 4: Re-run reconciliation tests.**
 
 ### Task 22: Bound non-order resource cleanup
 
@@ -367,12 +367,12 @@ pause entries, retain local state, and retry without submitting an order.**
 - Modify: `tests/test_engine.py`
 - Modify: `entropy_arb/engine.py`
 
-- [ ] **Step 1: Add a regression** with one blocked venue close and one normal
+- [x] **Step 1: Add a regression** with one blocked venue close and one normal
 close, asserting cleanup proceeds to the normal venue and HTTP session.
-- [ ] **Step 2: Run it and verify cleanup currently exceeds the deadline.**
-- [ ] **Step 3: Add a bounded per-resource close helper while leaving order
+- [x] **Step 2: Run it and verify cleanup currently exceeds the deadline.**
+- [x] **Step 3: Add a bounded per-resource close helper while leaving order
 drain unbounded.**
-- [ ] **Step 4: Re-run lifecycle and main shutdown tests.**
+- [x] **Step 4: Re-run lifecycle and main shutdown tests.**
 
 ### Task 23: Align analyzer and operator documentation
 
@@ -383,20 +383,153 @@ drain unbounded.**
 - Modify: `README.zh-CN.md`
 - Modify: `entropy_arb/venue_hl.py`
 
-- [ ] **Step 1: Add regressions** proving invalid metrics cannot hide a second
+- [x] **Step 1: Add regressions** proving invalid metrics cannot hide a second
 market identity.
-- [ ] **Step 2: Run them and verify the mixed file is currently accepted.**
-- [ ] **Step 3: Validate identity before metric filtering and document manual
+- [x] **Step 2: Run them and verify the mixed file is currently accepted.**
+- [x] **Step 3: Validate identity before metric filtering and document manual
 recovery for unreferenced Hyperliquid outcomes.**
-- [ ] **Step 4: Re-run analyzer tests.**
+- [x] **Step 4: Re-run analyzer tests.**
 
 ### Task 24: Final follow-up verification
 
 **Files:**
 - Review all files changed by Tasks 18-23
 
-- [ ] **Step 1: Run all focused regression groups.**
+- [x] **Step 1: Run all focused regression groups.**
+- [x] **Step 2: Run `python -m pytest -q -p no:cacheprovider -W error`.**
+- [x] **Step 3: Run `python -m compileall -q entropy_arb tools main.py tests`.**
+- [x] **Step 4: Run `git diff --check HEAD`, inspect status, and perform a
+read-only final review of the resulting execution and recovery paths.**
+
+### Task 25: Preserve post-submission books across terminal reordering
+
+**Files:**
+- Modify: `tests/test_engine.py`
+- Modify: `entropy_arb/engine.py`
+
+- [x] **Step 1: Add a regression** that publishes a fresh book after order
+submission but before the unresolved order reaches terminal status, provides
+no later book update, and asserts shutdown drain submits the reduce-only hedge.
+- [x] **Step 2: Run the focused test and verify it times out because
+`last_traded_ts` advances to terminal-consumption time.**
+- [x] **Step 3: Record the submission timestamp for executions that may need
+residual repair, use it only as `_hedge()`'s book cutoff, and clear it after the
+net position returns within tolerance.**
+- [x] **Step 4: Re-run both terminal/book ordering regressions repeatedly, then
+run the Engine suite and strict full suite.**
+
+### Task 26: Tighten submission causality and pending-order backoff
+
+**Files:**
+- Modify: `tests/test_engine.py`
+- Modify: `entropy_arb/engine.py`
+
+- [x] **Step 1: Add a controlled regression** that queues a book callback
+before venue submission tasks run and proves the resulting book remains
+ineligible until a truly post-submission update arrives.
+- [x] **Step 2: Capture one cutoff inside each venue submission wrapper rather
+than before `asyncio.gather` schedules the wrappers.**
+- [x] **Step 3: Extend the pending-order backoff regression with continuous
+book notifications and make shutdown ignore generic live progress until the
+pending lookup interval expires.**
+- [x] **Step 4: Repeat all ordering/backoff regressions, run the Engine suite,
+then run strict full verification and diff checks.**
+
+### Task 27: Preserve recovery phase and route progress by source
+
+**Files:**
+- Modify: `tests/test_engine.py`
+- Modify: `entropy_arb/engine.py`
+- Modify: `entropy_arb/venue_hl.py`
+- Modify: `entropy_arb/venue_lighter.py`
+- Modify: `entropy_arb/venues/base.py`
+
+- [x] **Step 1: Add three failing regressions** proving that shutdown retains
+feeds for a known residual waiting on a post-submission book, an account-order
+terminal notification immediately wakes a pending lookup, and a resolved
+pending order remains in post-order recovery without full REST position reads
+or wakeups from another venue's book.
+- [x] **Step 2: Run only those regressions** and confirm they fail respectively
+because shutdown recovery is not armed, terminal and book notifications share
+one event, and recovery phase is inferred from the transient pending list.
+- [x] **Step 3: Implement source-aware progress routing** by tagging adapter
+book/account callbacks with venue identity, waiting separately for order
+terminal progress and eligible residual-book progress, treating the residual
+state as an explicit persistent post-order recovery phase, and arming shutdown only
+while an unattempted residual is blocked on its causal book.
+- [x] **Step 4: Run the regressions, all recovery-ordering/backoff tests,
+the Engine suite, then the strict full suite, compileall, and diff checks.**
+
+### Task 28: Preserve atomic order-confirmation progress
+
+**Files:**
+- Modify: `tests/test_engine.py`
+- Modify: `entropy_arb/engine.py:111-113,1399-1487`
+
+- [ ] **Step 1: Add a failing regression** with three pending references: the
+first resolves to a filled terminal result, the second returns a non-terminal
+`OrderResult`, and the third is not inspected.  Assert that the first fill is
+applied exactly once and the remaining two confirmations retain their complete
+metadata for manual recovery.
+- [ ] **Step 2: Run the focused test** with
+`python -m pytest -q -p no:cacheprovider -W error tests/test_engine.py::test_contract_failure_preserves_atomic_pending_order_progress`
+and verify that the current code leaves the first position unchanged and loses
+all pending references.
+- [ ] **Step 3: Consume validated terminal confirmations one at a time.**
+After each terminal result, update position/cash/volume and remove only that
+confirmation from the active list.  On a contract invariant, move the current
+and unprocessed confirmations into `_manual_order_confirmations`, log their
+venue/reference metadata, disable automatic repair, and stop shutdown polling.
+- [ ] **Step 4: Re-run the focused test and existing pending-order recovery
+tests** and verify the terminal fill is applied once, manual references remain,
+and shutdown drain does not loop.
+
+### Task 29: Reset persistence when market continuity breaks
+
+**Files:**
+- Modify: `tests/test_engine.py`
+- Modify: `entropy_arb/engine.py:885-917`
+
+- [ ] **Step 1: Add failing regressions** that arm a direction, make a book
+stale or a venue unready/down for longer than `premium_persist_sec`, restore a
+fresh executable book, and assert the first restored scan only starts a new
+arm interval.
+- [ ] **Step 2: Run the focused tests** and verify the current code immediately
+returns an execution plan after restoration.
+- [ ] **Step 3: Clear the affected direction's `_armed` timestamp** before
+continuing from stale-book, unready-venue, or outage branches.  Do not reset it
+for execution-lock or rate-budget deferrals.
+- [ ] **Step 4: Re-run persistence and strategy tests** and verify an execution
+plan appears only after a new continuous interval.
+
+### Task 30: Separate recorder wall and monotonic clocks
+
+**Files:**
+- Modify: `tests/test_recorder.py`
+- Modify: `entropy_arb/recorder.py:520-560`
+
+- [ ] **Step 1: Add a failing regression** that starts a signal with
+`observe(now=time.time())`, closes it with `close()`, and asserts all
+`elapsed_ms` values are non-negative.
+- [ ] **Step 2: Run the focused test** and verify the current code writes a
+large negative shutdown duration.
+- [ ] **Step 3: Make `now` wall-clock-only** in `observe()` and `close()` and
+always obtain lifecycle time from `time.monotonic()`.  Update deterministic
+duration tests to patch `entropy_arb.recorder.time.monotonic` rather than using
+the wall-time argument as a second clock.
+- [ ] **Step 4: Re-run all recorder tests** and verify timestamps, sampling,
+shutdown rows, and mixed explicit/default calls remain correct.
+
+### Task 31: Final state-continuity verification
+
+**Files:**
+- Review: `entropy_arb/engine.py`
+- Review: `entropy_arb/recorder.py`
+- Review: `tests/test_engine.py`
+- Review: `tests/test_recorder.py`
+
+- [ ] **Step 1: Run the three focused regression groups.**
 - [ ] **Step 2: Run `python -m pytest -q -p no:cacheprovider -W error`.**
 - [ ] **Step 3: Run `python -m compileall -q entropy_arb tools main.py tests`.**
-- [ ] **Step 4: Run `git diff --check HEAD`, inspect status, and perform a
-read-only final review of the resulting execution and recovery paths.**
+- [ ] **Step 4: Run `git diff --check HEAD`, inspect `git status --short`, and
+review the final recovery/disarming/clock paths for regression risk.**

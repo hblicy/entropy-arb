@@ -138,7 +138,7 @@ and a monotonic millisecond counter inside that namespace.  Separate processes
 on one account must use separate API keys, which is already required for safe
 nonce ownership.  Unknown Lighter orders remain retained until Engine consumes
 their terminal result, and a websocket cache miss is checked against the
-authenticated inactive-orders REST endpoint before recovery waits again.
+authenticated `/api/v1/accountOrders` REST endpoint before recovery waits again.
 
 A positive normalized fill always carries a finite positive average price.
 Malformed Hyperliquid filled responses are unknown, never successful fills with
@@ -155,3 +155,67 @@ Analyzer market identity is validated before sample and metric filtering, so an
 invalid row from a second identified market cannot be used to conceal a mixed
 file.  Operator documentation states that an unreferenced Hyperliquid unknown
 stops for manual recovery rather than promising automatic reconciliation.
+
+## Cross-stream recovery ordering
+
+Lighter book and account-order updates arrive on independent websocket
+streams, so a book update that occurs after submission may arrive before the
+terminal order message.  Residual hedging therefore uses the local order
+submission time as its causal book cutoff.  Normal opportunity scanning keeps
+the stricter terminal-settlement cutoff, preventing a second arbitrage order
+from reusing an in-flight book.  A book older than submission remains
+ineligible; a fresh post-submission book remains eligible after a later
+terminal confirmation without requiring an additional depth update.
+
+The cutoff is captured separately inside each venue submission task,
+immediately before entering `send_taker`, so book callbacks already queued in
+the event loop remain ineligible.  While an order reference is still pending,
+ordinary book updates do not bypass the shutdown recovery polling interval;
+this prevents an active market-data stream from turning terminal lookup into a
+REST request storm.  Once terminal identity has converged, book progress again
+wakes residual hedging immediately.
+
+Recovery notifications preserve their source.  An account-order terminal
+update wakes a pending-order lookup immediately, while a book update only wakes
+residual repair when it belongs to a venue that can currently reduce the net
+position.  The post-order residual phase remains active after the last pending
+reference resolves and until the net position is neutral or automatic repair
+is explicitly disabled.  During that phase recovery trusts the normalized
+terminal fills and does not fall back to an unversioned full-position REST
+snapshot.  Shutdown keeps feeds alive while an otherwise eligible residual is
+waiting for a post-submission book, but does not retry indefinitely after a
+submission attempt, rejection, or manual-recovery decision.
+
+Because referenced-order recovery uses exact terminal results rather than a
+position snapshot, it bypasses the position-reconciliation grace period and
+responds to account-order progress immediately.  Once a qualifying book has
+arrived, a residual that cannot meet the venue minimum exits the shutdown-only
+drain while remaining paused for manual recovery.  If a required account or
+book feed fails, is cancelled, or exits before feed shutdown, automatic repair
+is disabled first; shutdown then crosses the recovery-lock barrier and waits
+for every already-created execution before returning to manual recovery.
+
+## Final state-continuity follow-up
+
+Pending terminal confirmations are consumed atomically in list order.  Each
+validated terminal fill updates local position, cash, volume, and trade time
+before the resolver advances to the next reference.  If a later adapter result
+violates the terminal-result contract, confirmations that are still pending or
+have not yet been inspected move to a manual-recovery collection with their
+venue, order reference, side, applied fill, and residual-hedge identity intact.
+Automatic repair and shutdown polling then stop, while confirmations already
+applied are not retained and therefore cannot be applied twice.
+
+Premium persistence represents continuous observation of a tradable market
+signal.  A stale book, an unready venue, or a declared venue outage breaks that
+continuity and disarms the affected direction.  A later fresh update starts a
+new `premium_persist_sec` interval instead of inheriting time accumulated
+before the interruption.  Execution locks and rate-limit deferrals do not
+invalidate otherwise observable market continuity.
+
+Signal-recorder wall timestamps and lifecycle durations use separate clocks.
+The optional `now` argument controls only wall-clock timestamps and freshness
+checks; lifecycle start, sampling, and elapsed duration always use
+`time.monotonic()`.  Tests that need deterministic durations patch the
+monotonic clock explicitly.  Mixing an explicitly supplied wall time with a
+later default call must never produce a negative elapsed duration.
