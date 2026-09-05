@@ -83,17 +83,31 @@ cp .env.example .env                     # 密钥——交易必填
 python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
-至少运行几个小时（最好一整天——溢价存在日内规律），数据写入
-`logs/minutes.csv`。
+至少运行几个小时（最好一整天——溢价存在日内规律）。分钟聚合写入
+`logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
+`logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
+`sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
+不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。两个
+文件的每行都包含交易标的、Entropy DEX 和对冲交易所。
+
+每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容完全不含
+市场字段的旧文件，但检测到一个文件中混有多个已标识市场时会直接拒绝分析，
+不会给出存在风险的合并阈值。旧 schema 或末行不完整、无效时，原文件会保留到
+下一个未占用的 `.old`、`.old.1` 等归档，再写入干净的新文件。`--record-only` 启动时会
+立即打开两个采集文件；创建或写入失败会报错并停止进程。如果分钟行已经交给
+CSV writer 后 `flush()` 才报告结果不确定的 I/O 错误，采集器不会盲目重写同一
+分钟聚合；这能避免重复行，但无法在 flush 失败时保证该行一定落盘。
 
 **第二步：分析数据、设定阈值：**
 
 ```bash
-python3 tools/analyze.py
+python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
-它会输出溢价分布、各档带宽的历史触发频率，以及可直接粘贴进
-`config.yaml` 的 `thresholds:` 配置块。
+它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
+以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块。同一市场、同一分钟的
+重启片段会先合并再做样本数过滤，因此每分钟只计一次；它不会分析
+`logs/signals.csv`，也不会把同一分钟文件中的多个已标识市场混合计算。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -125,16 +139,20 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | 列 | 含义 |
 |---|---|
 | `minute_ts`, `time_utc` | 分钟起点（epoch 秒 / ISO UTC） |
+| `symbol`, `entropy_dex`, `hedge_venue` | 市场身份；一个文件应只包含一个市场 |
 | `entropy_bid/ask`, `hedge_bid/ask` | 该分钟最后一次有效盘口 |
 | `premium_open/high/low/close/mean/std_bps` | Entropy 相对对冲腿的中间价溢价 |
 | `sell_edge_mean/max_bps` | 卖出 Entropy 方向的可成交溢价（Entropy 买一 / 对冲腿卖一 − 1） |
 | `buy_edge_mean/max_bps` | 买入 Entropy 方向的可成交溢价（对冲腿买一 / Entropy 卖一 − 1） |
 | `samples` | 该分钟约 60 秒中两边盘口同时有效的秒数 |
 
-采集的 edge 为费前口径；分析工具在统计触发频率前会先扣除 `--fees-bps`
-（请传入**两边吃单费之和**——零费交易所默认 0.0，对冲腿为 `tradexyz` 时
-约为 1.0），因此其表格与建议值可直接填入配置。`--hours 24`
-可只分析最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
+采集的 edge 为费前口径。请分别用 `--entropy-fee-bps` 和
+`--hedge-fee-bps` 传入两边吃单费；分析工具会按实盘相同的买卖价格比公式
+扣费后再统计触发频率。例如 Entropy + Lighter 使用 `0.9` 和 `0.0`，
+Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
+`--fees-bps`，但它只是近似计算；两个精确费率参数必须同时提供。
+费率可能因账户或交易所调整，上线前应核对实际费率。`--hours 24` 可只分析
+最近数据；溢价中枢会漂移，请定期重新分析并更新 `config.yaml`。
 
 ## 配置说明
 
@@ -148,7 +166,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `thresholds.midline_bps` | 溢价中枢（必须实测！） | — |
 | `thresholds.upper_bps` / `lower_bps` | 入场带宽（> 0） | — |
 | `entropy.dex` | Entropy 在 Hyperliquid 上的 dex 名 | `io` |
-| `*.taker_fee_bps` | 各所吃单费 | 0.0（tradexyz 对冲腿：1.0） |
+| `*.taker_fee_bps` | 各所吃单费 | Entropy 0.9；Lighter 0.0；tradexyz 对冲腿 1.0 |
 | `*.max_position_usd` | 各所持仓上限 | 1000 |
 | `*.max_orders_per_min` | 各所每分钟下单预算（滑动 60 秒） | 120；Lighter 对冲腿 30 |
 | `sizing.take_fraction` | 吃掉可套利深度的比例 | 0.5 |
@@ -156,7 +174,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
 | `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
 | `execution.*` | 滑点保护、超时、对账周期等 | 见配置文件 |
-| `recorder.*` | 分钟数据采集器 | 开启，`logs/minutes.csv` |
+| `recorder.*` | 分钟数据；只读模式信号生命周期路径 | 开启，`logs/minutes.csv`；`logs/signals.csv` |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
 
 ## 密钥配置（`.env`，仅实盘需要）
@@ -170,14 +188,19 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 - **Lighter** —— `LIGHTER_ACCOUNT_INDEX`、`LIGHTER_API_KEY_INDEX`、
   `LIGHTER_API_PRIVATE_KEY`，必须注册在与启动参数 `--hedge` **相同的部署**上
   （主网与 Robinhood 链是两套独立的账户和密钥——参见
-  [lighter-python](https://github.com/elliottech/lighter-python)）。
+  [lighter-python](https://github.com/elliottech/lighter-python)）。同一账户上同时运行的
+  每个进程必须使用独立的 API key index/私钥；共用 key 也会共用 nonce 序列，
+  不受支持。
 
 ## 执行机制
 
 - 两条腿**同时发出吃单**：Lighter 用带均价保护的市价单，在鉴权 websocket
   上异步确认成交；Hyperliquid HIP-3 用 IOC 限价单同步结算。HIP-3 当前不兼容
-  `cloid`，因此请求不会携带它；超时或 5xx 会保持为明确的“结果未知”并触发
-  仓位对账，绝不会盲目重发订单。
+  `cloid`，因此请求不会携带它；超时或 5xx 会保持为明确的“结果未知”。由于没有
+  订单引用，引擎会停机并要求人工核验仓位/恢复，不会自动提交修复单，也绝不会
+  盲目重发原订单。Lighter 的提交与成交确认分别拥有一个完整的
+  `settle_timeout_sec` 窗口；提交超时也按“结果未知”处理，因为订单可能已经到达
+  交易所。
 - **持续性闸门**（`premium_persist_sec`）：信号先"武装"，持续存在才触发，
   过滤单 tick 的假信号。
 - **库存阶梯**：仓位超过上限的 `floor_frac` 后，同方向加仓需要线性递增的
@@ -189,7 +212,9 @@ python3 main.py --symbol SNDK --hedge lighter-rh
   次执行异常则整体停机。
 - **安全关机**：收到停止信号后不再产生新机会，但会等待所有已经提交的双腿
   执行得到结果后才关闭交易所连接。等待过久会写入 critical 日志，不会由程序
-  主动取消在途下单任务。
+  主动取消在途下单任务。初始化失败时也会关闭此前已创建的全部任务和交易所；
+  任一受监督后台任务报错或意外提前退出，都会触发停机，并在清理完成后让进程
+  以非零状态退出。
 - **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
   其余都是真金白银。
 
@@ -207,7 +232,7 @@ entropy_arb/venues/base.py  统一交易所适配器协议
 entropy_arb/venues/registry.py  显式适配器工厂注册表
 entropy_arb/engine.py    双交易所策略主循环
 entropy_arb/dashboard.py Rich 终端仪表盘
-entropy_arb/recorder.py  分钟级盘口数据采集
+entropy_arb/recorder.py  分钟级盘口 + 只读信号生命周期采集
 tools/analyze.py         minutes.csv -> 阈值建议
 tests/                   python3 -m pytest tests/
 ```
@@ -228,8 +253,8 @@ tests/                   python3 -m pytest tests/
   但部分成交后对冲腿的滑点是真实存在的。
 - **交易时段**：股票类永续（如 SNDK）盘后各所预言机行为不同，建议加宽带宽
   或避开盘后。
-- **单腿风险**：一条腿成交后另一条可能失败。机器人会自动对冲并对账，但
-  仍需人工关注。
+- **单腿风险**：一条腿成交后另一条可能失败。通常会自动对冲并对账；但无订单
+  引用的 Hyperliquid 超时/5xx 会故意停机等待人工恢复，因此必须持续监控。
 
 风险自负。本软件直接操作真实资金，本文档不构成任何投资建议。请从最小的
 仓位上限开始。

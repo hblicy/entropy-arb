@@ -29,10 +29,11 @@
 # full round trip nets >= upper + lower bps after fees by construction.
 #
 # midline_bps is a number YOU derive from recorded data. Run the bot
-# (--record-only) to collect logs/minutes.csv, then:  python3 tools/analyze.py
+# (--record-only) to collect logs/minutes.csv, then:
+# python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 #
 # midline_bps 是你根据采集数据设定的值。先运行机器人（--record-only）采集
-# logs/minutes.csv，再运行 python3 tools/analyze.py 获取建议值。
+# logs/minutes.csv，再运行上面的命令获取建议值（Entropy + Lighter）。
 # 两个方向的门槛都已扣除手续费（引擎会在此之上另加手续费），因此一次完整往返
 # 扣费后净赚 >= upper + lower bps。
 thresholds:
@@ -43,12 +44,12 @@ thresholds:
 # ======================== VENUES / 交易所参数 ==============================
 entropy:
   dex: io                    # Entropy's dex name on Hyperliquid / Entropy 的 dex 名
-  taker_fee_bps: 0.0         # taker fee / 吃单手续费
+  taker_fee_bps: 0.9         # 0.009% taker; verify your account / 请按账户实际费率核对
   max_position_usd: 1000     # position cap / 持仓上限（美元）
   max_orders_per_min: 120    # order-send budget, sliding 60s / 每分钟下单预算
 
 hedge:
-  taker_fee_bps: 0.0         # Lighter venues: 0; tradexyz: ~1.0
+  # taker_fee_bps: 0.0       # optional override; Lighter: 0, tradexyz: ~1.0
   max_position_usd: 1000
   max_orders_per_min: 30     # Lighter's ceiling is ~40/min / Lighter 上限约 40/分钟
 
@@ -86,11 +87,16 @@ execution:
 # ================== DATA RECORDER / 数据采集 ===============================
 # Always-on while the bot runs: samples both real order books 1/sec and
 # writes one CSV row per minute. This is the input for tools/analyze.py.
+# Use a different csv path for every symbol/venue combination. Record-only
+# opens both CSV outputs at startup and exits if either cannot be created.
 # 机器人运行期间自动开启：每秒采样两边真实盘口，每分钟写一行 CSV，
 # 供 tools/analyze.py 分析并设定上方 thresholds。
+# 每个交易标的与交易所组合使用不同的 csv 路径。仅采集模式会在启动时打开
+# 两个 CSV；任一文件无法创建都会直接退出。
 recorder:
   enabled: true
   csv: logs/minutes.csv
+  signal_csv: logs/signals.csv
 
 # ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
 # On a terminal the bot shows a live Rich dashboard (books, signal, positions,

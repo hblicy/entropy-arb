@@ -21,10 +21,13 @@ class OrderBook:
         self.asks: Dict[float, float] = {}
         self.ready = False
         self.last_update_ts = 0.0
+        self.last_update_mono = 0.0
         self.alive_ts = 0.0
+        self.alive_mono = 0.0
 
     def touch(self) -> None:
         self.alive_ts = time.time()
+        self.alive_mono = time.monotonic()
 
     def clear(self) -> None:
         self.bids.clear()
@@ -45,6 +48,7 @@ class OrderBook:
                     side[px] = sz
         self.ready = True
         self.last_update_ts = time.time()
+        self.last_update_mono = time.monotonic()
         self.touch()
 
     # ---- Hyperliquid full snapshot ----
@@ -55,6 +59,7 @@ class OrderBook:
                      for l in levels[1] if float(l["sz"]) > 0}
         self.ready = True
         self.last_update_ts = time.time()
+        self.last_update_mono = time.monotonic()
         self.touch()
 
     def sorted_bids(self) -> List[Level]:
@@ -76,7 +81,7 @@ class OrderBook:
 
     def is_fresh(self, max_age_sec: float) -> bool:
         return self.ready and bool(self.bids) and bool(self.asks) and (
-            time.time() - self.alive_ts <= max_age_sec)
+            time.monotonic() - self.alive_mono <= max_age_sec)
 
 
 def floor_step(x: float, step: float) -> float:

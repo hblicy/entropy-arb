@@ -8,7 +8,8 @@ official `hyperliquid-python-sdk` signing helpers + eth_account —
 
 IOC limit orders settle synchronously in the /exchange response. HIP-3 orders
 omit cloid because the exchange currently rejects that combination; unknown
-outcomes (timeout/5xx) are returned unresolved for position reconciliation.
+outcomes (timeout/HTTP 408/5xx) are returned unresolved so the engine stops for
+manual position verification instead of automatically repairing.
 """
 from __future__ import annotations
 
@@ -153,9 +154,12 @@ class HLVenue:
             other.include_core_equity = False
 
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
+        def book_notify() -> None:
+            notify("book", self.key)
+
         return [asyncio.create_task(
             HLBookFeed(self.name, self.ws_url, self.coin, self.book,
-                       notify).run(stop),
+                       book_notify).run(stop),
             name=f"book-{self.key}")]
 
     def ready_to_trade(self) -> bool:
@@ -214,12 +218,12 @@ class HLVenue:
                     self.api_url + "/exchange", json=payload,
                     timeout=aiohttp.ClientTimeout(total=INFO_TIMEOUT)) as r:
                 text = await r.text()
+                if r.status == 408 or r.status >= 500:
+                    return None, None, True
                 if r.status == 429:
                     return None, f"RATE_LIMITED: HTTP 429 {text[:150]}", False
                 if 400 <= r.status < 500:
                     return None, f"HTTP {r.status}: {text[:250]}", False
-                if r.status >= 500:
-                    return None, None, True
                 return json.loads(text), None, False
         except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError):
             return None, None, True
@@ -235,16 +239,25 @@ class HLVenue:
         if body.get("status") == "err":
             return fail(str(body.get("response")))
         if body.get("status") != "ok":
-            return fail(f"unexpected response: {str(body)[:200]}")
+            return OrderResult.unknown(
+                "unexpected-response",
+                f"unexpected response: {str(body)[:200]}")
         try:
             st = body["response"]["data"]["statuses"][0]
         except (KeyError, IndexError, TypeError):
-            return fail(f"malformed response: {str(body)[:200]}")
+            return OrderResult.unknown(
+                "malformed-response",
+                f"malformed response: {str(body)[:200]}")
         if "filled" in st:
             fill = st["filled"]
+            filled_base = float(fill.get("totalSz") or 0.0)
+            if filled_base > 0 and not fill.get("avgPx"):
+                return OrderResult.unknown(
+                    "malformed-response",
+                    "positive fill is missing its average price")
             return OrderResult(
                 status="filled",
-                filled_base=float(fill.get("totalSz") or 0.0),
+                filled_base=filled_base,
                 avg_px=(float(fill["avgPx"])
                         if fill.get("avgPx") else None),
             )
@@ -255,7 +268,13 @@ class HLVenue:
             return fail(msg)
         if "resting" in st:
             return OrderResult.unknown("resting?")
-        return fail(f"unknown status: {str(st)[:150]}")
+        return OrderResult.unknown(
+            "unknown-status", f"unknown status: {str(st)[:150]}")
+
+    async def resolve_order(self, order_ref: str) -> Optional[OrderResult]:
+        # HIP-3 market orders omit a client order id, so ambiguous HTTP
+        # responses cannot be correlated with a later terminal order status.
+        return None
 
     # -------------------------------------------------------------- accounts
 

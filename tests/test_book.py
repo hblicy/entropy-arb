@@ -7,6 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import entropy_arb.book as book_module  # noqa: E402
 from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
 
 
@@ -89,6 +90,21 @@ def test_lighter_diff_maintenance():
                      "asks": [{"price": "100.2", "size": "3"}]},
                     snapshot=True)
     assert b.best_bid() == 98.9 and b.best_ask() == 100.2
+
+
+def test_feed_freshness_uses_monotonic_time_when_wall_clock_rolls_back(
+        monkeypatch):
+    wall_clock = [100.0]
+    monotonic_clock = [10.0]
+    monkeypatch.setattr(book_module.time, "time", lambda: wall_clock[0])
+    monkeypatch.setattr(
+        book_module.time, "monotonic", lambda: monotonic_clock[0])
+
+    book = make_book(bids=[(99.9, 1)], asks=[(100.0, 1)])
+    wall_clock[0] = 5.0
+    monotonic_clock[0] = 16.0
+
+    assert book.is_fresh(5.0) is False
 
 
 if __name__ == "__main__":

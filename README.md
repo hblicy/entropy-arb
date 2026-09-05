@@ -92,16 +92,38 @@ python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
 Let it run for at least a few hours (a day is better — premiums have
-intraday regimes). It writes `logs/minutes.csv`.
+intraday regimes). It writes minute aggregates to `logs/minutes.csv` and,
+in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
+row is written immediately on `start`, once per second as `sample`, and on
+disappearance, stale books, or shutdown as `end`. These rows are observation
+only: they do not gate entries or change live strategy behavior. The signal
+path can be changed with `recorder.signal_csv`. Both files include the symbol,
+Entropy DEX, and hedge venue on every row.
+
+Use a separate `recorder.csv` for each symbol/venue combination. The analyzer
+accepts a purely legacy file without market columns, but rejects a file that
+contains more than one identified market instead of producing unsafe combined
+thresholds. A legacy schema or incomplete/invalid final CSV row causes the file
+to be preserved at the next free `.old`, `.old.1`, ... archive before a clean
+file is written.
+In `--record-only`, both recorder output files are opened at startup; an output
+creation or write failure stops the process with an error. If a minute row has
+already been handed to the CSV writer when `flush()` reports an ambiguous I/O
+failure, that minute aggregate is not blindly written again; this prevents
+duplicates but cannot guarantee delivery after a failed flush.
 
 **2. Analyze and set your thresholds:**
 
 ```bash
-python3 tools/analyze.py
+python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
-It prints the premium distribution, how often each candidate band would have
-fired, and a ready-to-paste `thresholds:` block for `config.yaml`.
+It analyzes `logs/minutes.csv` and prints the premium distribution, how often
+each candidate band would have fired, and a ready-to-paste `thresholds:` block
+for `config.yaml`. Restart fragments carrying the same market and minute are
+combined before sample filtering, so a minute is counted once. It does not
+analyze `logs/signals.csv`, and it will not mix multiple identified markets
+from one minute file.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -136,17 +158,22 @@ Once per second it samples both live books; once per minute it writes a row:
 | column | meaning |
 |---|---|
 | `minute_ts`, `time_utc` | minute start (epoch seconds, ISO UTC) |
+| `symbol`, `entropy_dex`, `hedge_venue` | market identity; one file should contain one market |
 | `entropy_bid/ask`, `hedge_bid/ask` | last fresh top-of-book of the minute |
 | `premium_open/high/low/close/mean/std_bps` | mid-to-mid premium of Entropy over the hedge |
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |
 | `buy_edge_mean/max_bps` | executable premium for BUY entropy (hedge bid / entropy ask − 1) |
 | `samples` | how many of the ~60 seconds both books were fresh |
 
-Recorded edges are pre-fee; the analyzer subtracts `--fees-bps` (pass the
-**sum** of both venues' taker fees — default 0.0 for the zero-fee venues,
-~1.0 with a `tradexyz` hedge) before counting firings, so its table and
-suggestions translate directly into config values. `--hours 24` restricts to
-recent data; premiums drift, so re-run it regularly and update
+Recorded edges are pre-fee. Pass each venue's taker fee separately with
+`--entropy-fee-bps` and `--hedge-fee-bps`; the analyzer then applies the same
+buy/sell ratio formula as live execution before counting firings. For example,
+use `0.9` and `0.0` for Entropy + Lighter, or `0.9` and `1.0` for Entropy +
+`tradexyz`. The two exact fee flags must be supplied together. The legacy
+`--fees-bps` combined value remains accepted as an approximation for existing
+scripts.
+Fees can vary by account or venue; verify them before deployment. `--hours 24`
+restricts to recent data; premiums drift, so re-run it regularly and update
 `config.yaml`.
 
 ## Configuration
@@ -161,7 +188,7 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `thresholds.midline_bps` | premium center (measure it!) | — |
 | `thresholds.upper_bps` / `lower_bps` | entry bands (> 0) | — |
 | `entropy.dex` | Entropy's dex name on Hyperliquid | `io` |
-| `*.taker_fee_bps` | per-venue taker fee | 0.0 (tradexyz hedge: 1.0) |
+| `*.taker_fee_bps` | per-venue taker fee | Entropy 0.9; Lighter 0.0; tradexyz hedge 1.0 |
 | `*.max_position_usd` | per-venue position cap | 1000 |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |
@@ -169,7 +196,7 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
-| `recorder.*` | minute-data recorder | on, `logs/minutes.csv` |
+| `recorder.*` | minute data; record-only signal lifecycle path | on, `logs/minutes.csv`; `logs/signals.csv` |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
 ## Credentials (`.env`, live only)
@@ -184,6 +211,9 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   `LIGHTER_API_PRIVATE_KEY`, registered on the **same deployment** as your
   `--hedge` flag (mainnet and the Robinhood chain are separate accounts and
   keys — see [lighter-python](https://github.com/elliottech/lighter-python)).
+  Every simultaneously running process on one account must use its own API
+  key index/private key pair; sharing one key also shares its nonce stream and
+  is unsupported.
 
 ## How execution works
 
@@ -191,8 +221,12 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   with average-price protection settling on the authenticated account
   websocket; Hyperliquid HIP-3 IOC limits settle synchronously and omit
   `cloid` because HIP-3 currently rejects it. A timeout/5xx stays explicitly
-  unresolved and triggers position reconciliation; the order is never
-  blindly resent.
+  unresolved; because there is no order reference, the engine stops and
+  requires manual position verification/recovery instead of automatically
+  submitting a repair. The order is never blindly resent. Lighter submission
+  and settlement each get a separate
+  `settle_timeout_sec` window; a submission timeout is also treated as
+  unresolved because the order may already have reached the venue.
 - A **persistence gate** (`premium_persist_sec`) arms each direction and only
   fires if the edge survives — one-tick phantoms are filtered.
 - **Inventory ladder**: past `floor_frac` of a venue's cap, adding to the
@@ -203,11 +237,16 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 - **Failure containment**: a rate-limited venue pauses briefly; an
   unreachable venue (e.g. exchange maintenance) pauses trading and is probed
   every `venue_probe_sec` until it recovers; `max_consecutive_errors`
-  execution pathologies halt the engine entirely.
+  execution pathologies halt the engine entirely. An ambiguous order result
+  freezes new entries until strict position reconciliation and any required
+  reduce-only hedge leave the known net position within tolerance.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as
-  critical rather than cancelling the in-flight order tasks.
+  critical rather than cancelling the in-flight order tasks. Initialization
+  failures still close every venue and task already created. Any supervised
+  background task that fails or exits unexpectedly stops the engine and makes
+  the process exit nonzero after cleanup.
 - **Live-only**: there is no simulated-fill mode. `--record-only` is the
   risk-free way to run it; anything else trades real money.
 
@@ -225,7 +264,7 @@ entropy_arb/venues/base.py  common venue adapter protocol
 entropy_arb/venues/registry.py  explicit adapter factory registry
 entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
-entropy_arb/recorder.py  1-minute orderbook bars
+entropy_arb/recorder.py  1-minute bars + record-only signal lifecycles
 tools/analyze.py         minutes.csv -> suggested thresholds
 tests/                   python3 -m pytest tests/
 ```
@@ -249,8 +288,9 @@ foundation for the staged multi-hedge design in
   is real.
 - **Market hours**: for equity perps (e.g. SNDK), off-hours oracle regimes
   differ per venue; consider wider bands or not trading them.
-- **One-leg risk**: a leg can fail after the other filled. The bot hedges
-  and reconciles automatically, but you should still watch it.
+- **One-leg risk**: a leg can fail after the other filled. The bot normally
+  hedges and reconciles automatically. An unreferenced Hyperliquid timeout/5xx
+  deliberately stops for manual recovery, so active monitoring is required.
 
 Use at your own risk. This is trading software operating with real money;
 nothing here is investment advice. Start with tiny position caps.

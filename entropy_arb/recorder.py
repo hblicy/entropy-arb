@@ -30,19 +30,117 @@ import logging
 import math
 import os
 import time
+import uuid
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from .book import OrderBook
+from .book import OrderBook, plan_arb
 
 log = logging.getLogger("recorder")
 
-HEADER = ["minute_ts", "time_utc",
+HEADER = ["minute_ts", "time_utc", "symbol", "entropy_dex", "hedge_venue",
           "entropy_bid", "entropy_ask", "hedge_bid", "hedge_ask",
           "premium_open_bps", "premium_high_bps", "premium_low_bps",
           "premium_close_bps", "premium_mean_bps", "premium_std_bps",
           "sell_edge_mean_bps", "sell_edge_max_bps",
           "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
+
+SIGNAL_HEADER = [
+    "ts_ms", "time_utc", "symbol", "entropy_dex", "hedge_venue",
+    "event_id", "event", "direction",
+    "elapsed_ms", "end_reason", "entropy_bid", "entropy_ask",
+    "hedge_bid", "hedge_ask", "entropy_book_age_ms",
+    "hedge_book_age_ms", "book_update_skew_ms", "top_edge_bps",
+    "net_threshold_bps", "total_fee_bps", "plan_status", "qty",
+    "buy_limit", "sell_limit", "planned_notional_usd",
+    "crossable_notional_usd", "buy_depth_slippage_bps",
+    "sell_depth_slippage_bps", "leg_slippage_limit_bps",
+    "expected_edge_usd",
+]
+
+
+@dataclass
+class _SignalState:
+    event_id: str
+    started_mono: float
+    last_written_mono: float
+
+
+def next_archive_path(path: str) -> str:
+    candidate = path + ".old"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{path}.old.{suffix}"
+        suffix += 1
+    return candidate
+
+
+def csv_header_matches(path: str, expected: list[str]) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.readline().rstrip(b"\r\n")
+        return next(csv.reader(
+            [raw.decode("utf-8")], strict=True)) == expected
+    except (UnicodeDecodeError, csv.Error, StopIteration):
+        return False
+
+
+def _last_csv_row(path: str) -> Optional[list[str]]:
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        end = fh.tell()
+        if end == 0:
+            return []
+        fh.seek(end - 1)
+        if fh.read(1) != b"\n":
+            return None
+        pos = end - 2
+        while pos >= 0:
+            fh.seek(pos)
+            if fh.read(1) == b"\n":
+                pos += 1
+                break
+            pos -= 1
+        start = max(pos, 0)
+        fh.seek(start)
+        raw = fh.read(end - start).rstrip(b"\r\n")
+    try:
+        return next(csv.reader([raw.decode("utf-8")], strict=True))
+    except (UnicodeDecodeError, csv.Error, StopIteration):
+        return None
+
+
+def csv_tail_complete(path: str, expected: list[str]) -> bool:
+    row = _last_csv_row(path)
+    return row == expected or (row is not None and len(row) == len(expected))
+
+
+def _valid_minute_tail(path: str) -> bool:
+    row = _last_csv_row(path)
+    if row == HEADER:
+        return True
+    if row is None or len(row) != len(HEADER):
+        return False
+    try:
+        return math.isfinite(float(row[0])) and int(row[-1]) > 0
+    except ValueError:
+        return False
+
+
+def _valid_signal_tail(path: str) -> bool:
+    row = _last_csv_row(path)
+    if row == SIGNAL_HEADER:
+        return True
+    if row is None or len(row) != len(SIGNAL_HEADER):
+        return False
+    try:
+        timestamp_ok = math.isfinite(float(row[0]))
+    except ValueError:
+        return False
+    return bool(timestamp_ok and row[5]
+                and row[6] in {"start", "sample", "end"})
 
 
 class _MinuteAgg:
@@ -81,13 +179,15 @@ class _MinuteAgg:
         self.b_max = max(self.b_max, buy_edge)
         self.e_bid, self.e_ask, self.h_bid, self.h_ask = e_bid, e_ask, h_bid, h_ask
 
-    def row(self) -> list:
+    def row(self, symbol: str, entropy_dex: str,
+            hedge_venue: str) -> list:
         mean = self.p_sum / self.n
         var = max(self.p_sumsq / self.n - mean * mean, 0.0)
         ts = self.minute * 60
         return [ts,
                 datetime.fromtimestamp(ts, tz=timezone.utc)
                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                symbol, entropy_dex, hedge_venue,
                 f"{self.e_bid:.10g}", f"{self.e_ask:.10g}",
                 f"{self.h_bid:.10g}", f"{self.h_ask:.10g}",
                 f"{self.p_open:.3f}", f"{self.p_high:.3f}",
@@ -100,12 +200,17 @@ class _MinuteAgg:
 
 class MinuteRecorder:
     def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
-                 staleness_sec: float, interval_sec: float = 1.0) -> None:
+                 staleness_sec: float, interval_sec: float = 1.0, *,
+                 symbol: str = "", entropy_dex: str = "",
+                 hedge_venue: str = "") -> None:
         self.path = path
         self.entropy_book = entropy_book
         self.hedge_book = hedge_book
         self.staleness_sec = staleness_sec
         self.interval_sec = interval_sec
+        self.symbol = symbol
+        self.entropy_dex = entropy_dex
+        self.hedge_venue = hedge_venue
         self.rows_written = 0
         self._agg: Optional[_MinuteAgg] = None
         self._fh = None
@@ -117,13 +222,15 @@ class MinuteRecorder:
             os.makedirs(d, exist_ok=True)
         if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
             # never append rows under a different schema's header
-            with open(self.path) as fh0:
-                if fh0.readline().strip() != ",".join(HEADER):
-                    log.warning("%s has an old header — rotated to %s.old",
-                                self.path, self.path)
-                    os.replace(self.path, self.path + ".old")
+            if (not csv_header_matches(self.path, HEADER)
+                    or not _valid_minute_tail(self.path)):
+                old_path = next_archive_path(self.path)
+                log.warning("%s has an incompatible or invalid tail — "
+                            "rotated to %s",
+                            self.path, old_path)
+                os.replace(self.path, old_path)
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
-        self._fh = open(self.path, "a", newline="")
+        self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.writer(self._fh)
         if new:
             self._writer.writerow(HEADER)
@@ -136,10 +243,12 @@ class MinuteRecorder:
             return
         if self._writer is None:
             self._open()
-        self._writer.writerow(self._agg.row())
+        agg = self._agg
+        self._agg = None
+        self._writer.writerow(agg.row(
+            self.symbol, self.entropy_dex, self.hedge_venue))
         self._fh.flush()
         self.rows_written += 1
-        self._agg = None
 
     def sample(self, now: Optional[float] = None) -> None:
         """Take one sample; call ~1/sec. Rolls the minute over as needed."""
@@ -160,23 +269,369 @@ class MinuteRecorder:
 
     def close(self) -> None:
         """Flush the partial minute and close the file (call on shutdown)."""
-        self._flush_agg()
-        if self._fh is not None:
-            self._fh.close()
-            self._fh = self._writer = None
-
-    async def run(self, stop: asyncio.Event) -> None:
+        primary_error = None
         try:
-            while not stop.is_set():
-                try:
-                    self.sample()
-                except Exception:
-                    log.exception("recorder sample failed")
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=self.interval_sec)
-                except asyncio.TimeoutError:
-                    pass
+            self._flush_agg()
+        except Exception as exc:
+            primary_error = exc
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except Exception:
+            if primary_error is None:
+                raise
+            log.exception(
+                "recorder file also failed while closing; preserving the "
+                "flush error")
         finally:
-            self.close()
+            self._fh = self._writer = None
+        if primary_error is not None:
+            raise primary_error
+
+    async def run(self, stop: asyncio.Event,
+                  fail_fast: bool = False) -> None:
+        primary_error = None
+        try:
+            try:
+                if fail_fast and self._writer is None:
+                    self._open()
+                while not stop.is_set():
+                    try:
+                        self.sample()
+                    except Exception:
+                        log.exception("recorder sample failed")
+                        if fail_fast:
+                            raise
+                    try:
+                        await asyncio.wait_for(
+                            stop.wait(), timeout=self.interval_sec)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                primary_error = exc
+                stop.set()
+                log.exception("recorder failed")
+                raise
+        finally:
+            try:
+                self.close()
+            except Exception:
+                if primary_error is None:
+                    stop.set()
+                    log.exception("recorder failed while closing")
+                    raise
+                log.exception(
+                    "recorder also failed while closing; preserving the "
+                    "original error")
             log.info("recorder stopped — %d minute row(s) written to %s",
+                     self.rows_written, self.path)
+
+
+class SignalRecorder:
+    """Record fee-aware signal lifecycles without placing orders."""
+
+    def __init__(self, path: str, entropy, hedge, *, midline_bps: float,
+                 upper_bps: float, lower_bps: float, take_fraction: float,
+                 max_order_notional: float, min_base: float,
+                 min_notional: float, size_step: float,
+                 leg_slippage_bps: float, staleness_sec: float,
+                 symbol: str, entropy_dex: str, hedge_venue: str,
+                 sample_sec: float = 1.0) -> None:
+        self.path = path
+        self.entropy = entropy
+        self.hedge = hedge
+        self.midline_bps = midline_bps
+        self.upper_bps = upper_bps
+        self.lower_bps = lower_bps
+        self.take_fraction = take_fraction
+        self.max_order_notional = max_order_notional
+        self.min_base = min_base
+        self.min_notional = min_notional
+        self.size_step = size_step
+        self.leg_slippage_bps = leg_slippage_bps
+        self.staleness_sec = staleness_sec
+        self.sample_sec = sample_sec
+        self.symbol = symbol
+        self.entropy_dex = entropy_dex
+        self.hedge_venue = hedge_venue
+        self.rows_written = 0
+        self._states = {"sell_entropy": None, "buy_entropy": None}
+        self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
+        self._run_id = uuid.uuid4().hex
+        self._pending_rows = deque()
+        self._fh = None
+        self._writer = None
+        self._closed = False
+        self._serialization_failed = False
+
+    def _open(self) -> None:
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+            if (not csv_header_matches(self.path, SIGNAL_HEADER)
+                    or not _valid_signal_tail(self.path)):
+                old_path = next_archive_path(self.path)
+                log.warning("%s has an incompatible or invalid tail — "
+                            "rotated to %s",
+                            self.path, old_path)
+                os.replace(self.path, old_path)
+        new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
+        self._fh = open(self.path, "a", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._fh, fieldnames=SIGNAL_HEADER)
+        if new:
+            self._writer.writeheader()
+            self._fh.flush()
+        log.info("recording signal lifecycles -> %s", self.path)
+
+    def _books_status(self, now: float) -> Optional[str]:
+        books = (self.entropy.book, self.hedge.book)
+        if any(not book.ready for book in books):
+            return "book_not_ready"
+        if any(book.best_bid() is None or book.best_ask() is None
+               for book in books):
+            return "empty_book"
+        if any(not book.is_fresh(self.staleness_sec) for book in books):
+            return "stale_book"
+        return None
+
+    def _direction(self, direction: str):
+        if direction == "sell_entropy":
+            return (self.hedge, self.entropy,
+                    self.midline_bps + self.upper_bps)
+        return (self.entropy, self.hedge,
+                self.lower_bps - self.midline_bps)
+
+    def _snapshot(self, direction: str, now: float) -> dict:
+        buy, sell, threshold = self._direction(direction)
+        e_book, h_book = self.entropy.book, self.hedge.book
+        mono_now = time.monotonic()
+        e_bid, e_ask = e_book.best_bid(), e_book.best_ask()
+        h_bid, h_ask = h_book.best_bid(), h_book.best_ask()
+        buy_ask, sell_bid = buy.book.best_ask(), sell.book.best_bid()
+        top_edge = ""
+        if buy_ask is not None and sell_bid is not None:
+            top_edge = (sell_bid / buy_ask - 1.0) * 1e4
+        invalid = self._books_status(now)
+        plan = None
+        if invalid is None:
+            plan, plan_status = plan_arb(
+                buy.book, sell.book,
+                threshold_bps=threshold,
+                buy_fee_bps=buy.fee_bps,
+                sell_fee_bps=sell.fee_bps,
+                take_fraction=self.take_fraction,
+                cap_notional=self.max_order_notional,
+                min_base=self.min_base,
+                min_notional=self.min_notional,
+                size_step=self.size_step,
+            )
+        else:
+            plan_status = invalid
+        row = {
+            "entropy_bid": "" if e_bid is None else e_bid,
+            "entropy_ask": "" if e_ask is None else e_ask,
+            "hedge_bid": "" if h_bid is None else h_bid,
+            "hedge_ask": "" if h_ask is None else h_ask,
+            "entropy_book_age_ms": (
+                max((mono_now - e_book.last_update_mono) * 1000.0, 0.0)
+                if e_book.last_update_mono else ""
+            ),
+            "hedge_book_age_ms": (
+                max((mono_now - h_book.last_update_mono) * 1000.0, 0.0)
+                if h_book.last_update_mono else ""
+            ),
+            "book_update_skew_ms": (
+                abs(e_book.last_update_mono - h_book.last_update_mono) * 1000.0
+                if e_book.last_update_mono and h_book.last_update_mono else ""
+            ),
+            "top_edge_bps": top_edge,
+            "net_threshold_bps": threshold,
+            "total_fee_bps": buy.fee_bps + sell.fee_bps,
+            "plan_status": plan_status,
+            "leg_slippage_limit_bps": self.leg_slippage_bps,
+        }
+        if plan is not None:
+            row.update({
+                "qty": plan.qty,
+                "buy_limit": plan.buy_limit,
+                "sell_limit": plan.sell_limit,
+                "planned_notional_usd": plan.buy_notional,
+                "crossable_notional_usd": plan.q_max_notional,
+                "buy_depth_slippage_bps": (
+                    plan.buy_limit / buy_ask - 1.0) * 1e4,
+                "sell_depth_slippage_bps": (
+                    sell_bid / plan.sell_limit - 1.0) * 1e4,
+                "expected_edge_usd": plan.exp_edge_usd,
+            })
+        return row
+
+    def _qualifies(self, direction: str, now: float) -> tuple[bool, str]:
+        invalid = self._books_status(now)
+        if invalid is not None:
+            return False, invalid
+        buy, sell, threshold_bps = self._direction(direction)
+        buy_ask = buy.book.best_ask()
+        sell_bid = sell.book.best_bid()
+        qualifies = sell_bid * (1.0 - sell.fee_bps / 1e4) >= (
+            buy_ask * (1.0 + buy.fee_bps / 1e4)
+            * (1.0 + threshold_bps / 1e4)
+        )
+        return qualifies, "" if qualifies else "edge_below_threshold"
+
+    def _queue_row(self, event: str, direction: str, state: _SignalState,
+                   wall_now: float, mono_now: float,
+                   end_reason: str = "") -> None:
+        row = {name: "" for name in SIGNAL_HEADER}
+        row.update(self._snapshot(direction, wall_now))
+        row.update({
+            "ts_ms": int(wall_now * 1000),
+            "time_utc": datetime.fromtimestamp(wall_now, tz=timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "symbol": self.symbol,
+            "entropy_dex": self.entropy_dex,
+            "hedge_venue": self.hedge_venue,
+            "event_id": state.event_id,
+            "event": event,
+            "direction": direction,
+            "elapsed_ms": int(round(
+                (mono_now - state.started_mono) * 1000)),
+            "end_reason": end_reason,
+        })
+        self._pending_rows.append(row)
+
+    def _flush_pending(self) -> None:
+        if not self._pending_rows:
+            return
+        if self._writer is None:
+            self._open()
+        while self._pending_rows:
+            row = self._pending_rows.popleft()
+            try:
+                self._writer.writerow(row)
+            except BaseException:
+                self._serialization_failed = True
+                raise
+            self._fh.flush()
+            self.rows_written += 1
+
+    def observe(self, now: Optional[float] = None, *,
+                flush: bool = True) -> None:
+        wall_now = time.time() if now is None else now
+        mono_now = time.monotonic()
+        for direction in self._states:
+            active = self._states[direction]
+            qualifies, end_reason = self._qualifies(direction, wall_now)
+            if qualifies and active is None:
+                self._event_seq[direction] += 1
+                active = _SignalState(
+                    event_id=(f"{direction}-{int(wall_now * 1000)}-"
+                              f"{self._run_id}-"
+                              f"{self._event_seq[direction]}"),
+                    started_mono=mono_now,
+                    last_written_mono=mono_now,
+                )
+                self._queue_row(
+                    "start", direction, active, wall_now, mono_now)
+                self._states[direction] = active
+            elif (qualifies and active is not None
+                  and mono_now - active.last_written_mono
+                  >= self.sample_sec):
+                self._queue_row(
+                    "sample", direction, active, wall_now, mono_now)
+                active.last_written_mono = mono_now
+            elif not qualifies and active is not None:
+                self._queue_row(
+                    "end", direction, active, wall_now, mono_now,
+                    end_reason)
+                self._states[direction] = None
+        if flush:
+            self._flush_pending()
+
+    def close(self, now: Optional[float] = None) -> None:
+        if self._closed:
+            return
+        primary_error = None
+        try:
+            if not self._serialization_failed:
+                wall_now = time.time() if now is None else now
+                mono_now = time.monotonic()
+                for direction, active in self._states.items():
+                    if active is not None:
+                        self._queue_row(
+                            "end", direction, active, wall_now, mono_now,
+                            "shutdown")
+                        self._states[direction] = None
+                self._flush_pending()
+        except BaseException as exc:
+            primary_error = exc
+        try:
+            if self._fh is not None:
+                self._fh.close()
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+            else:
+                log.exception(
+                    "signal file also failed while closing; preserving the "
+                    "original error")
+        finally:
+            self._fh = self._writer = None
+            self._closed = True
+        if primary_error is not None:
+            raise primary_error
+
+    def _seconds_until_next_sample(self, now: Optional[float] = None) -> float:
+        mono_now = time.monotonic() if now is None else now
+        active = [state for state in self._states.values()
+                  if state is not None]
+        if not active:
+            return 3600.0
+        due = min(state.last_written_mono + self.sample_sec
+                  for state in active)
+        return max(due - mono_now, 0.001)
+
+    async def run(self, stop: asyncio.Event,
+                  update_evt: asyncio.Event) -> None:
+        primary_error = None
+        try:
+            try:
+                if self._writer is None:
+                    self._open()
+                while not stop.is_set():
+                    update_evt.clear()
+                    self.observe()
+                    if stop.is_set():
+                        break
+                    timeout = self._seconds_until_next_sample()
+                    if update_evt.is_set():
+                        continue
+                    try:
+                        await asyncio.wait_for(
+                            update_evt.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                primary_error = exc
+                log.exception("signal recorder failed")
+                stop.set()
+                update_evt.set()
+                raise
+        finally:
+            try:
+                self.close()
+            except Exception:
+                stop.set()
+                update_evt.set()
+                if primary_error is None:
+                    log.exception("signal recorder failed while closing")
+                    raise
+                log.exception(
+                    "signal recorder also failed while closing; preserving "
+                    "the original error")
+            log.info("signal recorder stopped — %d row(s) written to %s",
                      self.rows_written, self.path)
