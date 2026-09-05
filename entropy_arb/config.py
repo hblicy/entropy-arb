@@ -1,10 +1,12 @@
 """Configuration: strategy from a YAML file, credentials from .env, market
-selection (symbol + hedge venue) from the command line.
+selection (Entropy symbol + optional hedge symbol + hedge venue) from the
+command line.
 
 The split is deliberate: config.yaml IS the strategy (thresholds, sizing,
 risk) and is safe to share/commit as an example; .env holds only secrets;
 which markets to trade is stated explicitly on every start (--symbol,
---hedge). Every YAML key is validated against the schema below, so a typo
+optional --hedge-symbol, --hedge). Every YAML key is validated against the
+schema below, so a typo
 is an error rather than a setting that silently does nothing.
 
 Threshold model (fixed numbers the user derives from recorded minute data):
@@ -397,6 +399,7 @@ def validate_output_paths(cfg: Config, *, record_only: bool,
 
 def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
                  symbol: str, hedge_venue: str,
+                 hedge_symbol: Optional[str] = None,
                  record_only: bool = False,
                  validate_outputs: bool = True) -> Config:
     load_dotenv(env_file)
@@ -415,6 +418,12 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         raise ConfigError("--symbol is required, e.g. --symbol SNDK / "
                           "必须用 --symbol 指定交易品种")
     _validate_identity("--symbol", symbol)
+    effective_hedge_symbol = (
+        symbol if hedge_symbol is None else hedge_symbol.strip())
+    if not effective_hedge_symbol:
+        raise ConfigError("--hedge-symbol must not be empty / "
+                          "--hedge-symbol 不得为空")
+    _validate_identity("--hedge-symbol", effective_hedge_symbol)
     if hedge_venue not in HEDGE_VENUES:
         raise ConfigError(
             f"--hedge must be one of {list(HEDGE_VENUES)}, got "
@@ -461,7 +470,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if hedge_venue == "tradexyz":
         hedge = VenueConf(
             key="hedge", kind="hl", label="XYZ",
-            symbol=symbol,
+            symbol=effective_hedge_symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 1.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 120)),
@@ -474,7 +483,7 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         hedge = VenueConf(
             key="hedge", kind="lighter",
             label="LIGHTER" if hedge_venue == "lighter" else "RH",
-            symbol=symbol,
+            symbol=effective_hedge_symbol,
             fee_bps=float(_get(raw, "hedge", "taker_fee_bps", 0.0)),
             cap_usd=float(_get(raw, "hedge", "max_position_usd", 1000.0)),
             orders_per_min=int(_get(raw, "hedge", "max_orders_per_min", 30)),

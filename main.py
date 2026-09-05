@@ -4,14 +4,19 @@
     # collect minute data only — no strategy, no credentials needed
     python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 
+    # venue-native symbols may differ
+    python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
+        --hedge-symbol ANTHROPIC
+
     # LIVE trading: real orders, real money (needs .env credentials)
     python3 main.py --symbol SNDK --hedge lighter-rh
 
 --symbol and --hedge are required on every start: the markets you trade are
-an explicit decision, not a config default. Add --cn for a Chinese-language
-dashboard. There is no paper mode. Collect data with --record-only, set
-your thresholds with tools/analyze.py, then go live with small position
-caps.
+an explicit decision, not a config default. If the hedge venue uses another
+name for the same asset, pass it with --hedge-symbol. Add --cn for a
+Chinese-language dashboard. There is no paper mode. Collect data with
+--record-only, set your thresholds with tools/analyze.py, then go live with
+small position caps.
 
 On a terminal the bot shows a live Rich dashboard (books, signal, positions,
 PnL, last executions) and writes log lines to logging.file; use
@@ -184,12 +189,16 @@ def main() -> None:
                     "Lighter Robinhood / trade.xyz. Without --record-only, "
                     "real orders are sent.")
     p.add_argument("--symbol", required=True,
-                   help="symbol traded on both venues, e.g. SNDK / "
-                        "两个交易所共同交易的品种")
+                   help="Entropy symbol, e.g. SNDK or ANTH / "
+                        "Entropy 交易品种")
     p.add_argument("--hedge", required=True, choices=HEDGE_VENUES,
                    metavar="VENUE",
                    help=f"hedge venue, one of: {', '.join(HEDGE_VENUES)} / "
                         f"对冲腿，三选一")
+    p.add_argument(
+        "--hedge-symbol",
+        help="hedge venue symbol when it differs from --symbol; defaults "
+             "to --symbol / 对冲交易所品种；默认与 --symbol 相同")
     p.add_argument("--config", default="config.yaml",
                    help="strategy config (default: config.yaml)")
     p.add_argument("--env-file", default=".env",
@@ -209,6 +218,7 @@ def main() -> None:
     try:
         cfg = load_config(args.config, args.env_file,
                           symbol=args.symbol, hedge_venue=args.hedge,
+                          hedge_symbol=args.hedge_symbol,
                           record_only=args.record_only,
                           validate_outputs=False)
     except ConfigError as e:

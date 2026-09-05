@@ -3197,14 +3197,19 @@ def test_signal_recorder_starts_only_in_record_only_mode():
             record_dir, "minutes.csv")
         record_engine.cfg.recorder_signal_csv = os.path.join(
             record_dir, "signals.csv")
+        record_engine.cfg.entropy.symbol = "ANTH"
+        record_engine.cfg.hedge.symbol = "ANTHROPIC"
         record_tasks = []
 
         record_engine._start_recorders(record_tasks)
 
         assert record_engine.signal_recorder is not None
-        assert record_engine.recorder.symbol == "SNDK"
+        assert record_engine.recorder.entropy_symbol == "ANTH"
+        assert record_engine.recorder.hedge_symbol == "ANTHROPIC"
         assert record_engine.recorder.entropy_dex == "io"
         assert record_engine.recorder.hedge_venue == "lighter-rh"
+        assert record_engine.signal_recorder.entropy_symbol == "ANTH"
+        assert record_engine.signal_recorder.hedge_symbol == "ANTHROPIC"
         assert any(task.get_name() == "signal-recorder"
                    for task in record_tasks)
         record_engine.request_stop()

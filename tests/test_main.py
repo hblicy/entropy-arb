@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -308,3 +310,39 @@ def test_application_runner_abandons_non_cooperative_dashboard(monkeypatch):
                 eng, NonCooperativeDashboard(eng)))
 
     assert time.monotonic() - started < 0.2
+
+
+def test_cli_forwards_distinct_hedge_symbol(monkeypatch):
+    captured = {}
+
+    def fake_load_config(config_file, env_file, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            dashboard=False,
+            log_file="logs/engine.log",
+            log_level="INFO",
+        )
+
+    def discard_application(awaitable):
+        awaitable.close()
+
+    monkeypatch.setattr(main_module, "load_config", fake_load_config)
+    monkeypatch.setattr(
+        main_module, "validate_output_paths", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main_module, "setup_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_module, "_run_application", discard_application)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "main.py", "--record-only", "--symbol", "ANTH",
+            "--hedge", "lighter-rh", "--hedge-symbol", "ANTHROPIC",
+            "--no-dashboard",
+        ],
+    )
+
+    main_module.main()
+
+    assert captured["symbol"] == "ANTH"
+    assert captured["hedge_symbol"] == "ANTHROPIC"
+    assert captured["hedge_venue"] == "lighter-rh"

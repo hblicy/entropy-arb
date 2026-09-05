@@ -39,8 +39,10 @@ thresholds:
 
 
 def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh",
-         record_only=False):
+         record_only=False, hedge_symbol=None):
     kwargs = {"symbol": symbol, "hedge_venue": hedge}
+    if hedge_symbol is not None:
+        kwargs["hedge_symbol"] = hedge_symbol
     if record_only:
         kwargs["record_only"] = True
     return load_config(write_tmp(yaml_text), NO_ENV, **kwargs)
@@ -59,6 +61,37 @@ def test_example_config_loads():
     assert cfg.recorder_enabled and cfg.recorder_csv
     assert cfg.recorder_signal_csv == "logs/signals.csv"
     assert cfg.dashboard and cfg.log_file
+
+
+def test_hedge_symbol_can_differ_from_entropy_symbol():
+    cfg = load_config(
+        EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh")
+
+    assert cfg.symbol == "ANTH"
+    assert cfg.entropy.symbol == "ANTH"
+    assert cfg.hedge.symbol == "ANTHROPIC"
+
+
+def test_hedge_symbol_is_stripped():
+    cfg = load(MINIMAL, symbol="ANTH", hedge_symbol="  ANTHROPIC  ")
+
+    assert cfg.hedge.symbol == "ANTHROPIC"
+
+
+@pytest.mark.parametrize("hedge_symbol", ["", "   "])
+def test_explicit_blank_hedge_symbol_is_rejected(hedge_symbol):
+    with pytest.raises(ConfigError, match="--hedge-symbol"):
+        load_config(
+            EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol=hedge_symbol,
+            hedge_venue="lighter-rh")
+
+
+def test_hedge_symbol_rejects_embedded_control_characters():
+    with pytest.raises(ConfigError, match="control characters"):
+        load(
+            MINIMAL, symbol="ANTH",
+            hedge_symbol="ANTHROPIC\nforged-market")
 
 
 def test_example_config_uses_venue_specific_hedge_fee_defaults():

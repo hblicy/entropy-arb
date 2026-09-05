@@ -70,9 +70,9 @@ cp .env.example .env                     # 密钥——交易必填
 ```
 
 交易哪个市场**不在**配置文件中——每次启动时用命令行参数显式指定：
-`--symbol`（两个交易所共同交易的品种）和 `--hedge`（三选一：
-`lighter`、`lighter-rh`、`tradexyz`；Entropy 永远是
-另一条腿）。
+`--symbol` 选择 Entropy 品种，`--hedge` 选择对冲交易所（三选一：
+`lighter`、`lighter-rh`、`tradexyz`）。如果同一标的在对冲交易所使用
+不同名称，再传 `--hedge-symbol`；不传时默认与 `--symbol` 相同。
 
 本机器人**没有模拟盘**——要么采集数据（`--record-only`），要么实盘交易。
 请用采集的数据和最小的仓位上限来验证策略，而不是模拟成交。
@@ -83,17 +83,25 @@ cp .env.example .env                     # 密钥——交易必填
 python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 ```
 
+例如，Entropy 的 `ANTH` 与 Robinhood Lighter 的 `ANTHROPIC` 使用：
+
+```bash
+python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
+  --hedge-symbol ANTHROPIC --no-dashboard
+```
+
 至少运行几个小时（最好一整天——溢价存在日内规律）。分钟聚合写入
 `logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
 `logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
 `sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
 不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。两个
-文件的每行都包含交易标的、Entropy DEX 和对冲交易所。
+文件的每行都包含两条腿各自的原生 symbol、Entropy DEX 和对冲交易所。
 
-每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容完全不含
-市场字段的旧文件，但检测到一个文件中混有多个已标识市场时会直接拒绝分析，
-不会给出存在风险的合并阈值。旧 schema 或末行不完整、无效时，原文件会保留到
-下一个未占用的 `.old`、`.old.1` 等归档，再写入干净的新文件。`--record-only` 启动时会
+每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容使用旧
+`symbol` 身份字段或完全不含市场字段的历史文件，但检测到一个文件中混有多个
+已标识市场时会直接拒绝分析，不会给出存在风险的合并阈值。旧 schema 或末行
+不完整、无效时，原文件会保留到下一个未占用的 `.old`、`.old.1` 等归档，再写入
+干净的新文件。`--record-only` 启动时会
 立即打开两个采集文件；创建或写入失败会报错并停止进程。如果分钟行已经交给
 CSV writer 后 `flush()` 才报告结果不确定的 I/O 错误，采集器不会盲目重写同一
 分钟聚合；这能避免重复行，但无法在 flush 失败时保证该行一定落盘。
@@ -139,7 +147,7 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | 列 | 含义 |
 |---|---|
 | `minute_ts`, `time_utc` | 分钟起点（epoch 秒 / ISO UTC） |
-| `symbol`, `entropy_dex`, `hedge_venue` | 市场身份；一个文件应只包含一个市场 |
+| `entropy_symbol`, `entropy_dex`, `hedge_symbol`, `hedge_venue` | 两条腿的原生市场身份；一个文件应只包含一个交易对 |
 | `entropy_bid/ask`, `hedge_bid/ask` | 该分钟最后一次有效盘口 |
 | `premium_open/high/low/close/mean/std_bps` | Entropy 相对对冲腿的中间价溢价 |
 | `sell_edge_mean/max_bps` | 卖出 Entropy 方向的可成交溢价（Entropy 买一 / 对冲腿卖一 − 1） |
@@ -158,7 +166,7 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
 
 策略在 `config.yaml`（严格校验——未知键名、非有限数字及不安全的金额、频率、
 比例和超时边界都会在启动时直接报错），密钥在 `.env`。
-交易市场由命令行指定（`--symbol`、`--hedge`）。完整的双语注释参考：
+交易市场由命令行指定（`--symbol`、可选的 `--hedge-symbol`、`--hedge`）。完整的双语注释参考：
 [config.example.yaml](config.example.yaml)。核心项：
 
 | 键 | 含义 | 默认值 |

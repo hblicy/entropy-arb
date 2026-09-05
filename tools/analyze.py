@@ -24,6 +24,9 @@ import sys
 import time
 
 CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
+NEW_IDENTITY = (
+    "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue")
+LEGACY_IDENTITY = ("symbol", "entropy_dex", "hedge_venue")
 
 
 def pctl(sorted_vals: list, q: float) -> float:
@@ -65,19 +68,24 @@ def fee_adjusted_rooms(rows: list, *, midline: float,
     return sell_room, buy_room
 
 
-def _validate_market_set(markets: set) -> tuple[str, str, str]:
+def _validate_market_set(markets: set) -> tuple[str, str, str, str]:
     if len(markets) > 1:
         raise ValueError(
             "multiple markets found in one minute CSV; use a separate file "
             "for each symbol and hedge venue")
-    return next(iter(markets), ("", "", ""))
+    return next(iter(markets), ("", "", "", ""))
 
 
-def validate_single_market(rows: list) -> tuple[str, str, str]:
-    return _validate_market_set({
-        (row["symbol"], row["entropy_dex"], row["hedge_venue"])
-        for row in rows
-    })
+def _row_identity(row: dict) -> tuple[str, str, str, str]:
+    if "entropy_symbol" in row or "hedge_symbol" in row:
+        return tuple(row.get(field, "") for field in NEW_IDENTITY)
+    symbol = row.get("symbol", "")
+    return (symbol, row.get("entropy_dex", ""), symbol,
+            row.get("hedge_venue", ""))
+
+
+def validate_single_market(rows: list) -> tuple[str, str, str, str]:
+    return _validate_market_set({_row_identity(row) for row in rows})
 
 
 def load_rows(path: str, hours: float, min_samples: int) -> list:
@@ -86,19 +94,42 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
     markets = set()
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
-        identity_fields = {"symbol", "entropy_dex", "hedge_venue"}
-        present_identity = identity_fields.intersection(
-            reader.fieldnames or [])
-        if present_identity and present_identity != identity_fields:
+        fieldnames = set(reader.fieldnames or [])
+        has_new_symbol = bool(
+            fieldnames.intersection({"entropy_symbol", "hedge_symbol"}))
+        has_legacy_symbol = "symbol" in fieldnames
+        if has_new_symbol and has_legacy_symbol:
             raise ValueError(
                 "market identity columns must be all present or all absent")
-        has_identity = present_identity == identity_fields
+        if has_new_symbol:
+            if not set(NEW_IDENTITY).issubset(fieldnames):
+                raise ValueError(
+                    "market identity columns must be all present or all absent")
+            identity_fields = NEW_IDENTITY
+        elif has_legacy_symbol:
+            if not set(LEGACY_IDENTITY).issubset(fieldnames):
+                raise ValueError(
+                    "market identity columns must be all present or all absent")
+            identity_fields = LEGACY_IDENTITY
+        else:
+            shared_fields = {"entropy_dex", "hedge_venue"}
+            if fieldnames.intersection(shared_fields):
+                raise ValueError(
+                    "market identity columns must be all present or all absent")
+            identity_fields = ()
         for r in reader:
-            identity = tuple(
-                (r.get(field) or "").strip()
-                for field in ("symbol", "entropy_dex", "hedge_venue")
-            ) if has_identity else ("", "", "")
-            if has_identity and not all(identity):
+            if identity_fields == NEW_IDENTITY:
+                identity = tuple(
+                    (r.get(field) or "").strip()
+                    for field in NEW_IDENTITY)
+            elif identity_fields == LEGACY_IDENTITY:
+                legacy = tuple(
+                    (r.get(field) or "").strip()
+                    for field in LEGACY_IDENTITY)
+                identity = (legacy[0], legacy[1], legacy[0], legacy[2])
+            else:
+                identity = ("", "", "", "")
+            if identity_fields and not all(identity):
                 raise ValueError(
                     "market identity values must not be empty")
             markets.add(identity)
@@ -108,9 +139,10 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                 samples = int(r["samples"])
                 row = {
                     "ts": ts,
-                    "symbol": identity[0],
+                    "entropy_symbol": identity[0],
                     "entropy_dex": identity[1],
-                    "hedge_venue": identity[2],
+                    "hedge_symbol": identity[2],
+                    "hedge_venue": identity[3],
                     "prem": float(r["premium_close_bps"]),
                     "prem_mean": float(r["premium_mean_bps"]),
                     "sell_max": float(r["sell_edge_max_bps"]),
@@ -127,8 +159,8 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                 continue
             if ts < cutoff:
                 continue
-            key = (row["symbol"], row["entropy_dex"],
-                   row["hedge_venue"], ts)
+            key = (row["entropy_symbol"], row["entropy_dex"],
+                   row["hedge_symbol"], row["hedge_venue"], ts)
             previous = merged.get(key)
             if previous is None:
                 merged[key] = row
