@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .book import OrderBook, plan_arb
+from .csv_rotation import rotate_csv_gzip
 from .reference import ReferenceState, calculate_reference_metrics
 
 log = logging.getLogger("recorder")
@@ -482,7 +483,8 @@ class SignalRecorder:
                  leg_slippage_bps: float, staleness_sec: float,
                  entropy_symbol: str, entropy_dex: str,
                  hedge_symbol: str, hedge_venue: str,
-                 sample_sec: float = 1.0) -> None:
+                 sample_sec: float = 1.0,
+                 signal_rotate_daily: bool = True) -> None:
         self.path = path
         self.entropy = entropy
         self.hedge = hedge
@@ -501,6 +503,7 @@ class SignalRecorder:
         self.entropy_dex = entropy_dex
         self.hedge_symbol = hedge_symbol
         self.hedge_venue = hedge_venue
+        self.signal_rotate_daily = signal_rotate_daily
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
         self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
@@ -508,6 +511,7 @@ class SignalRecorder:
         self._pending_rows = deque()
         self._fh = None
         self._writer = None
+        self._current_utc_day = None
         self._closed = False
         self._serialization_failed = False
 
@@ -523,6 +527,15 @@ class SignalRecorder:
                             "rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
+        if (self._current_utc_day is None and os.path.exists(self.path)
+                and os.path.getsize(self.path) > 0):
+            last_row = _last_csv_row(self.path)
+            if last_row and last_row != SIGNAL_HEADER:
+                ts_index = SIGNAL_HEADER.index("ts_ms")
+                self._current_utc_day = datetime.fromtimestamp(
+                    float(last_row[ts_index]) / 1000.0,
+                    tz=timezone.utc,
+                ).date()
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
         self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._fh, fieldnames=SIGNAL_HEADER)
@@ -530,6 +543,28 @@ class SignalRecorder:
             self._writer.writeheader()
             self._fh.flush()
         log.info("recording signal lifecycles -> %s", self.path)
+
+    def _rotate_before(self, row: dict) -> None:
+        row_day = datetime.fromtimestamp(
+            float(row["ts_ms"]) / 1000.0, tz=timezone.utc).date()
+        if self._current_utc_day is None:
+            self._current_utc_day = row_day
+            return
+        if (not self.signal_rotate_daily
+                or row_day <= self._current_utc_day):
+            return
+        self._fh.flush()
+        self._fh.close()
+        self._fh = self._writer = None
+        result = rotate_csv_gzip(self.path, self._current_utc_day)
+        if not result.compressed:
+            log.warning(
+                "signal archive compression failed; raw CSV preserved at %s",
+                result.archive_path,
+            )
+        self._current_utc_day = None
+        self._open()
+        self._current_utc_day = row_day
 
     def _books_status(self, now: float) -> Optional[str]:
         books = (self.entropy.book, self.hedge.book)
@@ -692,6 +727,7 @@ class SignalRecorder:
         while self._pending_rows:
             row = self._pending_rows.popleft()
             try:
+                self._rotate_before(row)
                 self._writer.writerow(row)
             except BaseException:
                 self._serialization_failed = True

@@ -4,11 +4,13 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_recorder.py)
 """
 import csv
 import asyncio
+import gzip
 import io
 import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -76,7 +78,7 @@ def set_signal_levels(venue, *, bids, asks, ts):
 
 def make_signal_recorder(path, sample_sec=1.0, *, entropy_symbol="SNDK",
                          entropy_dex="io", hedge_symbol="SNDK",
-                         hedge_venue="lighter-rh"):
+                         hedge_venue="lighter-rh", rotate_daily=True):
     entropy = SignalVenue("entropy")
     hedge = SignalVenue("hedge")
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
@@ -91,6 +93,7 @@ def make_signal_recorder(path, sample_sec=1.0, *, entropy_symbol="SNDK",
         entropy_symbol=entropy_symbol, entropy_dex=entropy_dex,
         hedge_symbol=hedge_symbol,
         hedge_venue=hedge_venue,
+        signal_rotate_daily=rotate_daily,
     )
     return rec, entropy, hedge
 
@@ -856,6 +859,120 @@ def test_signal_append_keeps_single_header():
         lines = fh.read().splitlines()
     assert lines.count(",".join(SIGNAL_HEADER)) == 1
     assert len(lines) == 5
+
+
+def test_signal_recorder_rotates_on_utc_day_boundary(monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    archive = tmp_path / "signals-20260910.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        archived_rows = list(csv.DictReader(fh))
+    current_rows = read_signal_rows(path)
+    assert [row["event"] for row in archived_rows] == ["start"]
+    assert [row["event"] for row in current_rows] == ["sample", "end"]
+
+
+def test_signal_recorder_recovers_existing_utc_day_before_rotating(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    first, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    first.observe(now=day_one)
+    first.close(now=day_one)
+
+    monotonic_clock[0] = 200.0
+    second, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    second.observe(now=day_one + 2)
+    second.close(now=day_one + 2)
+
+    archive = tmp_path / "signals-20260910.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        assert [row["event"] for row in csv.DictReader(fh)] == [
+            "start", "end"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "start", "end"]
+
+
+def test_signal_rotation_gzip_failure_keeps_raw_and_continues(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    original_gzip_open = gzip.open
+
+    def fail_writes(path, mode="rb", *args, **kwargs):
+        if "w" in mode:
+            raise OSError("disk full")
+        return original_gzip_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(gzip, "open", fail_writes)
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    raw = tmp_path / "signals-20260910.csv"
+    assert raw.exists()
+    assert [row["event"] for row in read_signal_rows(raw)] == ["start"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "sample", "end"]
+
+
+def test_signal_daily_rotation_can_be_disabled(monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(
+        str(path), rotate_daily=False)
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "start", "sample", "end"]
+    assert not list(tmp_path.glob("*.gz"))
 
 
 def test_signal_rotates_old_header_before_writing():

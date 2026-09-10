@@ -3310,6 +3310,7 @@ def test_signal_recorder_starts_only_in_record_only_mode():
             record_dir, "signals.csv")
         record_engine.cfg.entropy.symbol = "ANTH"
         record_engine.cfg.hedge.symbol = "ANTHROPIC"
+        record_engine.cfg.recorder_signal_rotate_daily = False
         record_tasks = []
 
         record_engine._start_recorders(record_tasks)
@@ -3325,6 +3326,7 @@ def test_signal_recorder_starts_only_in_record_only_mode():
                 is record_engine.hedge.reference)
         assert record_engine.signal_recorder.entropy_symbol == "ANTH"
         assert record_engine.signal_recorder.hedge_symbol == "ANTHROPIC"
+        assert record_engine.signal_recorder.signal_rotate_daily is False
         assert any(task.get_name() == "signal-recorder"
                    for task in record_tasks)
         record_engine.request_stop()

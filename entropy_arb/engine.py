@@ -370,6 +370,7 @@ class Engine:
                 entropy_dex=cfg.entropy.hl_dex,
                 hedge_symbol=cfg.hedge.symbol,
                 hedge_venue=cfg.hedge_venue,
+                signal_rotate_daily=cfg.recorder_signal_rotate_daily,
             )
             self._signal_task = asyncio.create_task(
                 self.signal_recorder.run(self.stop, self._update_evt),
