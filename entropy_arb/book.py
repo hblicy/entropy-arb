@@ -132,6 +132,25 @@ def walk_depth(levels: List[Level], qty: float) -> Tuple[float, float]:
     return marginal_px, notional
 
 
+def quantity_within_notional(levels: List[Level], cap_notional: float) -> float:
+    """Return the maximum base quantity whose walked notional fits the cap."""
+    remaining = cap_notional
+    qty = 0.0
+    for px, size in levels:
+        if remaining <= 0.0:
+            break
+        take = min(size, remaining / px)
+        qty += take
+        remaining -= take * px
+        if take < size:
+            break
+    return qty
+
+
+def _notional_within_cap(value: float, cap: float) -> bool:
+    return value <= cap + max(1e-9, abs(cap) * 1e-12)
+
+
 @dataclass
 class ArbPlan:
     qty: float
@@ -179,12 +198,26 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     q_max, q_max_notional = crossable_base(asks, bids, threshold, buy_fee, sell_fee)
     if q_max <= 0:
         return None, "no_edge"
-    target = min(q_max * take_fraction, cap_notional / asks[0][0])
+    target = min(
+        q_max * take_fraction,
+        quantity_within_notional(asks, cap_notional),
+        quantity_within_notional(bids, cap_notional),
+    )
     target = floor_step(target, size_step)
     if target < min_base:
         return None, "below_min_base"
     buy_limit, buy_notional = walk_depth(asks, target)
     sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        target = floor_step(target - size_step, size_step)
+        if target < min_base:
+            return None, "below_min_base"
+        buy_limit, buy_notional = walk_depth(asks, target)
+        sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        raise ArithmeticError("planned leg notional exceeds cap")
     if buy_notional < min_notional or sell_notional < min_notional:
         return None, "below_min_notional"
     return ArbPlan(

@@ -58,7 +58,82 @@ def test_take_fraction_and_cap():
     plan, reason = plan_arb(buy, sell, **common(take_fraction=0.5))
     assert reason == "ok" and abs(plan.qty - 50.0) < 1e-9
     plan, reason = plan_arb(buy, sell, **common(cap_notional=1000.0))
-    assert reason == "ok" and abs(plan.qty - 10.0) < 1e-6  # $1000 / $100
+    assert reason == "ok" and abs(plan.qty - 9.9502) < 1e-6
+    assert_both_legs_capped(plan, 1000.0)
+
+
+def assert_both_legs_capped(plan, cap):
+    assert plan.buy_notional <= cap + 1e-9
+    assert plan.sell_notional <= cap + 1e-9
+
+
+def test_cap_uses_actual_multilevel_buy_notional():
+    buy = make_book(bids=[(99, 10)], asks=[(100, 1), (120, 10)])
+    sell = make_book(bids=[(130, 20)], asks=[(131, 20)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=500, size_step=0.01))
+
+    assert reason == "ok"
+    assert_both_legs_capped(plan, 500)
+
+
+def test_cap_also_limits_more_expensive_sell_leg():
+    buy = make_book(bids=[(99, 10)], asks=[(100, 10)])
+    sell = make_book(bids=[(150, 10)], asks=[(151, 10)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=500, size_step=0.01))
+
+    assert reason == "ok"
+    assert plan.qty == 3.33
+    assert_both_legs_capped(plan, 500)
+
+
+def test_cap_holds_when_direction_is_reversed():
+    buy = make_book(bids=[(149, 10)], asks=[(150, 10)])
+    sell = make_book(bids=[(200, 10)], asks=[(201, 10)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=500, size_step=0.01))
+
+    assert reason == "ok"
+    assert_both_legs_capped(plan, 500)
+
+
+def test_cap_rounding_can_drop_plan_below_minimum_base():
+    buy = make_book(bids=[(99, 1)], asks=[(100, 1)])
+    sell = make_book(bids=[(110, 1)], asks=[(111, 1)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=9.99, size_step=0.1,
+                            min_base=0.1))
+
+    assert plan is None
+    assert reason == "below_min_base"
+
+
+def test_cap_reduction_can_drop_plan_below_minimum_notional():
+    buy = make_book(bids=[(99, 1)], asks=[(100, 1)])
+    sell = make_book(bids=[(110, 1)], asks=[(111, 1)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=9.0, size_step=0.01,
+                            min_notional=10.0))
+
+    assert plan is None
+    assert reason == "below_min_notional"
+
+
+def test_cap_handles_small_size_step_without_iterative_decrement():
+    buy = make_book(bids=[(99, 1)], asks=[(100, 1)])
+    sell = make_book(bids=[(123.456789, 1)], asks=[(124, 1)])
+
+    plan, reason = plan_arb(
+        buy, sell, **common(cap_notional=1.0, size_step=1e-8))
+
+    assert reason == "ok"
+    assert_both_legs_capped(plan, 1.0)
 
 
 def test_min_notional():
