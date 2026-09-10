@@ -29,7 +29,11 @@ import aiohttp
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .models import OrderResult
-from .reference import InvalidReference
+from .reference import (
+    InvalidReference,
+    ReferenceAlertState,
+    calculate_reference_metrics,
+)
 from .recorder import (
     MinuteRecorder,
     SignalRecorder,
@@ -145,6 +149,9 @@ class Engine:
         self._venue_fetch_fails: Dict[str, int] = {}
         # per-execution records for the dashboard (newest last)
         self.recent_trades: deque = deque(maxlen=50)
+        self._reference_alerts = ReferenceAlertState(
+            alert_bps=cfg.reference_residual_alert_bps,
+            persist_sec=cfg.reference_residual_persist_sec)
 
     # ------------------------------------------------------------- utilities
 
@@ -427,6 +434,66 @@ class Engine:
             except asyncio.TimeoutError:
                 pass
 
+    def _observe_reference(self, now_mono: Optional[float] = None) -> None:
+        now = time.monotonic() if now_mono is None else now_mono
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        entropy_age = self.entropy.reference.age_ms(now_mono=now)
+        hedge_age = self.hedge.reference.age_ms(now_mono=now)
+        stale_limit_ms = self.cfg.reference_stale_sec * 1000.0
+        stale = (
+            entropy_ref.oracle_px is None
+            or hedge_ref.index_px is None
+            or entropy_age is None
+            or hedge_age is None
+            or entropy_age > stale_limit_ms
+            or hedge_age > stale_limit_ms
+        )
+        e_bid, e_ask = self.entropy.book.best_bid(), self.entropy.book.best_ask()
+        h_bid, h_ask = self.hedge.book.best_bid(), self.hedge.book.best_ask()
+        sell_residual = buy_residual = None
+        if not stale and None not in (e_bid, e_ask, h_bid, h_ask):
+            sell_residual = calculate_reference_metrics(
+                direction="sell_entropy",
+                entropy_bid=e_bid, entropy_ask=e_ask,
+                hedge_bid=h_bid, hedge_ask=h_ask,
+                entropy=entropy_ref, hedge=hedge_ref,
+            ).signed_residual_bps
+            buy_residual = calculate_reference_metrics(
+                direction="buy_entropy",
+                entropy_bid=e_bid, entropy_ask=e_ask,
+                hedge_bid=h_bid, hedge_ask=h_ask,
+                entropy=entropy_ref, hedge=hedge_ref,
+            ).signed_residual_bps
+        for event in self._reference_alerts.observe(
+                now_mono=now,
+                sell_residual_bps=sell_residual,
+                buy_residual_bps=buy_residual,
+                stale=stale):
+            if event.kind == "stale":
+                if event.active:
+                    log.warning(
+                        "reference data stale or incomplete — observation "
+                        "continues without blocking trading")
+                else:
+                    log.info("reference data recovered")
+            elif event.active:
+                log.warning(
+                    "%s reference residual alert: %+.2f bps",
+                    event.direction, event.value_bps)
+            else:
+                log.info(
+                    "%s reference residual recovered: %+.2f bps",
+                    event.direction, event.value_bps)
+
+    async def _reference_monitor_loop(self) -> None:
+        while not self.stop.is_set():
+            self._observe_reference()
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def _cleanup(self, tasks: List[asyncio.Task]) -> None:
         self.request_stop()
         if self._primary_error is None:
@@ -596,6 +663,9 @@ class Engine:
             self._track_task(
                 tasks,
                 asyncio.create_task(self._status_loop(), name="status"))
+            self._track_task(
+                tasks, asyncio.create_task(
+                    self._reference_monitor_loop(), name="reference-monitor"))
             if live:
                 self._track_task(
                     tasks, asyncio.create_task(

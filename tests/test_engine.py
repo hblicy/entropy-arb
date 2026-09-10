@@ -4,6 +4,7 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_engine.py)
 """
 import asyncio
 import csv
+import logging
 import os
 import sys
 import tempfile
@@ -19,7 +20,11 @@ from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
 from entropy_arb.models import OrderResult  # noqa: E402
-from entropy_arb.reference import ReferenceState, ReferenceUpdate  # noqa: E402
+from entropy_arb.reference import (  # noqa: E402
+    ReferenceAlertState,
+    ReferenceState,
+    ReferenceUpdate,
+)
 from entropy_arb.venue_lighter import LighterVenue  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
@@ -380,6 +385,50 @@ def test_eff_threshold_directions():
         eng.cfg.midline_bps = m
         total = eng._eff_threshold(buy=h, sell=e) + eng._eff_threshold(buy=e, sell=h)
         approx(total, 7.0)
+
+
+def test_reference_state_does_not_change_trade_plan():
+    eng = make_engine()
+    eng.entropy.set_book(100.20, 100.21)
+    eng.hedge.set_book(99.99, 100.00)
+
+    before = eng._plan(eng.hedge, eng.entropy, 500.0)
+    old = time.monotonic() - 3600.0
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=1000.0), source="rest",
+        received_mono=old)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=1.0), source="rest",
+        received_mono=old)
+    after = eng._plan(eng.hedge, eng.entropy, 500.0)
+
+    assert after == before
+
+
+def test_engine_reference_logs_are_stateful_and_observation_only(caplog):
+    caplog.set_level(logging.INFO)
+    eng = make_engine(record_only=True)
+    eng._reference_alerts = ReferenceAlertState(
+        alert_bps=20.0, persist_sec=0.0)
+
+    eng._observe_reference(now_mono=10.0)
+    eng._observe_reference(now_mono=10.1)
+    assert caplog.text.count("reference data stale or incomplete") == 1
+
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=100.0), source="rest",
+        received_mono=10.2)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=100.0), source="rest",
+        received_mono=10.2)
+    eng.entropy.set_book(101.0, 101.1)
+    eng.hedge.set_book(99.9, 100.0)
+    eng._observe_reference(now_mono=10.2)
+    eng._observe_reference(now_mono=10.3)
+
+    assert caplog.text.count("reference data recovered") == 1
+    assert caplog.text.count("sell_entropy reference residual alert") == 1
+    assert eng.stop.is_set() is False
 
 
 def test_inventory_ladder():

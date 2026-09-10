@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Optional
+from typing import Dict, Optional
 
 
 class InvalidReference(ValueError):
@@ -110,3 +110,109 @@ class ReferenceState:
             return False
         now = time.monotonic() if now_mono is None else now_mono
         return now - self.last_ws_received_mono <= stale_sec
+
+
+@dataclass(frozen=True)
+class ReferenceMetrics:
+    reference_basis_bps: Optional[float]
+    signed_executable_premium_bps: Optional[float]
+    signed_residual_bps: Optional[float]
+    residual_edge_bps: Optional[float]
+    net_funding_bps_per_hour: Optional[float]
+
+
+def calculate_reference_metrics(*, direction: str, entropy_bid: float,
+                                entropy_ask: float, hedge_bid: float,
+                                hedge_ask: float,
+                                entropy: MarketReference,
+                                hedge: MarketReference) -> ReferenceMetrics:
+    if direction not in {"sell_entropy", "buy_entropy"}:
+        raise ValueError(f"unknown direction {direction!r}")
+    basis = None
+    if entropy.oracle_px is not None and hedge.index_px is not None:
+        basis = (entropy.oracle_px / hedge.index_px - 1.0) * 1e4
+    signed_premium = (
+        (entropy_bid / hedge_ask - 1.0) * 1e4
+        if direction == "sell_entropy"
+        else (entropy_ask / hedge_bid - 1.0) * 1e4
+    )
+    signed_residual = None if basis is None else signed_premium - basis
+    residual_edge = signed_residual
+    if direction == "buy_entropy" and signed_residual is not None:
+        residual_edge = -signed_residual
+    funding = None
+    if (entropy.funding_current_bps_per_hour is not None
+            and hedge.funding_current_bps_per_hour is not None):
+        funding = (entropy.funding_current_bps_per_hour
+                   - hedge.funding_current_bps_per_hour)
+        if direction == "buy_entropy":
+            funding = -funding
+    return ReferenceMetrics(
+        reference_basis_bps=basis,
+        signed_executable_premium_bps=signed_premium,
+        signed_residual_bps=signed_residual,
+        residual_edge_bps=residual_edge,
+        net_funding_bps_per_hour=funding,
+    )
+
+
+@dataclass(frozen=True)
+class ReferenceAlertEvent:
+    kind: str
+    active: bool
+    direction: Optional[str] = None
+    value_bps: Optional[float] = None
+
+
+class ReferenceAlertState:
+    """Stateful residual persistence and stale/recovery event generator."""
+
+    _DIRECTIONS = ("sell_entropy", "buy_entropy")
+
+    def __init__(self, *, alert_bps: float, persist_sec: float) -> None:
+        self.alert_bps = alert_bps
+        self.persist_sec = persist_sec
+        self._candidate_since: Dict[str, Optional[float]] = {
+            direction: None for direction in self._DIRECTIONS}
+        self._active: Dict[str, bool] = {
+            direction: False for direction in self._DIRECTIONS}
+        self._stale = False
+
+    def observe(self, *, now_mono: float,
+                sell_residual_bps: Optional[float],
+                buy_residual_bps: Optional[float],
+                stale: bool) -> list[ReferenceAlertEvent]:
+        events = []
+        if stale != self._stale:
+            self._stale = stale
+            events.append(ReferenceAlertEvent(kind="stale", active=stale))
+
+        values = {
+            "sell_entropy": sell_residual_bps,
+            "buy_entropy": buy_residual_bps,
+        }
+        for direction, value in values.items():
+            if value is None:
+                self._candidate_since[direction] = None
+                continue
+            above = abs(value) >= self.alert_bps
+            if above:
+                if self._active[direction]:
+                    continue
+                since = self._candidate_since[direction]
+                if since is None:
+                    since = now_mono
+                    self._candidate_since[direction] = since
+                if now_mono - since >= self.persist_sec:
+                    self._active[direction] = True
+                    events.append(ReferenceAlertEvent(
+                        kind="residual", active=True,
+                        direction=direction, value_bps=value))
+                continue
+            self._candidate_since[direction] = None
+            if self._active[direction]:
+                self._active[direction] = False
+                events.append(ReferenceAlertEvent(
+                    kind="residual", active=False,
+                    direction=direction, value_bps=value))
+        return events
