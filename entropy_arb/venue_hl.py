@@ -26,6 +26,7 @@ from .book import OrderBook
 from .config import VenueConf
 from .feeds import HLBookFeed
 from .models import OrderResult
+from .reference import ReferenceState
 
 log = logging.getLogger("hl")
 
@@ -70,6 +71,7 @@ class HLVenue:
         self.session = session
         self.settle_timeout = settle_timeout_sec
         self.book = OrderBook()
+        self.reference = ReferenceState()
         self.position = 0.0
         self.cash = 0.0
         self.volume_usd = 0.0     # cumulative filled notional this session
@@ -159,7 +161,7 @@ class HLVenue:
 
         return [asyncio.create_task(
             HLBookFeed(self.name, self.ws_url, self.coin, self.book,
-                       book_notify).run(stop),
+                       book_notify, self.reference).run(stop),
             name=f"book-{self.key}")]
 
     def ready_to_trade(self) -> bool:

@@ -33,6 +33,7 @@ from .book import OrderBook
 from .config import VenueConf
 from .feeds import LighterBookFeed
 from .models import OrderResult
+from .reference import ReferenceState
 
 log = logging.getLogger("lighter")
 
@@ -261,6 +262,7 @@ class LighterVenue:
         self.settle_timeout = settle_timeout_sec
         self.profile = conf.lighter_profile
         self.book = OrderBook()
+        self.reference = ReferenceState()
         self.position = 0.0
         self.cash = 0.0
         self.volume_usd = 0.0     # cumulative filled notional this session
@@ -369,7 +371,7 @@ class LighterVenue:
                 notify=order_notify)
         tasks = [asyncio.create_task(
             LighterBookFeed(self.name, self.profile.ws_url, self.market_id,
-                            self.book, book_notify).run(stop),
+                            self.book, book_notify, self.reference).run(stop),
             name=f"book-{self.key}")]
         if orders_feed is not None:
             self.orders_feed = orders_feed
