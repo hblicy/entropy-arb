@@ -26,11 +26,27 @@ from .book import OrderBook
 from .config import VenueConf
 from .feeds import HLBookFeed
 from .models import OrderResult
-from .reference import ReferenceState
+from .reference import InvalidReference, ReferenceState, ReferenceUpdate
 
 log = logging.getLogger("hl")
 
 INFO_TIMEOUT = 10.0
+
+
+def parse_hl_rest_asset_ctx(ctx: dict) -> ReferenceUpdate:
+    try:
+        funding = ctx.get("funding")
+        return ReferenceUpdate(
+            oracle_px=(None if ctx.get("oraclePx") is None
+                       else float(ctx["oraclePx"])),
+            mark_px=(None if ctx.get("markPx") is None
+                     else float(ctx["markPx"])),
+            funding_current_bps_per_hour=(
+                None if funding is None else float(funding) * 1e4),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidReference(f"invalid Hyperliquid REST asset context: {exc}") \
+            from exc
 
 
 class NonceAllocator:
@@ -121,8 +137,30 @@ class HLVenue:
                      self.name, self.coin, self.asset_id, self.size_decimals,
                      a.get("maxLeverage"),
                      "isolated-only" if a.get("onlyIsolated") else "")
+            try:
+                await self.refresh_reference_rest()
+            except (aiohttp.ClientError, asyncio.TimeoutError,
+                    InvalidReference) as exc:
+                log.warning("[%s] initial reference REST failed: %s",
+                            self.name, exc)
             return
         raise RuntimeError(f"[{self.name}] {want} not found")
+
+    async def refresh_reference_rest(self) -> bool:
+        try:
+            data = await self._info({
+                "type": "metaAndAssetCtxs", "dex": self.conf.hl_dex})
+            meta, contexts = data
+            index = next(
+                idx for idx, asset in enumerate(meta["universe"])
+                if asset.get("name") == self.coin)
+            update = parse_hl_rest_asset_ctx(contexts[index])
+        except (KeyError, IndexError, StopIteration, TypeError,
+                ValueError) as exc:
+            raise InvalidReference(
+                f"invalid Hyperliquid REST reference payload for "
+                f"{self.coin}: {exc}") from exc
+        return self.reference.apply(update, source="rest")
 
     def init_signer(self) -> None:
         c = self.conf.hl_creds

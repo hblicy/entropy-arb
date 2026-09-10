@@ -19,6 +19,7 @@ from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
 from entropy_arb.models import OrderResult  # noqa: E402
+from entropy_arb.reference import ReferenceState, ReferenceUpdate  # noqa: E402
 from entropy_arb.venue_lighter import LighterVenue  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
@@ -48,6 +49,12 @@ class StubVenue:
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
+        self.reference = ReferenceState()
+        self.reference_refreshes = 0
+
+    async def refresh_reference_rest(self):
+        self.reference_refreshes += 1
+        return False
 
     def ready_to_trade(self):
         return True
@@ -303,6 +310,61 @@ def make_engine(record_only=False, **thr):
 
 def approx(a, b, tol=1e-9):
     assert abs(a - b) <= tol, f"{a} != {b}"
+
+
+def test_reference_recovery_repeats_until_websocket_is_fresh():
+    async def go():
+        eng = make_engine(record_only=True)
+        eng.cfg.reference_rest_recovery_sec = 0.01
+        eng.cfg.reference_stale_sec = 0.1
+        venue = eng.entropy
+        venue.reference.apply(
+            ReferenceUpdate(oracle_px=100.0), source="rest",
+            received_mono=time.monotonic() - 1.0)
+        websocket_restored = asyncio.Event()
+
+        async def refresh():
+            venue.reference_refreshes += 1
+            if venue.reference_refreshes == 2:
+                venue.reference.apply(
+                    ReferenceUpdate(oracle_px=100.1), source="websocket")
+                websocket_restored.set()
+            return True
+
+        venue.refresh_reference_rest = refresh
+        task = asyncio.create_task(eng._reference_recovery_loop(venue))
+        await asyncio.wait_for(websocket_restored.wait(), timeout=0.2)
+        await asyncio.sleep(0.03)
+        assert venue.reference_refreshes == 2
+        eng.stop.set()
+        await asyncio.wait_for(task, timeout=0.2)
+
+    asyncio.run(go())
+
+
+def test_expected_reference_rest_failure_does_not_stop_engine(caplog):
+    async def go():
+        eng = make_engine(record_only=True)
+        eng.cfg.reference_rest_recovery_sec = 0.01
+        venue = eng.entropy
+        attempts = 0
+
+        async def refresh():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise engine_module.aiohttp.ClientConnectionError("offline")
+            eng.stop.set()
+            return True
+
+        venue.refresh_reference_rest = refresh
+        await asyncio.wait_for(
+            eng._reference_recovery_loop(venue), timeout=0.2)
+
+        assert attempts == 2
+        assert "reference REST recovery failed" in caplog.text
+
+    asyncio.run(go())
 
 
 def test_eff_threshold_directions():

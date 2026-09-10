@@ -84,7 +84,7 @@ sell_notional <= cap_notional
 
 - Hyperliquid `funding` 按小时小数比例转换为 bps。
 - Lighter `market_stats.current_funding_rate` 按其 WebSocket 百分比字段转换为 bps/小时。
-- Lighter REST 恢复值按对应 REST 接口的原生单位单独转换。
+- Lighter REST 的 index/mark 来自 `orderBookDetails`；`funding-rates` 返回跨交易所的 8 小时等效小数费率，筛选 `exchange=lighter` 后除以 8 并转换为 bps/小时。
 
 WebSocket 和 REST 解析器分别测试，不能因为字段名称相同而共用未经验证的倍率。日志可保留原始值用于诊断，CSV 只写统一后的 bps/小时。
 

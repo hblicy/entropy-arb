@@ -338,7 +338,7 @@ git commit -m "新增：复用行情连接采集参考数据"
 
 - [ ] **Step 1：写 REST 单位、初始化和恢复调度测试**
 
-覆盖：HL `metaAndAssetCtxs` 找到同一 universe 索引并转 bps；Lighter `orderBooks` 初始化 index/mark，`funding-rates` REST 小数费率乘 `10000`；启动失败只 warning；WS 超过 60 秒时每 15 秒恢复；REST 成功不能伪装 WS 新鲜；WS 更新后不再请求 REST。
+覆盖：HL `metaAndAssetCtxs` 找到同一 universe 索引并转 bps；Lighter `orderBookDetails` 初始化 index/mark，`funding-rates` 无参数返回跨交易所 8 小时等效费率，必须筛选 `exchange=lighter` 并按 `rate * 10000 / 8` 转成 bps/小时；启动失败只 warning；WS 超过 60 秒时每 15 秒恢复；REST 成功不能伪装 WS 新鲜；WS 更新后不再请求 REST。
 
 Engine 测试使用 fake monotonic/time 和 stub venue，断言恢复协程不调用下单路径，HTTP 预期异常不设置全局 stop。
 
@@ -358,7 +358,7 @@ Expected: `refresh_reference_rest` 或调度断言失败。
 
 使用独立命名的 `parse_hl_rest_asset_ctx(ctx)` 和 `parse_lighter_rest_market(ob, funding)`，避免混用倍率；前者只接受 HL REST ctx，后者只接受 Lighter order-book metadata 和可选 funding REST row。
 
-Lighter WS 百分数字符串乘 `100`，REST funding 小数比例乘 `10000`；为两者保留独立测试。
+Lighter WS 百分数字符串乘 `100`；REST `funding-rates` 是 8 小时等效小数比例，筛选 Lighter 自身行后乘 `10000 / 8`。为两者保留独立测试。
 
 - [ ] **Step 5：Engine 启动独立恢复任务**
 

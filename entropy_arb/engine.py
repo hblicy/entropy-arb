@@ -29,6 +29,7 @@ import aiohttp
 from .book import ArbPlan, floor_step, plan_arb
 from .config import Config
 from .models import OrderResult
+from .reference import InvalidReference
 from .recorder import (
     MinuteRecorder,
     SignalRecorder,
@@ -391,6 +392,41 @@ class Engine:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
+    async def _reference_recovery_loop(self, venue: VenueAdapter) -> None:
+        recovery_active = False
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if venue.reference.ws_is_fresh(
+                    self.cfg.reference_stale_sec, now_mono=now):
+                recovery_active = False
+                delay = min(self.cfg.reference_rest_recovery_sec,
+                            self.cfg.reference_stale_sec)
+            else:
+                age_ms = venue.reference.age_ms(now_mono=now)
+                if not recovery_active and age_ms is not None:
+                    remaining = self.cfg.reference_stale_sec - age_ms / 1000.0
+                    if remaining > 0.0:
+                        delay = min(self.cfg.reference_rest_recovery_sec,
+                                    remaining)
+                    else:
+                        recovery_active = True
+                        delay = 0.0
+                else:
+                    recovery_active = True
+                    try:
+                        await venue.refresh_reference_rest()
+                    except (aiohttp.ClientError, asyncio.TimeoutError,
+                            InvalidReference) as exc:
+                        log.warning("[%s] reference REST recovery failed: %s",
+                                    venue.name, exc)
+                    delay = self.cfg.reference_rest_recovery_sec
+            if delay <= 0.0:
+                continue
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
     async def _cleanup(self, tasks: List[asyncio.Task]) -> None:
         self.request_stop()
         if self._primary_error is None:
@@ -541,6 +577,10 @@ class Engine:
             for venue in self.venues.values():
                 for task in venue.start_tasks(self._feed_stop, notify, live):
                     self._track_task(tasks, task)
+                self._track_task(
+                    tasks, asyncio.create_task(
+                        self._reference_recovery_loop(venue),
+                        name=f"reference-rest-{venue.key}"))
             if not self.record_only:
                 self._start_recorders(tasks)
                 self._track_task(
