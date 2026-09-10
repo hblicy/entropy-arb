@@ -97,6 +97,12 @@ python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
 不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。两个
 文件的每行都包含两条腿各自的原生 symbol、Entropy DEX 和对冲交易所。
 
+参考价格和资金费复用现有行情 WebSocket 采集，启动时通过 REST 初始化，参考
+WebSocket 过期后再用 REST 定时恢复。Hyperliquid 与 Lighter 的资金费统一为
+`bps/hour`。参考异常和残差告警只记录、只告警，不会阻止开仓或改变交易阈值。
+信号行会追加两腿的参考价格、资金费、数据龄，以及按方向计算的有符号可成交
+溢价、残差、残差 edge 和净资金费；参考值缺失时留空，但不会丢弃原信号。
+
 每个“交易标的 + 交易所组合”应使用独立的 `recorder.csv`。分析器兼容使用旧
 `symbol` 身份字段或完全不含市场字段的历史文件，但检测到一个文件中混有多个
 已标识市场时会直接拒绝分析，不会给出存在风险的合并阈值。旧 schema 或末行
@@ -105,17 +111,25 @@ python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
 立即打开两个采集文件；创建或写入失败会报错并停止进程。如果分钟行已经交给
 CSV writer 后 `flush()` 才报告结果不确定的 I/O 错误，采集器不会盲目重写同一
 分钟聚合；这能避免重复行，但无法在 flush 失败时保证该行一定落盘。
+开启 `recorder.signal_rotate_daily: true` 后，跨入新的 UTC 日期并写入第一行时，
+`signals.csv` 会轮转，例如 9 月 10 日归档为 `signals-20260910.csv.gz`；重名时
+依次使用 `.gz.1`、`.gz.2`。程序会完整校验 gzip 后才删除原始归档；压缩失败
+则保留带日期的原始 CSV，并继续写新的 `signals.csv`。
 
 **第二步：分析数据、设定阈值：**
 
 ```bash
 python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
+python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
+  --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
 以及可直接粘贴进 `config.yaml` 的 `thresholds:` 配置块。同一市场、同一分钟的
 重启片段会先合并再做样本数过滤，因此每分钟只计一次；它不会分析
 `logs/signals.csv`，也不会把同一分钟文件中的多个已标识市场混合计算。
+新参考列存在有效值时，分析器还会输出分钟 close 的参考基差、有符号残差和
+每小时资金费差分布；普通 `.csv` 与 `.csv.gz` 使用完全相同的分析逻辑。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -152,6 +166,11 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 | `premium_open/high/low/close/mean/std_bps` | Entropy 相对对冲腿的中间价溢价 |
 | `sell_edge_mean/max_bps` | 卖出 Entropy 方向的可成交溢价（Entropy 买一 / 对冲腿卖一 − 1） |
 | `buy_edge_mean/max_bps` | 买入 Entropy 方向的可成交溢价（对冲腿买一 / Entropy 卖一 − 1） |
+| `*_oracle_px`, `*_index_px`, `*_mark_px` | 最新可用的标准化参考价格；交易所不提供的字段留空 |
+| `*_funding_current/last_bps_per_hour`, `*_funding_last_ts_ms` | 标准化当前/上一期资金费及交易所时间戳 |
+| `*_reference_age_ms`, `reference_update_skew_ms` | 两腿参考数据的单调时钟数据龄与接收偏差 |
+| `reference_basis_close_bps`, `funding_diff_close_bps_per_hour` | Entropy oracle / 对冲腿 index 基差；Entropy 当前资金费减对冲腿当前资金费 |
+| `residual_open/high/low/close/mean/std_bps` | 中间价溢价减参考基差，只统计两项必要参考值齐全的样本 |
 | `samples` | 该分钟约 60 秒中两边盘口同时有效的秒数 |
 
 采集的 edge 为费前口径。请分别用 `--entropy-fee-bps` 和
@@ -178,11 +197,14 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
 | `*.max_position_usd` | 各所持仓上限 | 1000 |
 | `*.max_orders_per_min` | 各所每分钟下单预算（滑动 60 秒） | 120；Lighter 对冲腿 30 |
 | `sizing.take_fraction` | 吃掉可套利深度的比例 | 0.5 |
-| `sizing.max_order_notional_usd` | 单笔名义上限 | 500 |
+| `sizing.max_order_notional_usd` | 每次切片两条腿各自实际计划名义金额的硬上限 | 500 |
 | `inventory.scale_bps` / `floor_frac` | 库存阶梯（仓位超过上限的 `floor_frac` 后额外加价） | 10 / 0.5 |
 | `execution.premium_persist_sec` | 信号需持续多久才触发 | 0.3 |
 | `execution.*` | 滑点保护、超时、对账周期等 | 见配置文件 |
 | `recorder.*` | 分钟数据；只读模式信号生命周期路径 | 开启，`logs/minutes.csv`；`logs/signals.csv` |
+| `recorder.signal_rotate_daily` | 按 UTC 日轮转并校验压缩信号明细 | true |
+| `reference.rest_recovery_sec` / `stale_sec` | REST 恢复周期 / 参考数据过期阈值 | 15 / 60 |
+| `reference.residual_alert_bps` / `residual_persist_sec` | 状态化观察告警的残差阈值 / 持续时间 | 20 / 30 |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
 
 ## 密钥配置（`.env`，仅实盘需要）
@@ -255,8 +277,8 @@ tests/                   python3 -m pytest tests/
   `config.yaml` 与市场同步。
 - **USDG 基差**（`lighter-rh`）：对冲腿以 USDG 计价，持续溢价中有
   一部分是稳定币本身的基差；midline 吸收其水平，但 USDG 的*变动*是真实盈亏。
-- **资金费**：两个交易所、两套独立的资金费率，持仓成本未建模——仓位上限
-  请设小一些。
+- **资金费**：两个交易所有独立费率。当前会统一单位、记录并告警，但持仓成本
+  仍不会阻止开仓或改变阈值——仓位上限请设小一些。
 - **薄盘口**：Entropy 深度可能很小；`take_fraction` 与名义上限控制单笔规模，
   但部分成交后对冲腿的滑点是真实存在的。
 - **交易时段**：股票类永续（如 SNDK）盘后各所预言机行为不同，建议加宽带宽
@@ -265,7 +287,8 @@ tests/                   python3 -m pytest tests/
   引用的 Hyperliquid 超时/5xx 会故意停机等待人工恢复，因此必须持续监控。
 
 风险自负。本软件直接操作真实资金，本文档不构成任何投资建议。请从最小的
-仓位上限开始。
+仓位上限开始。任何实盘前都应再次运行 `--record-only`，检查新增 reference
+字段和 `logs/engine.log`；这些检查也不代表实盘无风险。
 
 ## 开源协议
 

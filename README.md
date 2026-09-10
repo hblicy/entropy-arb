@@ -109,6 +109,15 @@ only: they do not gate entries or change live strategy behavior. The signal
 path can be changed with `recorder.signal_csv`. Both files include each leg's
 native symbol, the Entropy DEX, and the hedge venue on every row.
 
+Reference prices and funding are collected on the existing market-data
+WebSockets, initialized by REST, and refreshed by REST while a reference
+stream is stale. Hyperliquid and Lighter funding are normalized to
+`bps/hour`. Reference failures and residual alerts are observational only:
+they are logged and recorded but do not block an entry or change its threshold.
+Signal rows append both legs' reference price/funding/age fields plus the
+directional signed executable premium, signed residual, residual edge, and
+net funding. Missing reference values stay blank without dropping the signal.
+
 Use a separate `recorder.csv` for each symbol/venue combination. The analyzer
 accepts legacy files with the old `symbol` identity or with no market columns,
 but rejects a file that contains more than one identified market instead of
@@ -120,11 +129,18 @@ creation or write failure stops the process with an error. If a minute row has
 already been handed to the CSV writer when `flush()` reports an ambiguous I/O
 failure, that minute aggregate is not blindly written again; this prevents
 duplicates but cannot guarantee delivery after a failed flush.
+With `recorder.signal_rotate_daily: true`, `signals.csv` rolls at the first
+row of a new UTC day. A September 10 file becomes
+`signals-20260910.csv.gz`; conflicts use `.gz.1`, `.gz.2`, and so on. The gzip
+is fully verified before the raw archive is removed. If compression fails,
+the dated raw CSV is retained and recording continues in a new `signals.csv`.
 
 **2. Analyze and set your thresholds:**
 
 ```bash
 python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
+python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
+  --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 It analyzes `logs/minutes.csv` and prints the premium distribution, how often
@@ -133,6 +149,9 @@ for `config.yaml`. Restart fragments carrying the same market and minute are
 combined before sample filtering, so a minute is counted once. It does not
 analyze `logs/signals.csv`, and it will not mix multiple identified markets
 from one minute file.
+When the new reference columns contain valid samples, the analyzer also prints
+the minute-close distributions of reference basis, signed residual, and
+funding difference. Plain `.csv` and `.csv.gz` inputs use the same logic.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -172,6 +191,11 @@ Once per second it samples both live books; once per minute it writes a row:
 | `premium_open/high/low/close/mean/std_bps` | mid-to-mid premium of Entropy over the hedge |
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |
 | `buy_edge_mean/max_bps` | executable premium for BUY entropy (hedge bid / entropy ask − 1) |
+| `*_oracle_px`, `*_index_px`, `*_mark_px` | latest available normalized reference prices; unavailable venue fields remain blank |
+| `*_funding_current/last_bps_per_hour`, `*_funding_last_ts_ms` | normalized current/last funding and its exchange timestamp |
+| `*_reference_age_ms`, `reference_update_skew_ms` | monotonic age of each reference and receive-time skew between legs |
+| `reference_basis_close_bps`, `funding_diff_close_bps_per_hour` | Entropy oracle / hedge index basis; current Entropy funding minus hedge funding |
+| `residual_open/high/low/close/mean/std_bps` | mid-price premium minus reference basis, using only samples with both required references |
 | `samples` | how many of the ~60 seconds both books were fresh |
 
 Recorded edges are pre-fee. Pass each venue's taker fee separately with
@@ -201,11 +225,14 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `*.max_position_usd` | per-venue position cap | 1000 |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |
-| `sizing.max_order_notional_usd` | per-slice cap | 500 |
+| `sizing.max_order_notional_usd` | hard cap on each leg's actual planned notional for one slice | 500 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
 | `recorder.*` | minute data; record-only signal lifecycle path | on, `logs/minutes.csv`; `logs/signals.csv` |
+| `recorder.signal_rotate_daily` | rotate and verified-gzip signal rows by UTC day | true |
+| `reference.rest_recovery_sec` / `stale_sec` | REST recovery cadence / reference stale threshold | 15 / 60 |
+| `reference.residual_alert_bps` / `residual_persist_sec` | stateful observational residual alert threshold / persistence | 20 / 30 |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
 ## Credentials (`.env`, live only)
@@ -290,8 +317,9 @@ foundation for the staged multi-hedge design in
 - **USDG basis** (`lighter-rh`): the hedge quotes in USDG. Part of any
   persistent premium is the stablecoin itself; your midline absorbs the
   level, but a USDG *move* is real PnL.
-- **Funding**: two venues, two independent funding rates; carry is not
-  modeled. Position caps bound it — keep them modest.
+- **Funding**: two venues have independent funding rates. They are normalized,
+  recorded, and alerted on, but carry still does not gate entries or alter
+  thresholds. Position caps bound it — keep them modest.
 - **Thin books**: Entropy depth can be tiny; `take_fraction` and notional
   caps keep clips small, but slippage on the hedge leg after a partial fill
   is real.
@@ -302,7 +330,9 @@ foundation for the staged multi-hedge design in
   deliberately stops for manual recovery, so active monitoring is required.
 
 Use at your own risk. This is trading software operating with real money;
-nothing here is investment advice. Start with tiny position caps.
+nothing here is investment advice. Before any live run, repeat
+`--record-only`, verify the reference columns and `logs/engine.log`, and start
+with tiny position caps. These checks do not make live trading risk-free.
 
 ## License
 
