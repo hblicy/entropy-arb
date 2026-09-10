@@ -1,6 +1,7 @@
 import gzip
 from datetime import date
 
+import entropy_arb.csv_rotation as rotation_module
 from entropy_arb.csv_rotation import rotate_csv_gzip
 
 
@@ -81,3 +82,22 @@ def test_rotate_csv_gzip_keeps_raw_archive_when_validation_is_truncated(
     assert result.compressed is False
     assert raw.read_text(encoding="utf-8") == "important"
     assert not list(tmp_path.glob("*.tmp.gz"))
+
+
+def test_rotate_csv_gzip_keeps_raw_when_temp_creation_fails(
+        tmp_path, monkeypatch):
+    path = tmp_path / "signals.csv"
+    path.write_text("important", encoding="utf-8")
+
+    def fail_temp_creation(*args, **kwargs):
+        raise OSError("no temporary file")
+
+    monkeypatch.setattr(
+        rotation_module.tempfile, "mkstemp", fail_temp_creation)
+
+    result = rotate_csv_gzip(str(path), date(2026, 9, 10))
+
+    raw = tmp_path / "signals-20260910.csv"
+    assert result.archive_path == str(raw)
+    assert result.compressed is False
+    assert raw.read_text(encoding="utf-8") == "important"

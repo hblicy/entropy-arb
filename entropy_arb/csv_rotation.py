@@ -33,13 +33,14 @@ def rotate_csv_gzip(path: str, utc_day: date) -> RotationResult:
     raw_path, compressed_path = _archive_paths(path, utc_day)
     os.replace(path, raw_path)
     directory = os.path.dirname(path) or "."
-    fd, temp_path = tempfile.mkstemp(
-        prefix=f".{os.path.basename(path)}.",
-        suffix=".tmp.gz",
-        dir=directory,
-    )
-    os.close(fd)
+    temp_path = ""
     try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp.gz",
+            dir=directory,
+        )
+        os.close(fd)
         with open(raw_path, "rb") as source, gzip.open(
                 temp_path, "wb") as target:
             shutil.copyfileobj(source, target)
