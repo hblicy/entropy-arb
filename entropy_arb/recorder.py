@@ -318,6 +318,8 @@ class _MinuteAgg:
             elif field == "funding_diff_bps_per_hour":
                 values["funding_diff_close_bps_per_hour"] = (
                     "" if value is None else f"{value:.6g}")
+            elif field.endswith("_ts_ms"):
+                values[field] = "" if value is None else str(value)
             elif field in HEADER:
                 values[field] = "" if value is None else f"{value:.10g}"
         if self.r_n:

@@ -288,6 +288,8 @@ def test_minute_reference_stats_use_only_samples_with_reference(monkeypatch):
     assert row["samples"] == "2"
     assert float(row["entropy_oracle_px"]) == 100.05
     assert float(row["hedge_index_px"]) == 100.00
+    assert row["entropy_funding_last_ts_ms"] == "1699999000000"
+    assert row["hedge_funding_last_ts_ms"] == "1699999100000"
     assert float(row["entropy_reference_age_ms"]) == pytest.approx(700.0)
     assert float(row["hedge_reference_age_ms"]) == pytest.approx(1000.0)
     assert float(row["reference_update_skew_ms"]) == pytest.approx(300.0)
