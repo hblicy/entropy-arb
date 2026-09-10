@@ -340,6 +340,8 @@ class Engine:
             self.recorder = MinuteRecorder(
                 cfg.recorder_csv, self.entropy.book, self.hedge.book,
                 cfg.staleness_sec,
+                entropy_reference=self.entropy.reference,
+                hedge_reference=self.hedge.reference,
                 entropy_symbol=cfg.entropy.symbol,
                 entropy_dex=cfg.entropy.hl_dex,
                 hedge_symbol=cfg.hedge.symbol,

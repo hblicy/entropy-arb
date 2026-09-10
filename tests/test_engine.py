@@ -3319,6 +3319,10 @@ def test_signal_recorder_starts_only_in_record_only_mode():
         assert record_engine.recorder.hedge_symbol == "ANTHROPIC"
         assert record_engine.recorder.entropy_dex == "io"
         assert record_engine.recorder.hedge_venue == "lighter-rh"
+        assert (record_engine.recorder.entropy_reference
+                is record_engine.entropy.reference)
+        assert (record_engine.recorder.hedge_reference
+                is record_engine.hedge.reference)
         assert record_engine.signal_recorder.entropy_symbol == "ANTH"
         assert record_engine.signal_recorder.hedge_symbol == "ANTHROPIC"
         assert any(task.get_name() == "signal-recorder"
