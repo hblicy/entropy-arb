@@ -41,11 +41,6 @@ def _chan_id(channel: str) -> Optional[int]:
     return None
 
 
-def _optional_float(data: dict, key: str) -> Optional[float]:
-    value = data.get(key)
-    return None if value is None else float(value)
-
-
 def _optional_int(data: dict, key: str) -> Optional[int]:
     value = data.get(key)
     return None if value is None else int(value)
@@ -56,17 +51,15 @@ def parse_lighter_market_stats(
     if _chan_id(str(msg.get("channel", ""))) != market_id:
         return None
     stats = msg["market_stats"]
-    current = _optional_float(stats, "current_funding_rate")
-    last = _optional_float(stats, "funding_rate")
+    current = float(stats["current_funding_rate"])
+    last = float(stats["funding_rate"])
     return ReferenceUpdate(
-        index_px=_optional_float(stats, "index_price"),
-        mark_px=_optional_float(stats, "mark_price"),
-        funding_current_bps_per_hour=(
-            None if current is None else current * 100.0),
-        funding_last_bps_per_hour=(
-            None if last is None else last * 100.0),
-        funding_last_ts_ms=_optional_int(stats, "funding_timestamp"),
-        exchange_ts_ms=_optional_int(msg, "timestamp"),
+        index_px=float(stats["index_price"]),
+        mark_px=float(stats["mark_price"]),
+        funding_current_bps_per_hour=current * 100.0,
+        funding_last_bps_per_hour=last * 100.0,
+        funding_last_ts_ms=int(stats["funding_timestamp"]),
+        exchange_ts_ms=int(msg["timestamp"]),
     )
 
 
@@ -75,12 +68,11 @@ def parse_hl_asset_ctx(msg: dict, coin: str) -> Optional[ReferenceUpdate]:
     if data.get("coin") != coin:
         return None
     ctx = data["ctx"]
-    funding = _optional_float(ctx, "funding")
+    funding = float(ctx["funding"])
     return ReferenceUpdate(
-        oracle_px=_optional_float(ctx, "oraclePx"),
-        mark_px=_optional_float(ctx, "markPx"),
-        funding_current_bps_per_hour=(
-            None if funding is None else funding * 1e4),
+        oracle_px=float(ctx["oraclePx"]),
+        mark_px=float(ctx["markPx"]),
+        funding_current_bps_per_hour=funding * 1e4,
         exchange_ts_ms=_optional_int(data, "time"),
     )
 

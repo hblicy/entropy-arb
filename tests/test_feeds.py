@@ -5,7 +5,7 @@ import pytest
 
 from entropy_arb.book import OrderBook
 from entropy_arb.feeds import HLBookFeed, LighterBookFeed
-from entropy_arb.reference import ReferenceState
+from entropy_arb.reference import ReferenceState, ReferenceUpdate
 
 
 class StubWebSocket:
@@ -28,6 +28,32 @@ def message(event, nonce, begin_nonce=None, bid="100"):
         "type": event,
         "channel": "order_book:32",
         "order_book": order_book,
+    }
+
+
+def lighter_reference_message(*, timestamp=2000, index_price="100.0"):
+    return {
+        "type": "update/market_stats",
+        "channel": "market_stats:32",
+        "timestamp": timestamp,
+        "market_stats": {
+            "index_price": index_price,
+            "mark_price": "100.1",
+            "current_funding_rate": "0.0012",
+            "funding_rate": "0.0008",
+            "funding_timestamp": 1234,
+        },
+    }
+
+
+def hl_reference_message(*, oracle_px="100.2"):
+    return {
+        "channel": "activeAssetCtx",
+        "data": {"coin": "io:ANTH", "ctx": {
+            "oraclePx": oracle_px,
+            "markPx": "100.3",
+            "funding": "0.000032",
+        }},
     }
 
 
@@ -128,20 +154,61 @@ def test_lighter_market_stats_rejects_out_of_order_top_level_timestamp():
     feed = LighterBookFeed(
         "RH", "wss://example", 32, OrderBook(), lambda: None, state)
 
-    feed._handle_reference({
-        "type": "update/market_stats", "channel": "market_stats:32",
-        "timestamp": 2000,
-        "market_stats": {"index_price": "100.0"},
-    }, received_mono=10.0)
-    feed._handle_reference({
-        "type": "update/market_stats", "channel": "market_stats:32",
-        "timestamp": 1999,
-        "market_stats": {"index_price": "99.0"},
-    }, received_mono=11.0)
+    feed._handle_reference(
+        lighter_reference_message(timestamp=2000), received_mono=10.0)
+    feed._handle_reference(
+        lighter_reference_message(timestamp=1999, index_price="99.0"),
+        received_mono=11.0)
 
     assert state.snapshot.index_px == 100.0
     assert state.snapshot.exchange_ts_ms == 2000
     assert state.snapshot.received_mono == 10.0
+
+
+@pytest.mark.parametrize("missing", [
+    "timestamp", "index_price", "mark_price", "current_funding_rate",
+    "funding_rate", "funding_timestamp",
+])
+def test_incomplete_lighter_reference_does_not_refresh_snapshot(
+        missing, caplog):
+    state = ReferenceState()
+    feed = LighterBookFeed(
+        "RH", "wss://example", 32, OrderBook(), lambda: None, state)
+    feed._handle_reference(
+        lighter_reference_message(timestamp=2000), received_mono=10.0)
+    before = state.snapshot
+    generation = state.websocket_generation
+    incomplete = lighter_reference_message(
+        timestamp=3000, index_price="200.0")
+    container = incomplete if missing == "timestamp" else incomplete["market_stats"]
+    del container[missing]
+
+    feed._handle_reference(incomplete, received_mono=20.0)
+
+    assert state.snapshot == before
+    assert state.websocket_generation == generation
+    assert state.last_ws_received_mono == 10.0
+    assert "invalid reference" in caplog.text
+
+
+def test_incomplete_lighter_frame_does_not_discard_inflight_rest():
+    state = ReferenceState()
+    feed = LighterBookFeed(
+        "RH", "wss://example", 32, OrderBook(), lambda: None, state)
+    generation = state.websocket_generation
+    incomplete = lighter_reference_message()
+    del incomplete["market_stats"]["index_price"]
+
+    feed._handle_reference(incomplete, received_mono=10.0)
+    changed = state.apply_rest_if_ws_unchanged(
+        ReferenceUpdate(index_px=101.0),
+        expected_websocket_generation=generation,
+        received_mono=11.0,
+    )
+
+    assert changed is True
+    assert state.snapshot.index_px == 101.0
+    assert state.snapshot.source == "rest"
 
 
 def test_bad_lighter_reference_does_not_change_book_state(caplog):
@@ -211,6 +278,47 @@ def test_hl_asset_context_filters_coin_and_converts_fraction_to_bps():
     assert state.snapshot.oracle_px == 100.2
     assert state.snapshot.mark_px == 100.3
     assert state.snapshot.funding_current_bps_per_hour == pytest.approx(0.32)
+
+
+@pytest.mark.parametrize("missing", ["oraclePx", "markPx", "funding"])
+def test_incomplete_hl_reference_does_not_refresh_snapshot(missing, caplog):
+    state = ReferenceState()
+    feed = HLBookFeed(
+        "ENTROPY", "wss://example", "io:ANTH", OrderBook(),
+        lambda: None, state)
+    feed._on_frame(hl_reference_message(), received_mono=10.0)
+    before = state.snapshot
+    generation = state.websocket_generation
+    incomplete = hl_reference_message(oracle_px="200.0")
+    del incomplete["data"]["ctx"][missing]
+
+    feed._on_frame(incomplete, received_mono=20.0)
+
+    assert state.snapshot == before
+    assert state.websocket_generation == generation
+    assert state.last_ws_received_mono == 10.0
+    assert "invalid reference" in caplog.text
+
+
+def test_incomplete_hl_frame_does_not_discard_inflight_rest():
+    state = ReferenceState()
+    feed = HLBookFeed(
+        "ENTROPY", "wss://example", "io:ANTH", OrderBook(),
+        lambda: None, state)
+    generation = state.websocket_generation
+    incomplete = hl_reference_message()
+    del incomplete["data"]["ctx"]["oraclePx"]
+
+    feed._on_frame(incomplete, received_mono=10.0)
+    changed = state.apply_rest_if_ws_unchanged(
+        ReferenceUpdate(oracle_px=101.0),
+        expected_websocket_generation=generation,
+        received_mono=11.0,
+    )
+
+    assert changed is True
+    assert state.snapshot.oracle_px == 101.0
+    assert state.snapshot.source == "rest"
 
 
 def test_bad_hl_reference_does_not_touch_or_clear_book(caplog):
