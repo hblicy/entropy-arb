@@ -66,7 +66,7 @@ def parse_lighter_market_stats(
         funding_last_bps_per_hour=(
             None if last is None else last * 100.0),
         funding_last_ts_ms=_optional_int(stats, "funding_timestamp"),
-        exchange_ts_ms=_optional_int(stats, "timestamp"),
+        exchange_ts_ms=_optional_int(msg, "timestamp"),
     )
 
 

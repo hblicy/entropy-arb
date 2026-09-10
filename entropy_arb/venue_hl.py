@@ -147,6 +147,7 @@ class HLVenue:
         raise RuntimeError(f"[{self.name}] {want} not found")
 
     async def refresh_reference_rest(self) -> bool:
+        websocket_generation = self.reference.websocket_generation
         try:
             data = await self._info({
                 "type": "metaAndAssetCtxs", "dex": self.conf.hl_dex})
@@ -160,7 +161,10 @@ class HLVenue:
             raise InvalidReference(
                 f"invalid Hyperliquid REST reference payload for "
                 f"{self.coin}: {exc}") from exc
-        return self.reference.apply(update, source="rest")
+        return self.reference.apply_rest_if_ws_unchanged(
+            update,
+            expected_websocket_generation=websocket_generation,
+        )
 
     def init_signer(self) -> None:
         c = self.conf.hl_creds

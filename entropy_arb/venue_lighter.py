@@ -357,6 +357,7 @@ class LighterVenue:
                            f"{self.profile.name}")
 
     async def refresh_reference_rest(self) -> bool:
+        websocket_generation = self.reference.websocket_generation
         try:
             markets = await self._get(
                 "/api/v1/orderBookDetails",
@@ -375,7 +376,10 @@ class LighterVenue:
             raise InvalidReference(
                 f"invalid Lighter REST reference payload for market "
                 f"{self.market_id}: {exc}") from exc
-        return self.reference.apply(update, source="rest")
+        return self.reference.apply_rest_if_ws_unchanged(
+            update,
+            expected_websocket_generation=websocket_generation,
+        )
 
     def init_signer(self) -> None:
         c = self.conf.lighter_creds

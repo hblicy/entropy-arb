@@ -4,7 +4,7 @@ import aiohttp
 import pytest
 
 from entropy_arb.config import VenueConf
-from entropy_arb.reference import ReferenceState
+from entropy_arb.reference import ReferenceState, ReferenceUpdate
 from entropy_arb.venue_hl import HLVenue, parse_hl_rest_asset_ctx
 
 
@@ -54,6 +54,37 @@ def test_hl_refresh_reference_rest_selects_matching_universe_context():
         assert venue.reference.snapshot.source == "rest"
         assert venue.reference.snapshot.oracle_px == 100.2
         assert venue.reference.last_ws_received_mono == 0.0
+
+    asyncio.run(go())
+
+
+def test_hl_inflight_rest_does_not_overwrite_recovered_websocket():
+    async def go():
+        conf = VenueConf(
+            key="entropy", kind="hl", label="ENTROPY", symbol="ANTH",
+            fee_bps=0.9, cap_usd=1000.0, orders_per_min=120, hl_dex="io")
+        venue = HLVenue(conf, "https://api", "wss://ws", object(), 5.0)
+        venue.coin = "io:ANTH"
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def info(_payload):
+            started.set()
+            await release.wait()
+            return [
+                {"universe": [{"name": "io:ANTH"}]},
+                [{"oraclePx": "99", "markPx": "99", "funding": "0"}],
+            ]
+
+        venue._info = info
+        refresh = asyncio.create_task(venue.refresh_reference_rest())
+        await started.wait()
+        venue.reference.apply(
+            ReferenceUpdate(oracle_px=101.0), source="websocket")
+        release.set()
+
+        assert await refresh is False
+        assert venue.reference.snapshot.oracle_px == 101.0
+        assert venue.reference.snapshot.source == "websocket"
 
     asyncio.run(go())
 

@@ -105,13 +105,13 @@ def test_lighter_market_stats_filters_market_and_converts_percent_to_bps():
     feed._handle_reference({
         "type": "update/market_stats",
         "channel": "market_stats:32",
+        "timestamp": 5678,
         "market_stats": {
             "index_price": "100.0",
             "mark_price": "100.1",
             "current_funding_rate": "0.0012",
             "funding_rate": "0.0008",
             "funding_timestamp": 1234,
-            "timestamp": 5678,
         },
     }, received_mono=10.0)
 
@@ -121,6 +121,27 @@ def test_lighter_market_stats_filters_market_and_converts_percent_to_bps():
     assert state.snapshot.funding_last_bps_per_hour == pytest.approx(0.08)
     assert state.snapshot.funding_last_ts_ms == 1234
     assert state.snapshot.exchange_ts_ms == 5678
+
+
+def test_lighter_market_stats_rejects_out_of_order_top_level_timestamp():
+    state = ReferenceState()
+    feed = LighterBookFeed(
+        "RH", "wss://example", 32, OrderBook(), lambda: None, state)
+
+    feed._handle_reference({
+        "type": "update/market_stats", "channel": "market_stats:32",
+        "timestamp": 2000,
+        "market_stats": {"index_price": "100.0"},
+    }, received_mono=10.0)
+    feed._handle_reference({
+        "type": "update/market_stats", "channel": "market_stats:32",
+        "timestamp": 1999,
+        "market_stats": {"index_price": "99.0"},
+    }, received_mono=11.0)
+
+    assert state.snapshot.index_px == 100.0
+    assert state.snapshot.exchange_ts_ms == 2000
+    assert state.snapshot.received_mono == 10.0
 
 
 def test_bad_lighter_reference_does_not_change_book_state(caplog):

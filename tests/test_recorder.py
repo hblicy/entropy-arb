@@ -977,6 +977,33 @@ def test_signal_daily_rotation_can_be_disabled(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.gz"))
 
 
+def test_signal_recorder_rotates_when_utc_date_moves_backward(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_two = datetime(
+        2026, 9, 11, 0, 0, 1, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_two)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_two)
+    rec.observe(now=day_two)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_two - 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_two - 2)
+
+    rec.observe(now=day_two - 2)
+    rec.close(now=day_two - 2)
+
+    archive = tmp_path / "signals-20260911.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        assert [row["event"] for row in csv.DictReader(fh)] == ["start"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "sample", "end"]
+
+
 def test_signal_rotates_old_header_before_writing():
     directory = tempfile.mkdtemp()
     path = os.path.join(directory, "signals.csv")

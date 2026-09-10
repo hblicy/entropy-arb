@@ -106,6 +106,27 @@ def test_rest_update_does_not_refresh_websocket_freshness():
     assert state.last_ws_received_mono == 10.0
 
 
+def test_inflight_rest_update_cannot_overwrite_new_websocket_snapshot():
+    state = ReferenceState()
+    generation = state.websocket_generation
+    state.apply(
+        ReferenceUpdate(index_px=101.0),
+        source="websocket",
+        received_mono=20.0,
+    )
+
+    changed = state.apply_rest_if_ws_unchanged(
+        ReferenceUpdate(index_px=99.0),
+        expected_websocket_generation=generation,
+        received_mono=21.0,
+    )
+
+    assert changed is False
+    assert state.snapshot.index_px == 101.0
+    assert state.snapshot.source == "websocket"
+    assert state.snapshot.received_mono == 20.0
+
+
 def test_reference_state_rejects_unknown_source_and_bad_timestamps():
     state = ReferenceState()
 

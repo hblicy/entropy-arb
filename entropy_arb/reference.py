@@ -69,10 +69,15 @@ class ReferenceState:
     def __init__(self) -> None:
         self._snapshot = MarketReference()
         self.last_ws_received_mono = 0.0
+        self._websocket_generation = 0
 
     @property
     def snapshot(self) -> MarketReference:
         return self._snapshot
+
+    @property
+    def websocket_generation(self) -> int:
+        return self._websocket_generation
 
     def apply(self, update: ReferenceUpdate, *, source: str,
               received_mono: Optional[float] = None) -> bool:
@@ -96,7 +101,17 @@ class ReferenceState:
             current, **changes, received_mono=received, source=source)
         if source == "websocket":
             self.last_ws_received_mono = received
+            self._websocket_generation += 1
         return True
+
+    def apply_rest_if_ws_unchanged(
+            self, update: ReferenceUpdate, *,
+            expected_websocket_generation: int,
+            received_mono: Optional[float] = None) -> bool:
+        if self._websocket_generation != expected_websocket_generation:
+            return False
+        return self.apply(
+            update, source="rest", received_mono=received_mono)
 
     def age_ms(self, now_mono: Optional[float] = None) -> Optional[float]:
         if not self._snapshot.source:

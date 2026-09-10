@@ -553,7 +553,7 @@ class SignalRecorder:
             self._current_utc_day = row_day
             return
         if (not self.signal_rotate_daily
-                or row_day <= self._current_utc_day):
+                or row_day == self._current_utc_day):
             return
         self._fh.flush()
         self._fh.close()

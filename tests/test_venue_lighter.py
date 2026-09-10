@@ -4,7 +4,7 @@ import aiohttp
 import pytest
 
 from entropy_arb.config import LighterProfile, VenueConf
-from entropy_arb.reference import ReferenceState
+from entropy_arb.reference import ReferenceState, ReferenceUpdate
 from entropy_arb.venue_lighter import (
     LighterVenue,
     parse_lighter_rest_market,
@@ -70,6 +70,40 @@ def test_lighter_refresh_reference_rest_selects_market_and_funding():
         assert venue.reference.snapshot.funding_current_bps_per_hour \
             == pytest.approx(0.04)
         assert venue.reference.last_ws_received_mono == 0.0
+
+    asyncio.run(go())
+
+
+def test_lighter_inflight_rest_does_not_overwrite_recovered_websocket():
+    async def go():
+        profile = LighterProfile("robinhood", "https://api", "wss://ws", 1)
+        conf = VenueConf(
+            key="hedge", kind="lighter", label="RH", symbol="ANTHROPIC",
+            fee_bps=0.0, cap_usd=1000.0, orders_per_min=30,
+            lighter_profile=profile)
+        venue = LighterVenue(conf, object(), 5.0)
+        venue.market_id = 32
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def get(path, params=None, headers=None):
+            if path == "/api/v1/orderBookDetails":
+                started.set()
+                await release.wait()
+                return {"order_book_details": [{
+                    "market_id": 32, "index_price": "99",
+                    "mark_price": "99"}]}
+            return {"funding_rates": []}
+
+        venue._get = get
+        refresh = asyncio.create_task(venue.refresh_reference_rest())
+        await started.wait()
+        venue.reference.apply(
+            ReferenceUpdate(index_px=101.0), source="websocket")
+        release.set()
+
+        assert await refresh is False
+        assert venue.reference.snapshot.index_px == 101.0
+        assert venue.reference.snapshot.source == "websocket"
 
     asyncio.run(go())
 
