@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import math
 import sys
 import time
@@ -27,6 +28,12 @@ CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 NEW_IDENTITY = (
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue")
 LEGACY_IDENTITY = ("symbol", "entropy_dex", "hedge_venue")
+
+
+def open_csv_text(path: str):
+    if path.lower().endswith(".gz"):
+        return gzip.open(path, "rt", newline="", encoding="utf-8")
+    return open(path, newline="", encoding="utf-8")
 
 
 def pctl(sorted_vals: list, q: float) -> float:
@@ -39,6 +46,26 @@ def pctl(sorted_vals: list, q: float) -> float:
     if lo == hi:
         return sorted_vals[int(k)]
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
+
+
+def describe(values: list[float]) -> tuple[float, float, float, float, float]:
+    ordered = sorted(values)
+    mean = sum(ordered) / len(ordered)
+    std = math.sqrt(
+        sum((value - mean) ** 2 for value in ordered) / len(ordered))
+    return (mean, std, pctl(ordered, 50), pctl(ordered, 5),
+            pctl(ordered, 95))
+
+
+def _optional_finite_float(row: dict, field: str):
+    raw = row.get(field)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def net_edge_bps(gross_edge_bps: float, *, buy_fee_bps: float,
@@ -92,7 +119,7 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
     cutoff = time.time() - hours * 3600 if hours > 0 else 0.0
     merged = {}
     markets = set()
-    with open(path, newline="", encoding="utf-8") as fh:
+    with open_csv_text(path) as fh:
         reader = csv.DictReader(fh)
         fieldnames = set(reader.fieldnames or [])
         has_new_symbol = bool(
@@ -148,6 +175,12 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                     "sell_max": float(r["sell_edge_max_bps"]),
                     "buy_max": float(r["buy_edge_max_bps"]),
                     "samples": samples,
+                    "reference_basis": _optional_finite_float(
+                        r, "reference_basis_close_bps"),
+                    "residual": _optional_finite_float(
+                        r, "residual_close_bps"),
+                    "funding_diff": _optional_finite_float(
+                        r, "funding_diff_close_bps_per_hour"),
                 }
             except (KeyError, ValueError):
                 continue
@@ -172,6 +205,9 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
                     + row["prem_mean"] * samples) / total_samples
             previous["samples"] = total_samples
             previous["prem"] = row["prem"]
+            previous["reference_basis"] = row["reference_basis"]
+            previous["residual"] = row["residual"]
+            previous["funding_diff"] = row["funding_diff"]
             previous["sell_max"] = max(
                 previous["sell_max"], row["sell_max"])
             previous["buy_max"] = max(
@@ -244,6 +280,21 @@ def main() -> None:
           f"median {median:+.2f}")
     print(f"  p5 {pctl(prem, 5):+.2f}   p25 {pctl(prem, 25):+.2f}   "
           f"p75 {pctl(prem, 75):+.2f}   p95 {pctl(prem, 95):+.2f}")
+
+    for field, label in (
+        ("reference_basis", "reference basis, minute close (bps)"),
+        ("residual", "signed residual, minute close (bps)"),
+        ("funding_diff", "funding difference, minute close (bps/hour)"),
+    ):
+        values = [row[field] for row in rows if row[field] is not None]
+        if not values:
+            continue
+        stat_mean, stat_std, stat_median, stat_p5, stat_p95 = describe(values)
+        print(f"\n{label}:")
+        print(f"  mean {stat_mean:+.2f}   std {stat_std:.2f}   "
+              f"median {stat_median:+.2f}")
+        print(f"  p5 {stat_p5:+.2f}   p95 {stat_p95:+.2f}   "
+              f"samples {len(values)}")
 
     midline = round(median, 1) or 0.0   # normalize -0.0
     # room beyond the midline that was actually executable each minute, net

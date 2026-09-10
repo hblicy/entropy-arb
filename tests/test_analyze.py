@@ -1,5 +1,6 @@
 """Fee adjustment in the minute-data analyzer."""
 import csv
+import gzip
 import os
 import sys
 import time
@@ -9,6 +10,23 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import tools.analyze as analyze  # noqa: E402
+
+
+ANALYZE_FIELDS = [
+    "minute_ts", "samples", "entropy_symbol", "entropy_dex",
+    "hedge_symbol", "hedge_venue", "premium_close_bps",
+    "premium_mean_bps", "sell_edge_max_bps", "buy_edge_max_bps",
+    "reference_basis_close_bps", "residual_close_bps",
+    "funding_diff_close_bps_per_hour",
+]
+
+
+def write_analyze_rows(path, rows, *, compressed=False):
+    opener = gzip.open if compressed else open
+    with opener(path, "wt", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(ANALYZE_FIELDS)
+        writer.writerows(rows)
 
 
 def test_validate_single_market_rejects_mixed_minute_rows():
@@ -110,6 +128,101 @@ def test_load_rows_accepts_distinct_symbols_in_new_schema(tmp_path):
         loaded[0]["entropy_symbol"], loaded[0]["entropy_dex"],
         loaded[0]["hedge_symbol"], loaded[0]["hedge_venue"],
     ) == ("ANTH", "io", "ANTHROPIC", "lighter-rh")
+
+
+def test_load_rows_reads_gzip_identically_to_plain_csv(tmp_path):
+    row = [
+        60, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+        1.0, 1.0, 2.0, 3.0, 0.5, 0.5, 0.08,
+    ]
+    plain = tmp_path / "minutes.csv"
+    compressed = tmp_path / "minutes.csv.gz"
+    write_analyze_rows(plain, [row])
+    write_analyze_rows(compressed, [row], compressed=True)
+
+    assert analyze.load_rows(
+        str(compressed), hours=0.0, min_samples=10) == analyze.load_rows(
+        str(plain), hours=0.0, min_samples=10)
+
+
+def test_load_rows_parses_optional_reference_close_metrics(tmp_path):
+    path = tmp_path / "minutes.csv"
+    rows = [
+        [60, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         1, 1, 2, 3, 0.5, -0.25, 0.08],
+        [120, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         1, 1, 2, 3, "", "nan", "inf"],
+    ]
+    write_analyze_rows(path, rows)
+
+    loaded = analyze.load_rows(str(path), hours=0.0, min_samples=10)
+
+    assert loaded[0]["reference_basis"] == 0.5
+    assert loaded[0]["residual"] == -0.25
+    assert loaded[0]["funding_diff"] == 0.08
+    assert loaded[1]["reference_basis"] is None
+    assert loaded[1]["residual"] is None
+    assert loaded[1]["funding_diff"] is None
+
+
+def test_duplicate_minute_uses_last_reference_close_without_sample_weighting(
+        tmp_path):
+    path = tmp_path / "minutes.csv"
+    rows = [
+        [60, 59, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         1, 1, 2, 3, 0.5, 10.0, 0.08],
+        [60, 1, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         2, 2, 4, 5, 0.6, 20.0, 0.09],
+    ]
+    write_analyze_rows(path, rows)
+
+    loaded = analyze.load_rows(str(path), hours=0.0, min_samples=10)
+
+    assert len(loaded) == 1
+    assert loaded[0]["samples"] == 60
+    assert loaded[0]["residual"] == 20.0
+    assert loaded[0]["reference_basis"] == 0.6
+    assert loaded[0]["funding_diff"] == 0.09
+
+
+def test_main_prints_reference_distributions_only_when_values_exist(
+        monkeypatch, capsys, tmp_path):
+    new_path = tmp_path / "new.csv"
+    old_path = tmp_path / "old.csv"
+    rows = [
+        [60 * index, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         index / 10, index / 10, 2 + index / 10, 3 + index / 10,
+         0.5 + index / 100, -0.25 + index / 100, 0.08]
+        for index in range(1, 31)
+    ]
+    write_analyze_rows(new_path, rows)
+    with old_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(ANALYZE_FIELDS[:10])
+        writer.writerows(row[:10] for row in rows)
+
+    monkeypatch.setattr(
+        sys, "argv", ["analyze.py", "--csv", str(new_path),
+                      "--min-samples", "1"])
+    analyze.main()
+    output = capsys.readouterr().out
+    assert "reference basis, minute close (bps)" in output
+    assert "signed residual, minute close (bps)" in output
+    assert "funding difference, minute close (bps/hour)" in output
+
+    monkeypatch.setattr(
+        sys, "argv", ["analyze.py", "--csv", str(old_path),
+                      "--min-samples", "1"])
+    analyze.main()
+    legacy_output = capsys.readouterr().out
+    assert "reference basis, minute close (bps)" not in legacy_output
+    assert "signed residual, minute close (bps)" not in legacy_output
+    assert "funding difference, minute close (bps/hour)" not in legacy_output
+
+
+def test_describe_returns_population_distribution():
+    assert analyze.describe([1.0, 2.0, 3.0]) == pytest.approx(
+        (2.0, (2.0 / 3.0) ** 0.5, 2.0, 1.1, 2.9))
 
 
 def test_load_rows_rejects_partial_new_market_identity_schema(tmp_path):
