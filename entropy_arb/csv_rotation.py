@@ -49,11 +49,11 @@ def rotate_csv_gzip(path: str, utc_day: date) -> RotationResult:
         os.replace(temp_path, compressed_path)
         temp_path = ""
         os.remove(raw_path)
-    except (OSError, gzip.BadGzipFile):
+    except (OSError, EOFError, gzip.BadGzipFile):
         if temp_path:
             try:
                 os.remove(temp_path)
-            except FileNotFoundError:
+            except OSError:
                 pass
         return RotationResult(raw_path, False)
     return RotationResult(compressed_path, True)

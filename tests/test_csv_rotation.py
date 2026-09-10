@@ -59,3 +59,25 @@ def test_rotate_csv_gzip_keeps_raw_archive_when_compression_fails(
     assert raw.read_text(encoding="utf-8") == "important"
     assert not path.exists()
     assert not list(tmp_path.glob("*.tmp.gz"))
+
+
+def test_rotate_csv_gzip_keeps_raw_archive_when_validation_is_truncated(
+        tmp_path, monkeypatch):
+    path = tmp_path / "signals.csv"
+    path.write_text("important", encoding="utf-8")
+    original_gzip_open = gzip.open
+
+    def fail_validation(path, mode="rb", *args, **kwargs):
+        if mode == "rb":
+            raise EOFError("truncated gzip")
+        return original_gzip_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(gzip, "open", fail_validation)
+
+    result = rotate_csv_gzip(str(path), date(2026, 9, 10))
+
+    raw = tmp_path / "signals-20260910.csv"
+    assert result.archive_path == str(raw)
+    assert result.compressed is False
+    assert raw.read_text(encoding="utf-8") == "important"
+    assert not list(tmp_path.glob("*.tmp.gz"))
