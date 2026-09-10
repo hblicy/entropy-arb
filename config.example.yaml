@@ -97,6 +97,17 @@ recorder:
   enabled: true
   csv: logs/minutes.csv
   signal_csv: logs/signals.csv
+  signal_rotate_daily: true     # gzip and rotate signals at UTC midnight / UTC 每日轮转压缩
+
+# ================= REFERENCE OBSERVATION / 参考数据观测 ====================
+# Reference prices and funding are recorded and alerted only. They do not
+# block entries or alter trading thresholds in this version.
+# 参考价格与资金费只用于记录和告警，本版本不会阻止开仓或改变交易阈值。
+reference:
+  rest_recovery_sec: 15
+  stale_sec: 60
+  residual_alert_bps: 20
+  residual_persist_sec: 30
 
 # ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
 # On a terminal the bot shows a live Rich dashboard (books, signal, positions,

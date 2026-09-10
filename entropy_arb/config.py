@@ -132,6 +132,12 @@ class Config:
     recorder_enabled: bool
     recorder_csv: str
     recorder_signal_csv: str
+    recorder_signal_rotate_daily: bool
+    # reference observation
+    reference_rest_recovery_sec: float
+    reference_stale_sec: float
+    reference_residual_alert_bps: float
+    reference_residual_persist_sec: float
     # logging
     log_level: str
     status_interval_sec: float
@@ -200,6 +206,13 @@ _SCHEMA: Dict[str, Any] = {
         "enabled": bool,
         "csv": str,
         "signal_csv": str,
+        "signal_rotate_daily": bool,
+    },
+    "reference": {
+        "rest_recovery_sec": float,
+        "stale_sec": float,
+        "residual_alert_bps": float,
+        "residual_persist_sec": float,
     },
     "logging": {
         "level": str,
@@ -522,6 +535,16 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         recorder_csv=_get(raw, "recorder", "csv", "logs/minutes.csv"),
         recorder_signal_csv=_get(
             raw, "recorder", "signal_csv", "logs/signals.csv"),
+        recorder_signal_rotate_daily=bool(_get(
+            raw, "recorder", "signal_rotate_daily", True)),
+        reference_rest_recovery_sec=float(_get(
+            raw, "reference", "rest_recovery_sec", 15.0)),
+        reference_stale_sec=float(_get(
+            raw, "reference", "stale_sec", 60.0)),
+        reference_residual_alert_bps=float(_get(
+            raw, "reference", "residual_alert_bps", 20.0)),
+        reference_residual_persist_sec=float(_get(
+            raw, "reference", "residual_persist_sec", 30.0)),
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
         status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
@@ -544,6 +567,10 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         ("execution.net_tolerance_base", cfg.net_tolerance_base),
         ("execution.rate_limit_pause_sec", cfg.rate_limit_pause_sec),
         ("execution.http_keepalive_sec", cfg.http_keepalive_sec),
+        ("reference.residual_alert_bps",
+         cfg.reference_residual_alert_bps),
+        ("reference.residual_persist_sec",
+         cfg.reference_residual_persist_sec),
     )
     positive = (
         ("entropy.max_position_usd", cfg.entropy.cap_usd),
@@ -557,6 +584,8 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         ("execution.staleness_sec", cfg.staleness_sec),
         ("execution.reconcile_sec", cfg.reconcile_sec),
         ("execution.venue_probe_sec", cfg.venue_probe_sec),
+        ("reference.rest_recovery_sec", cfg.reference_rest_recovery_sec),
+        ("reference.stale_sec", cfg.reference_stale_sec),
         ("logging.status_interval_sec", cfg.status_interval_sec),
     )
     for name, value in nonnegative:

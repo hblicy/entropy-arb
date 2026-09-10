@@ -126,6 +126,30 @@ def test_minimal_defaults():
     assert cfg.entropy.fee_bps == 0.9
     assert cfg.recorder_enabled is True
     assert cfg.recorder_signal_csv == "logs/signals.csv"
+    assert cfg.recorder_signal_rotate_daily is True
+    assert cfg.reference_rest_recovery_sec == 15.0
+    assert cfg.reference_stale_sec == 60.0
+    assert cfg.reference_residual_alert_bps == 20.0
+    assert cfg.reference_residual_persist_sec == 30.0
+
+
+def test_reference_and_signal_rotation_can_be_overridden():
+    cfg = load(
+        MINIMAL
+        + "\nreference:\n"
+        + "  rest_recovery_sec: 5\n"
+        + "  stale_sec: 30\n"
+        + "  residual_alert_bps: 12.5\n"
+        + "  residual_persist_sec: 8\n"
+        + "recorder:\n"
+        + "  signal_rotate_daily: false\n"
+    )
+
+    assert cfg.reference_rest_recovery_sec == 5.0
+    assert cfg.reference_stale_sec == 30.0
+    assert cfg.reference_residual_alert_bps == 12.5
+    assert cfg.reference_residual_persist_sec == 8.0
+    assert cfg.recorder_signal_rotate_daily is False
 
 
 def test_recorder_signal_csv_can_be_overridden():
@@ -363,6 +387,8 @@ def test_unknown_key_rejected():
                  "unknown config key 'thresholdz'")
     expect_error(MINIMAL + "\nsizing:\n  take_fractionn: 0.5\n",
                  "sizing.take_fractionn")
+    expect_error(MINIMAL + "\nreference:\n  polling_sec: 5\n",
+                 "reference.polling_sec")
 
 
 def test_markets_no_longer_config_keys():
@@ -423,6 +449,10 @@ def test_nonpositive_band():
     ("execution:\n  reconcile_sec: 0\n", "reconcile_sec"),
     ("execution:\n  venue_probe_sec: 0\n", "venue_probe_sec"),
     ("execution:\n  http_keepalive_sec: -1\n", "http_keepalive_sec"),
+    ("reference:\n  rest_recovery_sec: 0\n", "rest_recovery_sec"),
+    ("reference:\n  stale_sec: 0\n", "reference.stale_sec"),
+    ("reference:\n  residual_alert_bps: -1\n", "residual_alert_bps"),
+    ("reference:\n  residual_persist_sec: -1\n", "residual_persist_sec"),
     ("logging:\n  status_interval_sec: 0\n", "status_interval_sec"),
     ("logging:\n  level: LOUD\n", "logging.level"),
 ])
@@ -432,6 +462,8 @@ def test_invalid_runtime_boundaries_are_rejected(section, needle):
 
 def test_nonfinite_numbers_are_rejected():
     expect_error(MINIMAL + "sizing:\n  max_order_notional_usd: .nan\n",
+                 "finite")
+    expect_error(MINIMAL + "reference:\n  residual_alert_bps: .nan\n",
                  "finite")
 
 
