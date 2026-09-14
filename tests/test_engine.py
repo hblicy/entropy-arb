@@ -748,6 +748,103 @@ def test_live_matched_close_clears_campaign_and_persists_flat_state(tmp_path):
     asyncio.run(go())
 
 
+def test_live_actual_adverse_slippage_uses_decision_book_average(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.hedge.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.04)
+        eng.entropy.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.40)
+        try:
+            await eng._evaluate()
+
+            buy_sample = eng.dynamic_strategy.slippage.latest("hedge", "buy")
+            sell_sample = eng.dynamic_strategy.slippage.latest(
+                "entropy", "sell")
+            assert buy_sample.adverse_bps == pytest.approx(4.0)
+            assert sell_sample.adverse_bps == pytest.approx(
+                (100.45 / 100.40 - 1.0) * 1e4)
+            assert buy_sample.decision_budget_bps <= 5.0
+            assert sell_sample.decision_budget_bps <= 5.0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_slippage_pause_does_not_block_campaign_close(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            quantity = eng.campaign.qty
+            now = time.monotonic()
+            for index in range(5):
+                eng.dynamic_strategy.slippage.record(
+                    venue="entropy", side="buy", now=now + index,
+                    adverse_bps=6.0, decision_budget_bps=5.0)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=quantity, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=quantity, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 2
+            assert eng.hedge.send_calls == 2
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_fill_never_adds_live_slippage_sample(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+
+            assert eng.dynamic_strategy.slippage.sample_count(
+                "hedge", "buy") == 0
+            assert eng.dynamic_strategy.slippage.sample_count(
+                "entropy", "sell") == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_three_recent_slippage_breaches_halves_dynamic_entry_size(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        now = time.monotonic()
+        model = eng.residual_model.snapshot(
+            now_minute=int(time.time() // 60))
+        market = eng._dynamic_market_view(now)
+        baseline = eng.dynamic_strategy.decide(
+            market=market, model=model, campaign=None,
+            now_wall=time.time(), now_mono=now)
+        for index in range(3):
+            eng.dynamic_strategy.slippage.record(
+                venue="entropy", side="sell", now=now + index,
+                adverse_bps=6.0, decision_budget_bps=5.0)
+
+        degraded = eng.dynamic_strategy.decide(
+            market=market, model=model, campaign=None,
+            now_wall=time.time(), now_mono=now + 3)
+
+        assert baseline.intent == "OPEN"
+        assert degraded.intent == "OPEN"
+        assert degraded.plan.qty <= baseline.plan.qty * 0.5
+        assert degraded.plan.qty >= baseline.plan.qty * 0.5 - eng._step
+    finally:
+        eng._close_dynamic_strategy()
+
+
 def approx(a, b, tol=1e-9):
     assert abs(a - b) <= tol, f"{a} != {b}"
 

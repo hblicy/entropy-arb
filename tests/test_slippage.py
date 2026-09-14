@@ -170,3 +170,16 @@ def test_protection_exposes_statistical_budget_without_entry_edge_cap():
     assert result.budget_bps == 5.0
     assert result.source == "bootstrap"
     assert result.sample_count == 0
+
+
+def test_latest_returns_last_sample_for_venue_side():
+    model = make_model()
+    model.record(
+        venue="entropy", side="buy", now=10.0,
+        adverse_bps=4.0, decision_budget_bps=5.0)
+    model.record(
+        venue="entropy", side="buy", now=11.0,
+        adverse_bps=6.0, decision_budget_bps=5.0)
+
+    assert model.latest("entropy", "buy").adverse_bps == 6.0
+    assert model.latest("entropy", "sell") is None

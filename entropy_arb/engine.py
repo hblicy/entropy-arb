@@ -810,6 +810,13 @@ class Engine:
             matched: float, now_wall: float) -> None:
         if self.record_only:
             raise RuntimeError("live fills require live mode")
+        self._record_live_slippage(
+            decision,
+            buy=buy,
+            sell=sell,
+            buy_result=buy_result,
+            sell_result=sell_result,
+        )
         if matched <= 0:
             self._record_dynamic_decision(
                 decision, now_wall=now_wall,
@@ -883,6 +890,34 @@ class Engine:
             hold_seconds=hold_seconds,
         )
         self._dynamic_last_action_mono = time.monotonic()
+
+    def _record_live_slippage(
+            self, decision: StrategyDecision, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult) -> None:
+        plan = decision.plan
+        expected_buy = plan.buy_notional / plan.qty
+        expected_sell = plan.sell_notional / plan.qty
+        now = time.monotonic()
+        if buy_result.filled_base > 0:
+            adverse = max(
+                (buy_result.avg_px / expected_buy - 1.0) * 1e4, 0.0)
+            self.dynamic_strategy.slippage.record(
+                venue=buy.key,
+                side="buy",
+                now=now,
+                adverse_bps=adverse,
+                decision_budget_bps=decision.buy_slippage_budget_bps,
+            )
+        if sell_result.filled_base > 0:
+            adverse = max(
+                (expected_sell / sell_result.avg_px - 1.0) * 1e4, 0.0)
+            self.dynamic_strategy.slippage.record(
+                venue=sell.key,
+                side="sell",
+                now=now,
+                adverse_bps=adverse,
+                decision_budget_bps=decision.sell_slippage_budget_bps,
+            )
 
     @staticmethod
     def _dynamic_execution_plan(decision: StrategyDecision, buy, sell) -> ArbPlan:

@@ -150,6 +150,10 @@ class SlippageModel:
     def sample_count(self, venue: str, side: str) -> int:
         return len(self._samples.get(self._key(venue, side), ()))
 
+    def latest(self, venue: str, side: str) -> Optional[SlippageSample]:
+        samples = self._samples.get(self._key(venue, side))
+        return None if not samples else samples[-1]
+
     def entry_size_factor(self, venue: str, now: float) -> float:
         if not isinstance(venue, str) or not venue:
             raise ValueError("venue must not be empty")
