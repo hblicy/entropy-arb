@@ -138,6 +138,31 @@ class Config:
     reference_stale_sec: float
     reference_residual_alert_bps: float
     reference_residual_persist_sec: float
+    # strategy selection and dynamic residual model
+    strategy_mode: str
+    strategy_live_enabled: bool
+    strategy_window_minutes: int
+    strategy_min_samples: int
+    strategy_lower_quantile: float
+    strategy_upper_quantile: float
+    strategy_regime_window_minutes: int
+    strategy_regime_recovery_minutes: int
+    strategy_exit_band_fraction: float
+    strategy_min_exit_band_bps: float
+    strategy_min_expected_profit_bps: float
+    strategy_soft_hold_minutes: int
+    strategy_hard_hold_minutes: int
+    strategy_entry_reference_max_age_sec: float
+    strategy_entry_reference_max_skew_sec: float
+    strategy_state_file: str
+    strategy_event_csv: str
+    # dynamic slippage
+    slippage_bootstrap_bps: float
+    slippage_min_bps: float
+    slippage_safety_bps: float
+    slippage_hard_max_bps: float
+    slippage_max_edge_fraction: float
+    slippage_min_live_samples: int
     # logging
     log_level: str
     status_interval_sec: float
@@ -213,6 +238,33 @@ _SCHEMA: Dict[str, Any] = {
         "stale_sec": float,
         "residual_alert_bps": float,
         "residual_persist_sec": float,
+    },
+    "strategy": {
+        "mode": str,
+        "live_enabled": bool,
+        "window_minutes": int,
+        "min_samples": int,
+        "lower_quantile": float,
+        "upper_quantile": float,
+        "regime_window_minutes": int,
+        "regime_recovery_minutes": int,
+        "exit_band_fraction": float,
+        "min_exit_band_bps": float,
+        "min_expected_profit_bps": float,
+        "soft_hold_minutes": int,
+        "hard_hold_minutes": int,
+        "entry_reference_max_age_sec": float,
+        "entry_reference_max_skew_sec": float,
+        "state_file": str,
+        "event_csv": str,
+    },
+    "slippage": {
+        "bootstrap_bps": float,
+        "min_bps": float,
+        "safety_bps": float,
+        "hard_max_bps": float,
+        "max_edge_fraction": float,
+        "min_live_samples": int,
     },
     "logging": {
         "level": str,
@@ -396,6 +448,11 @@ def validate_output_paths(cfg: Config, *, record_only: bool,
             outputs.append(("recorder.csv", cfg.recorder_csv))
     if log_file_active:
         outputs.append(("logging.file", cfg.log_file))
+    if cfg.strategy_mode == "residual_dynamic":
+        outputs.extend((
+            ("strategy.state_file", cfg.strategy_state_file),
+            ("strategy.event_csv", cfg.strategy_event_csv),
+        ))
     for name, path in outputs:
         if not path or not path.strip():
             raise ConfigError(
@@ -545,6 +602,52 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
             raw, "reference", "residual_alert_bps", 20.0)),
         reference_residual_persist_sec=float(_get(
             raw, "reference", "residual_persist_sec", 30.0)),
+        strategy_mode=str(_get(
+            raw, "strategy", "mode", "fixed_premium")),
+        strategy_live_enabled=bool(_get(
+            raw, "strategy", "live_enabled", False)),
+        strategy_window_minutes=int(_get(
+            raw, "strategy", "window_minutes", 180)),
+        strategy_min_samples=int(_get(
+            raw, "strategy", "min_samples", 120)),
+        strategy_lower_quantile=float(_get(
+            raw, "strategy", "lower_quantile", 0.10)),
+        strategy_upper_quantile=float(_get(
+            raw, "strategy", "upper_quantile", 0.90)),
+        strategy_regime_window_minutes=int(_get(
+            raw, "strategy", "regime_window_minutes", 60)),
+        strategy_regime_recovery_minutes=int(_get(
+            raw, "strategy", "regime_recovery_minutes", 15)),
+        strategy_exit_band_fraction=float(_get(
+            raw, "strategy", "exit_band_fraction", 0.25)),
+        strategy_min_exit_band_bps=float(_get(
+            raw, "strategy", "min_exit_band_bps", 0.5)),
+        strategy_min_expected_profit_bps=float(_get(
+            raw, "strategy", "min_expected_profit_bps", 2.0)),
+        strategy_soft_hold_minutes=int(_get(
+            raw, "strategy", "soft_hold_minutes", 60)),
+        strategy_hard_hold_minutes=int(_get(
+            raw, "strategy", "hard_hold_minutes", 360)),
+        strategy_entry_reference_max_age_sec=float(_get(
+            raw, "strategy", "entry_reference_max_age_sec", 15.0)),
+        strategy_entry_reference_max_skew_sec=float(_get(
+            raw, "strategy", "entry_reference_max_skew_sec", 15.0)),
+        strategy_state_file=str(_get(
+            raw, "strategy", "state_file", "logs/campaign-state.json")),
+        strategy_event_csv=str(_get(
+            raw, "strategy", "event_csv", "logs/strategy-events.csv")),
+        slippage_bootstrap_bps=float(_get(
+            raw, "slippage", "bootstrap_bps", 5.0)),
+        slippage_min_bps=float(_get(
+            raw, "slippage", "min_bps", 1.0)),
+        slippage_safety_bps=float(_get(
+            raw, "slippage", "safety_bps", 1.0)),
+        slippage_hard_max_bps=float(_get(
+            raw, "slippage", "hard_max_bps", 20.0)),
+        slippage_max_edge_fraction=float(_get(
+            raw, "slippage", "max_edge_fraction", 0.25)),
+        slippage_min_live_samples=int(_get(
+            raw, "slippage", "min_live_samples", 10)),
         log_level=str(_get(raw, "logging", "level", "INFO")).upper(),
         status_interval_sec=float(_get(raw, "logging", "status_interval_sec", 30.0)),
         trades_csv=_get(raw, "logging", "trades_csv", "logs/trades.csv"),
@@ -571,6 +674,13 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
          cfg.reference_residual_alert_bps),
         ("reference.residual_persist_sec",
          cfg.reference_residual_persist_sec),
+        ("strategy.min_exit_band_bps", cfg.strategy_min_exit_band_bps),
+        ("strategy.min_expected_profit_bps",
+         cfg.strategy_min_expected_profit_bps),
+        ("slippage.bootstrap_bps", cfg.slippage_bootstrap_bps),
+        ("slippage.min_bps", cfg.slippage_min_bps),
+        ("slippage.safety_bps", cfg.slippage_safety_bps),
+        ("slippage.hard_max_bps", cfg.slippage_hard_max_bps),
     )
     positive = (
         ("entropy.max_position_usd", cfg.entropy.cap_usd),
@@ -586,6 +696,22 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
         ("execution.venue_probe_sec", cfg.venue_probe_sec),
         ("reference.rest_recovery_sec", cfg.reference_rest_recovery_sec),
         ("reference.stale_sec", cfg.reference_stale_sec),
+        ("strategy.window_minutes", cfg.strategy_window_minutes),
+        ("strategy.min_samples", cfg.strategy_min_samples),
+        ("strategy.regime_window_minutes",
+         cfg.strategy_regime_window_minutes),
+        ("strategy.regime_recovery_minutes",
+         cfg.strategy_regime_recovery_minutes),
+        ("strategy.exit_band_fraction",
+         cfg.strategy_exit_band_fraction),
+        ("strategy.soft_hold_minutes", cfg.strategy_soft_hold_minutes),
+        ("strategy.hard_hold_minutes", cfg.strategy_hard_hold_minutes),
+        ("strategy.entry_reference_max_age_sec",
+         cfg.strategy_entry_reference_max_age_sec),
+        ("strategy.entry_reference_max_skew_sec",
+         cfg.strategy_entry_reference_max_skew_sec),
+        ("slippage.max_edge_fraction", cfg.slippage_max_edge_fraction),
+        ("slippage.min_live_samples", cfg.slippage_min_live_samples),
         ("logging.status_interval_sec", cfg.status_interval_sec),
     )
     for name, value in nonnegative:
@@ -601,6 +727,45 @@ def load_config(config_file: str = "config.yaml", env_file: str = ".env", *,
     if cfg.min_order_notional > cfg.max_order_notional:
         raise ConfigError("'sizing.min_order_notional_usd' must be <= "
                           "'sizing.max_order_notional_usd'")
+    if cfg.strategy_mode not in {"fixed_premium", "residual_dynamic"}:
+        raise ConfigError("'strategy.mode' must be fixed_premium or "
+                          "residual_dynamic")
+    if not (math.isfinite(cfg.strategy_lower_quantile)
+            and math.isfinite(cfg.strategy_upper_quantile)
+            and 0 <= cfg.strategy_lower_quantile < 0.5
+            < cfg.strategy_upper_quantile <= 1):
+        raise ConfigError("strategy quantiles must satisfy "
+                          "0 <= lower < 0.5 < upper <= 1")
+    if cfg.strategy_min_samples > cfg.strategy_window_minutes:
+        raise ConfigError("'strategy.min_samples' must be <= window_minutes")
+    if cfg.strategy_regime_window_minutes > cfg.strategy_window_minutes:
+        raise ConfigError("'strategy.regime_window_minutes' must be <= "
+                          "window_minutes")
+    if cfg.strategy_soft_hold_minutes >= cfg.strategy_hard_hold_minutes:
+        raise ConfigError("'strategy.soft_hold_minutes' must be < "
+                          "hard_hold_minutes")
+    if cfg.strategy_exit_band_fraction > 1:
+        raise ConfigError("'strategy.exit_band_fraction' must be <= 1")
+    if cfg.slippage_min_bps > cfg.slippage_hard_max_bps:
+        raise ConfigError("'slippage.min_bps' must be <= hard_max_bps")
+    if cfg.slippage_max_edge_fraction > 1:
+        raise ConfigError("'slippage.max_edge_fraction' must be <= 1")
+    if cfg.slippage_min_live_samples > 50:
+        raise ConfigError("'slippage.min_live_samples' must be <= 50")
+    if (cfg.strategy_mode == "residual_dynamic"
+            and cfg.strategy_live_enabled
+            and cfg.premium_persist_sec <= 0):
+        raise ConfigError("residual live requires "
+                          "execution.premium_persist_sec > 0")
+    if (cfg.strategy_mode == "residual_dynamic"
+            and not record_only and not cfg.strategy_live_enabled):
+        raise ConfigError("residual live requires "
+                          "strategy.live_enabled=true")
+    for name, path in (
+            ("strategy.state_file", cfg.strategy_state_file),
+            ("strategy.event_csv", cfg.strategy_event_csv)):
+        if not path.strip():
+            raise ConfigError(f"'{name}' must not be empty")
     if not math.isfinite(cfg.inventory_floor_frac) \
             or not 0 <= cfg.inventory_floor_frac < 1:
         raise ConfigError("'inventory.floor_frac' must be in [0, 1)")

@@ -50,7 +50,8 @@ def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh",
 
 def test_example_config_loads():
     cfg = load_config(EXAMPLE, NO_ENV,
-                      symbol="SNDK", hedge_venue="lighter-rh")
+                      symbol="SNDK", hedge_venue="lighter-rh",
+                      record_only=True)
     assert cfg.symbol == "SNDK"
     assert cfg.entropy.kind == "hl" and cfg.entropy.hl_dex == "io"
     assert cfg.hedge_venue == "lighter-rh"
@@ -66,7 +67,7 @@ def test_example_config_loads():
 def test_hedge_symbol_can_differ_from_entropy_symbol():
     cfg = load_config(
         EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol="ANTHROPIC",
-        hedge_venue="lighter-rh")
+        hedge_venue="lighter-rh", record_only=True)
 
     assert cfg.symbol == "ANTH"
     assert cfg.entropy.symbol == "ANTH"
@@ -96,9 +97,11 @@ def test_hedge_symbol_rejects_embedded_control_characters():
 
 def test_example_config_uses_venue_specific_hedge_fee_defaults():
     lighter = load_config(EXAMPLE, NO_ENV,
-                          symbol="SNDK", hedge_venue="lighter-rh")
+                          symbol="SNDK", hedge_venue="lighter-rh",
+                          record_only=True)
     tradexyz = load_config(EXAMPLE, NO_ENV,
-                           symbol="SNDK", hedge_venue="tradexyz")
+                           symbol="SNDK", hedge_venue="tradexyz",
+                           record_only=True)
 
     assert lighter.hedge.fee_bps == 0.0
     assert tradexyz.hedge.fee_bps == 1.0
@@ -131,6 +134,60 @@ def test_minimal_defaults():
     assert cfg.reference_stale_sec == 60.0
     assert cfg.reference_residual_alert_bps == 20.0
     assert cfg.reference_residual_persist_sec == 30.0
+
+
+def test_missing_strategy_keeps_fixed_premium_mode():
+    cfg = load(MINIMAL)
+
+    assert cfg.strategy_mode == "fixed_premium"
+    assert cfg.strategy_live_enabled is False
+
+
+def test_example_enables_residual_shadow_defaults():
+    cfg = load_config(
+        EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh", record_only=True)
+
+    assert cfg.strategy_mode == "residual_dynamic"
+    assert cfg.strategy_window_minutes == 180
+    assert cfg.strategy_min_samples == 120
+    assert cfg.strategy_soft_hold_minutes == 60
+    assert cfg.strategy_hard_hold_minutes == 360
+    assert cfg.strategy_live_enabled is False
+    assert cfg.slippage_bootstrap_bps == 5.0
+    assert cfg.slippage_hard_max_bps == 20.0
+
+
+@pytest.mark.parametrize(("section", "needle"), [
+    ("strategy:\n  mode: other\n", "strategy.mode"),
+    ("strategy:\n  mode: residual_dynamic\n  min_samples: 181\n",
+     "min_samples"),
+    ("strategy:\n  mode: residual_dynamic\n  lower_quantile: 0.9\n"
+     "  upper_quantile: 0.1\n", "quantile"),
+    ("strategy:\n  mode: residual_dynamic\n  soft_hold_minutes: 360\n"
+     "  hard_hold_minutes: 60\n", "soft_hold_minutes"),
+    ("slippage:\n  min_bps: 21\n  hard_max_bps: 20\n",
+     "slippage.min_bps"),
+])
+def test_dynamic_config_rejects_invalid_cross_field_values(section, needle):
+    expect_error(MINIMAL + section, needle, record_only=True)
+
+
+def test_dynamic_live_requires_positive_persistence():
+    expect_error(
+        MINIMAL
+        + "strategy:\n  mode: residual_dynamic\n  live_enabled: true\n"
+        + "execution:\n  premium_persist_sec: 0\n",
+        "premium_persist_sec",
+    )
+
+
+def test_residual_live_requires_explicit_live_enabled():
+    expect_error(
+        MINIMAL
+        + "strategy:\n  mode: residual_dynamic\n  live_enabled: false\n",
+        "live_enabled",
+    )
 
 
 def test_reference_and_signal_rotation_can_be_overridden():
