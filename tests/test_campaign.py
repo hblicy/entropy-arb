@@ -4,10 +4,12 @@ import math
 import pytest
 
 from entropy_arb.campaign import (
+    CampaignRecoveryError,
     CampaignInvariantError,
     CampaignStateError,
     CampaignStore,
     PositionCampaign,
+    reconcile_campaign,
 )
 from entropy_arb.strategy import MarketIdentity, ModelSnapshot
 
@@ -182,3 +184,73 @@ def test_campaign_rejects_nonfinite_persisted_values(tmp_path):
 
     with pytest.raises(CampaignStateError, match="qty"):
         CampaignStore(str(path), shadow=False).load()
+
+
+def test_reconcile_allows_flat_without_state():
+    result = reconcile_campaign(
+        None, entropy_position=0.0, hedge_position=0.0,
+        step=0.001, net_tolerance=0.001)
+
+    assert result.campaign is None
+    assert result.reason == ""
+
+
+@pytest.mark.parametrize(
+    ("direction", "entropy_position", "hedge_position"),
+    [
+        ("sell_entropy", -1.0, 1.0),
+        ("buy_entropy", 1.0, -1.0),
+    ],
+)
+def test_reconcile_resumes_matching_campaign(
+        direction, entropy_position, hedge_position):
+    saved = campaign(mode="live", direction=direction)
+
+    result = reconcile_campaign(
+        saved,
+        entropy_position=entropy_position,
+        hedge_position=hedge_position,
+        step=0.001,
+        net_tolerance=0.001,
+    )
+
+    assert result.campaign == saved
+    assert result.reason == ""
+
+
+@pytest.mark.parametrize(
+    ("saved", "entropy_position", "hedge_position"),
+    [
+        (None, -1.0, 1.0),
+        (campaign(mode="live", direction="sell_entropy"), 0.0, 0.0),
+        (campaign(mode="live", direction="sell_entropy"), -1.0, 0.5),
+        (campaign(mode="live", direction="buy_entropy"), -1.0, 1.0),
+    ],
+)
+def test_reconcile_fails_closed_on_ambiguous_or_mismatched_state(
+        saved, entropy_position, hedge_position):
+    with pytest.raises(CampaignRecoveryError, match="campaign recovery"):
+        reconcile_campaign(
+            saved,
+            entropy_position=entropy_position,
+            hedge_position=hedge_position,
+            step=0.001,
+            net_tolerance=0.001,
+        )
+
+
+@pytest.mark.parametrize(
+    ("entropy_position", "hedge_position", "step", "net_tolerance"),
+    [(math.nan, 0, .001, .001), (0, math.inf, .001, .001),
+     (0, 0, 0, .001), (0, 0, .001, -1)],
+)
+def test_reconcile_rejects_invalid_numeric_inputs(
+        entropy_position, hedge_position, step, net_tolerance):
+    with pytest.raises(ValueError):
+        reconcile_campaign(
+            None,
+            entropy_position=entropy_position,
+            hedge_position=hedge_position,
+            step=step,
+            net_tolerance=net_tolerance,
+        )

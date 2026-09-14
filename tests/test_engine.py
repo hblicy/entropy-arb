@@ -17,6 +17,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import entropy_arb.engine as engine_module  # noqa: E402
 from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
+from entropy_arb.campaign import (  # noqa: E402
+    CampaignStore,
+    PositionCampaign,
+)
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
 from entropy_arb.models import OrderResult  # noqa: E402
@@ -25,6 +29,7 @@ from entropy_arb.reference import (  # noqa: E402
     ReferenceState,
     ReferenceUpdate,
 )
+from entropy_arb.strategy import MarketIdentity, ModelSnapshot  # noqa: E402
 from entropy_arb.venue_lighter import LighterVenue  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
@@ -479,6 +484,116 @@ def test_dynamic_minute_observation_commits_previous_close_and_gaps(
             now_minute=int(base // 60) + 2).samples == 1
     finally:
         eng._close_dynamic_strategy()
+
+
+def dynamic_live_campaign():
+    return PositionCampaign(
+        campaign_id="live-campaign",
+        mode="live",
+        identity=MarketIdentity("SNDK", "io", "SNDK", "lighter-rh"),
+        direction="sell_entropy",
+        opened_at=time.time() - 60,
+        qty=1.0,
+        entropy_avg_px=100.2,
+        hedge_avg_px=100.0,
+        frozen_model=ModelSnapshot(
+            version=1, minute=int(time.time() // 60), samples=120,
+            status="READY", median_bps=0.0, lower_bps=-10.0,
+            q25_bps=-2.0, q75_bps=2.0, upper_bps=10.0),
+        entry_boundary_bps=10.0,
+        exit_target_bps=2.5,
+        fees_usd=0.0,
+        realized_pnl_usd=0.0,
+    )
+
+
+def make_dynamic_live_cfg(tmp_path):
+    cfg = make_cfg()
+    cfg.strategy_mode = "residual_dynamic"
+    cfg.strategy_live_enabled = True
+    cfg.strategy_state_file = str(tmp_path / "campaign-state.json")
+    cfg.strategy_event_csv = str(tmp_path / "strategy-events.csv")
+    cfg.recorder_enabled = False
+    cfg.recorder_csv = str(tmp_path / "minutes.csv")
+    cfg.trades_csv = str(tmp_path / "trades.csv")
+    cfg.entropy.hl_creds = SimpleNamespace(complete=True)
+    cfg.hedge.lighter_creds = SimpleNamespace(complete=True)
+    return cfg
+
+
+def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        expected = dynamic_live_campaign()
+        CampaignStore(cfg.strategy_state_file, shadow=False).save(expected)
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=-1.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=1.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                wait_until(lambda: eng.campaign is not None), timeout=0.3)
+            assert eng.campaign == expected
+            assert not eng._recovery_required
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
+        tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        CampaignStore(cfg.strategy_state_file, shadow=False).save(
+            dynamic_live_campaign())
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=0.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=0.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        strategy_started = asyncio.Event()
+
+        async def observed_strategy_loop():
+            strategy_started.set()
+            await eng.stop.wait()
+
+        eng._strategy_loop = observed_strategy_loop
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                wait_until(lambda: eng._recovery_required), timeout=0.3)
+            await asyncio.sleep(0)
+            assert eng._auto_repair_disabled
+            assert not strategy_started.is_set()
+            assert venues["entropy"].send_calls == 0
+            assert venues["hedge"].send_calls == 0
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
 
 
 def approx(a, b, tol=1e-9):

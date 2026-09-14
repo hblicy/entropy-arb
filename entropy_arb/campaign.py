@@ -23,6 +23,16 @@ class CampaignStateError(ValueError):
     pass
 
 
+class CampaignRecoveryError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class CampaignReconciliation:
+    campaign: Optional["PositionCampaign"]
+    reason: str = ""
+
+
 def _finite(name: str, value, *, positive: bool = False,
             nonnegative: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -138,6 +148,46 @@ class PositionCampaign:
                 + gross_per_base * quantity - fill_fees),
         )
         return updated
+
+
+def reconcile_campaign(
+        campaign: Optional[PositionCampaign], *,
+        entropy_position: float, hedge_position: float,
+        step: float, net_tolerance: float) -> CampaignReconciliation:
+    """Require durable campaign state to exactly explain both live legs."""
+    entropy = _finite("entropy_position", entropy_position)
+    hedge = _finite("hedge_position", hedge_position)
+    common_step = _finite("step", step, positive=True)
+    tolerance = _finite(
+        "net_tolerance", net_tolerance, nonnegative=True)
+    leg_tolerance = max(common_step, tolerance)
+
+    if campaign is None:
+        if (abs(entropy) <= leg_tolerance
+                and abs(hedge) <= leg_tolerance):
+            return CampaignReconciliation(None)
+        raise CampaignRecoveryError(
+            "campaign recovery mismatch: no saved campaign but positions "
+            f"are entropy={entropy:+.12g}, hedge={hedge:+.12g}")
+    if not isinstance(campaign, PositionCampaign):
+        raise ValueError("campaign must be PositionCampaign or None")
+
+    sign = -1.0 if campaign.direction == "sell_entropy" else 1.0
+    expected_entropy = sign * campaign.qty
+    expected_hedge = -sign * campaign.qty
+    entropy_error = entropy - expected_entropy
+    hedge_error = hedge - expected_hedge
+    net = entropy + hedge
+    if (abs(entropy_error) > leg_tolerance
+            or abs(hedge_error) > leg_tolerance
+            or abs(net) > tolerance):
+        raise CampaignRecoveryError(
+            "campaign recovery mismatch: "
+            f"saved={campaign.direction} qty={campaign.qty:.12g}; "
+            f"expected entropy={expected_entropy:+.12g}, "
+            f"hedge={expected_hedge:+.12g}; actual "
+            f"entropy={entropy:+.12g}, hedge={hedge:+.12g}, net={net:+.12g}")
+    return CampaignReconciliation(campaign)
 
 
 _CAMPAIGN_FIELDS = {

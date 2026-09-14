@@ -28,7 +28,13 @@ from typing import Dict, List, Optional
 import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
-from .campaign import CampaignStateError, CampaignStore, PositionCampaign
+from .campaign import (
+    CampaignRecoveryError,
+    CampaignStateError,
+    CampaignStore,
+    PositionCampaign,
+    reconcile_campaign,
+)
 from .config import Config
 from .models import OrderResult
 from .reference import (
@@ -103,6 +109,7 @@ class Engine:
         self.campaign_store: Optional[CampaignStore] = None
         self.campaign: Optional[PositionCampaign] = None
         self.model_warm_start = None
+        self._campaign_recovery_blocked = False
         self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
         self._primary_error: Optional[BaseException] = None
@@ -460,18 +467,11 @@ class Engine:
         )
         self.campaign_store = CampaignStore(
             cfg.strategy_state_file, shadow=self.record_only)
-        self.campaign = self.campaign_store.load()
-        if (self.campaign is not None
-                and self.campaign.identity != self._market_identity()):
-            raise CampaignStateError(
-                "saved campaign market identity does not match config")
-        expected_mode = "shadow" if self.record_only else "live"
-        if (self.campaign is not None
-                and self.campaign.mode != expected_mode):
-            raise CampaignStateError(
-                "saved campaign mode does not match engine mode")
+        if self.record_only:
+            self._load_dynamic_campaign()
         self.strategy_events = StrategyEventRecorder(
             cfg.strategy_event_csv)
+
         log.info(
             "dynamic residual model warm start: accepted=%d "
             "identity_rejected=%d reference_rejected=%d value_rejected=%d "
@@ -482,6 +482,18 @@ class Engine:
             self.model_warm_start.rejected_value,
             self.model_warm_start.rejected_time,
         )
+
+    def _load_dynamic_campaign(self) -> None:
+        self.campaign = self.campaign_store.load()
+        if (self.campaign is not None
+                and self.campaign.identity != self._market_identity()):
+            raise CampaignStateError(
+                "saved campaign market identity does not match config")
+        expected_mode = "shadow" if self.record_only else "live"
+        if (self.campaign is not None
+                and self.campaign.mode != expected_mode):
+            raise CampaignStateError(
+                "saved campaign mode does not match engine mode")
 
     def _close_dynamic_strategy(self) -> None:
         if self.strategy_events is not None:
@@ -1064,6 +1076,20 @@ class Engine:
                     " ".join(f"{v.name}={v.position:+.6g}"
                              for v in self.venues.values()),
                     sum(v.position for v in self.venues.values()))
+                if cfg.strategy_mode == "residual_dynamic":
+                    self._load_dynamic_campaign()
+                    try:
+                        reconcile_campaign(
+                            self.campaign,
+                            entropy_position=self.entropy.position,
+                            hedge_position=self.hedge.position,
+                            step=self._step,
+                            net_tolerance=cfg.net_tolerance_base,
+                        )
+                    except CampaignRecoveryError as exc:
+                        self._campaign_recovery_blocked = True
+                        self._auto_repair_disabled = True
+                        self._pause_for_recovery(str(exc))
                 startup_net = sum(
                     v.position for v in self.venues.values())
                 if abs(startup_net) > cfg.net_tolerance_base:
@@ -1081,8 +1107,9 @@ class Engine:
                     tasks, asyncio.create_task(
                         self._reference_recovery_loop(venue),
                         name=f"reference-rest-{venue.key}"))
-            if (not self.record_only
-                    or cfg.strategy_mode == "residual_dynamic"):
+            if ((not self.record_only
+                 or cfg.strategy_mode == "residual_dynamic")
+                    and not self._campaign_recovery_blocked):
                 if not self.record_only:
                     self._start_recorders(tasks)
                 self._track_task(
