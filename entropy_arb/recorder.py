@@ -168,7 +168,8 @@ def _valid_signal_tail(path: str) -> bool:
     event_id_index = SIGNAL_HEADER.index("event_id")
     event_index = SIGNAL_HEADER.index("event")
     return bool(timestamp_ok and row[event_id_index]
-                and row[event_index] in {"start", "sample", "end"})
+                and row[event_index]
+                in {"start", "sample", "end", "snapshot"})
 
 
 def _reference_observation(
@@ -509,6 +510,8 @@ class SignalRecorder:
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
         self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
+        self._snapshot_seq = 0
+        self._last_snapshot_mono = None
         self._run_id = uuid.uuid4().hex
         self._pending_rows = deque()
         self._fh = None
@@ -721,6 +724,40 @@ class SignalRecorder:
         })
         self._pending_rows.append(row)
 
+    def _top_common_notional(self) -> Optional[float]:
+        levels = (
+            self.entropy.book.sorted_bids(),
+            self.entropy.book.sorted_asks(),
+            self.hedge.book.sorted_bids(),
+            self.hedge.book.sorted_asks(),
+        )
+        if any(not side for side in levels):
+            return None
+        return min(side[0][0] * side[0][1] for side in levels)
+
+    def _queue_snapshot(self, wall_now: float, mono_now: float) -> None:
+        self._snapshot_seq += 1
+        row = {name: "" for name in SIGNAL_HEADER}
+        row.update(self._snapshot("sell_entropy", wall_now))
+        common_notional = self._top_common_notional()
+        row.update({
+            "ts_ms": int(wall_now * 1000),
+            "time_utc": datetime.fromtimestamp(wall_now, tz=timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "entropy_symbol": self.entropy_symbol,
+            "entropy_dex": self.entropy_dex,
+            "hedge_symbol": self.hedge_symbol,
+            "hedge_venue": self.hedge_venue,
+            "event_id": (
+                f"snapshot-{int(wall_now * 1000)}-{self._run_id}-"
+                f"{self._snapshot_seq}"),
+            "event": "snapshot",
+            "direction": "",
+            "crossable_notional_usd": (
+                "" if common_notional is None else common_notional),
+        })
+        self._pending_rows.append(row)
+
     def _flush_pending(self) -> None:
         if not self._pending_rows:
             return
@@ -741,6 +778,7 @@ class SignalRecorder:
                 flush: bool = True) -> None:
         wall_now = time.time() if now is None else now
         mono_now = time.monotonic()
+        pending_before = len(self._pending_rows)
         for direction in self._states:
             active = self._states[direction]
             qualifies, end_reason = self._qualifies(direction, wall_now)
@@ -767,6 +805,14 @@ class SignalRecorder:
                     "end", direction, active, wall_now, mono_now,
                     end_reason)
                 self._states[direction] = None
+        if len(self._pending_rows) > pending_before:
+            self._last_snapshot_mono = mono_now
+        elif (not any(self._states.values())
+              and (self._last_snapshot_mono is None
+                   or mono_now - self._last_snapshot_mono
+                   >= self.sample_sec)):
+            self._queue_snapshot(wall_now, mono_now)
+            self._last_snapshot_mono = mono_now
         if flush:
             self._flush_pending()
 
@@ -808,7 +854,12 @@ class SignalRecorder:
         active = [state for state in self._states.values()
                   if state is not None]
         if not active:
-            return 3600.0
+            if self._last_snapshot_mono is None:
+                return 0.001
+            return max(
+                self._last_snapshot_mono + self.sample_sec - mono_now,
+                0.001,
+            )
         due = min(state.last_written_mono + self.sample_sec
                   for state in active)
         return max(due - mono_now, 0.001)

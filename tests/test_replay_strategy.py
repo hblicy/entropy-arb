@@ -131,7 +131,86 @@ def test_replay_merges_gzip_signals_and_minutes_chronologically(tmp_path):
 
     assert result.signal_rows == 4
     assert result.timestamps_monotonic
-    assert result.approximation == "top-of-book approximation"
+    assert result.approximation == (
+        "threshold-censored legacy top-of-book approximation")
+
+
+def test_replay_marks_legacy_signal_timeline_as_censored(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    signals = write_signals(tmp_path / "signals.csv", [
+        signal_row(300_000, "sell_entropy", 45, "legacy-start")])
+
+    result = replay_files(
+        minutes_path=str(minutes),
+        signal_paths=[str(signals)],
+        config=replay_config(),
+        now_ts=400,
+    )
+
+    assert result.timeline_complete is False
+    assert result.coverage_end_ts == pytest.approx(300)
+    assert result.requested_end_ts == pytest.approx(400)
+    assert "threshold-censored legacy" in result.approximation
+
+
+def test_replay_uses_snapshot_coverage_end_instead_of_now_ts(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    snapshot = signal_row(360_000, "sell_entropy", 45, "snapshot-1")
+    snapshot.update(event="snapshot", direction="")
+    signals = write_signals(tmp_path / "signals.csv", [snapshot])
+
+    result = replay_files(
+        minutes_path=str(minutes),
+        signal_paths=[str(signals)],
+        config=replay_config(),
+        now_ts=600,
+    )
+
+    assert result.timeline_complete is False
+    assert result.coverage_end_ts == pytest.approx(360)
+    assert result.requested_end_ts == pytest.approx(600)
+    assert result.raw_buy_coverage == 0
+    assert result.raw_sell_coverage == 0
+
+
+def test_replay_snapshot_timeline_is_complete_through_requested_end(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    snapshots = []
+    for timestamp in (360_000, 361_000):
+        row = signal_row(
+            timestamp,
+            "sell_entropy",
+            45,
+            f"snapshot-{timestamp}",
+        )
+        row.update(event="snapshot", direction="")
+        snapshots.append(row)
+    signals = write_signals(tmp_path / "signals.csv", snapshots)
+
+    result = replay_files(
+        minutes_path=str(minutes),
+        signal_paths=[str(signals)],
+        config=replay_config(),
+        now_ts=361,
+    )
+
+    assert result.timeline_complete is True
+    assert result.approximation == "continuous top-of-book snapshot approximation"
+
+
+def test_replay_rejects_snapshot_with_direction(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    snapshot = signal_row(360_000, "sell_entropy", 45, "snapshot-1")
+    snapshot["event"] = "snapshot"
+    signals = write_signals(tmp_path / "signals.csv", [snapshot])
+
+    with pytest.raises(ValueError, match="snapshot direction"):
+        replay_files(
+            minutes_path=str(minutes),
+            signal_paths=[str(signals)],
+            config=replay_config(),
+            now_ts=400,
+        )
 
 
 def test_replay_reports_coverage_and_campaign_invariants(tmp_path):

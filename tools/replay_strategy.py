@@ -32,7 +32,9 @@ from entropy_arb.strategy import (  # noqa: E402
 )
 
 
-APPROXIMATION = "top-of-book approximation"
+LEGACY_APPROXIMATION = (
+    "threshold-censored legacy top-of-book approximation")
+SNAPSHOT_APPROXIMATION = "continuous top-of-book snapshot approximation"
 IDENTITY_FIELDS = (
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue")
 MINUTE_FIELDS = {
@@ -56,6 +58,9 @@ class ReplayResult:
     approximation: str
     minute_rows: int
     signal_rows: int
+    requested_end_ts: float
+    coverage_end_ts: Optional[float]
+    timeline_complete: bool
     actions: int
     timestamps_monotonic: bool
     raw_buy_coverage: float
@@ -161,12 +166,18 @@ def _load_signals(paths: Sequence[str]) -> tuple[list[dict], MarketIdentity]:
                 timestamp_ms = _finite(source, "ts_ms")
                 if timestamp_ms is None or timestamp_ms < 0:
                     raise ValueError("signal timestamp must be finite")
+                event = (source.get("event") or "").strip()
                 direction = (source.get("direction") or "").strip()
-                if direction not in {"buy_entropy", "sell_entropy"}:
+                if event == "snapshot":
+                    if direction:
+                        raise ValueError("snapshot direction must be empty")
+                elif event not in {"start", "sample", "end"}:
+                    raise ValueError("signal event is invalid")
+                elif direction not in {"buy_entropy", "sell_entropy"}:
                     raise ValueError("signal direction is invalid")
                 dedupe = (
                     timestamp_ms, direction,
-                    (source.get("event") or "").strip(),
+                    event,
                     (source.get("event_id") or "").strip(),
                 )
                 if dedupe in seen:
@@ -247,9 +258,13 @@ def _signal_market(
         )
     }
     caps = [config.max_order_notional]
-    for field in ("planned_notional_usd", "crossable_notional_usd"):
-        value = values[field]
+    if (row.get("event") or "").strip() == "snapshot":
+        value = values["crossable_notional_usd"]
         caps.append(value if value is not None and value > 0 else 0.0)
+    else:
+        for field in ("planned_notional_usd", "crossable_notional_usd"):
+            value = values[field]
+            caps.append(value if value is not None and value > 0 else 0.0)
     recorded_cap = min(caps)
     cap = recorded_cap if entry_cap_notional is None else min(
         recorded_cap, max(entry_cap_notional, 0.0))
@@ -413,6 +428,21 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     if not math.isfinite(end) or end < 0:
         raise ValueError("now_ts must be finite and non-negative")
     signals = [row for row in signals if row["timestamp_ms"] / 1000 <= end]
+    snapshot_times = [
+        row["timestamp_ms"] / 1000.0
+        for row in signals
+        if (row.get("event") or "").strip() == "snapshot"
+    ]
+    has_snapshots = bool(snapshot_times)
+    if has_snapshots:
+        coverage_start = snapshot_times[0]
+        signals = [
+            row for row in signals
+            if row["timestamp_ms"] / 1000.0 >= coverage_start
+        ]
+        approximation = SNAPSHOT_APPROXIMATION
+    else:
+        approximation = LEGACY_APPROXIMATION
     model = _make_model(config)
     strategy = _make_strategy(config)
     minute_index = 0
@@ -560,15 +590,37 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
 
     total = len(signals)
     timestamps = [row["timestamp_ms"] for row in signals]
+    lifecycle_rows = [
+        row for row in signals
+        if (row.get("event") or "").strip() != "snapshot"
+    ]
+    raw_total = len(lifecycle_rows)
+    raw_sell = sum(
+        row["direction"] == "sell_entropy" for row in lifecycle_rows)
+    coverage_end = (
+        None if not signals else signals[-1]["timestamp_ms"] / 1000.0)
+    timeline_gaps_ok = all(
+        right - left <= 2_500.0
+        for left, right in zip(timestamps, timestamps[1:])
+    )
+    timeline_complete = bool(
+        has_snapshots
+        and coverage_end is not None
+        and coverage_end >= end
+        and timeline_gaps_ok
+    )
     return ReplayResult(
-        approximation=APPROXIMATION,
+        approximation=approximation,
         minute_rows=len(minutes),
         signal_rows=total,
+        requested_end_ts=end,
+        coverage_end_ts=coverage_end,
+        timeline_complete=timeline_complete,
         actions=actions,
         timestamps_monotonic=all(
             left <= right for left, right in zip(timestamps, timestamps[1:])),
-        raw_buy_coverage=(raw_buy / total if total else 0.0),
-        raw_sell_coverage=((total - raw_buy) / total if total else 0.0),
+        raw_buy_coverage=(raw_buy / raw_total if raw_total else 0.0),
+        raw_sell_coverage=(raw_sell / raw_total if raw_total else 0.0),
         residual_open_coverage=(entry_decisions / total if total else 0.0),
         campaigns_opened=opened,
         campaigns_completed=completed,
@@ -621,6 +673,14 @@ def main() -> None:
     )
     print(f"\n=== dynamic residual replay ({result.approximation}) ===")
     print(f"minutes: {result.minute_rows}  signals: {result.signal_rows}")
+    coverage = (
+        "n/a" if result.coverage_end_ts is None
+        else f"{result.coverage_end_ts:.3f}")
+    print(f"requested end: {result.requested_end_ts:.3f}  "
+          f"coverage end: {coverage}")
+    if not result.timeline_complete:
+        print("WARNING: replay timeline is incomplete; campaign and hold "
+              "metrics apply only to the recorded coverage window.")
     print(f"simulated actions: {result.actions}")
     print(f"raw direction coverage: buy={result.raw_buy_coverage:.1%} "
           f"sell={result.raw_sell_coverage:.1%}")

@@ -620,6 +620,37 @@ def test_signal_directions_have_independent_lifecycles():
     assert sell_id != buy_id
 
 
+def test_signal_recorder_writes_neutral_snapshots_without_raw_signal(
+        tmp_path, monkeypatch):
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time,
+        "monotonic",
+        lambda: monotonic_clock[0],
+    )
+    path = tmp_path / "signals.csv"
+    rec, entropy, hedge = make_signal_recorder(str(path), sample_sec=1.0)
+    set_signal_book(entropy, bid=100.00, ask=100.01, ts=1000.0)
+    set_signal_book(hedge, bid=100.00, ask=100.01, ts=1000.0)
+
+    rec.observe(now=1000.0)
+    monotonic_clock[0] = 100.5
+    rec.observe(now=1000.5)
+    monotonic_clock[0] = 101.0
+    rec.observe(now=1001.0)
+    rec.close(now=1001.0)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["snapshot", "snapshot"]
+    assert all(row["direction"] == "" for row in rows)
+    assert len({row["event_id"] for row in rows}) == 2
+    assert all(float(row["entropy_bid"]) == 100.0 for row in rows)
+    assert all(float(row["entropy_ask"]) == 100.01 for row in rows)
+    assert all(float(row["hedge_bid"]) == 100.0 for row in rows)
+    assert all(float(row["hedge_ask"]) == 100.01 for row in rows)
+    assert all(float(row["crossable_notional_usd"]) > 0 for row in rows)
+
+
 def test_signal_metrics_use_plan_and_book_update_times(monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     entropy = SignalVenue("entropy", fee_bps=0.3)
