@@ -9,20 +9,28 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from .strategy import MarketIdentity
+from .campaign import PositionCampaign, _campaign_from_dict
+from .strategy import MarketIdentity, ModelSnapshot
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _LEG_FIELDS = {
     "venue_key", "is_buy", "order_ref", "status", "filled_base",
     "avg_px", "applied_fill", "unresolved",
 }
 _EXECUTION_FIELDS = {
     "execution_id", "identity", "intent", "direction", "campaign_id",
-    "qty", "buy", "sell", "audit_ok", "campaign_applied",
+    "qty", "decided_at", "frozen_model", "entry_boundary_bps",
+    "exit_target_bps", "entropy_expected_px", "hedge_expected_px",
+    "entropy_fee_bps", "hedge_fee_bps", "campaign_before", "buy", "sell",
+    "audit_ok", "campaign_applied",
 }
 _IDENTITY_FIELDS = {
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue",
+}
+_MODEL_FIELDS = {
+    "version", "minute", "samples", "status", "median_bps", "lower_bps",
+    "q25_bps", "q75_bps", "upper_bps",
 }
 
 
@@ -40,6 +48,13 @@ def _finite(name: str, value, *, positive: bool = False) -> float:
     if not positive and result < 0:
         raise PendingExecutionStateError(f"{name} must be non-negative")
     return result
+
+
+def _signed_finite(name: str, value) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)):
+        raise PendingExecutionStateError(f"{name} must be finite")
+    return float(value)
 
 
 @dataclass(frozen=True)
@@ -85,8 +100,17 @@ class PendingExecutionState:
     identity: MarketIdentity
     intent: str
     direction: str
-    campaign_id: Optional[str]
+    campaign_id: str
     qty: float
+    decided_at: float
+    frozen_model: ModelSnapshot
+    entry_boundary_bps: float
+    exit_target_bps: float
+    entropy_expected_px: float
+    hedge_expected_px: float
+    entropy_fee_bps: float
+    hedge_fee_bps: float
+    campaign_before: Optional[PositionCampaign]
     buy: PendingLegState
     sell: PendingLegState
     audit_ok: bool
@@ -101,15 +125,51 @@ class PendingExecutionState:
             raise PendingExecutionStateError("intent is invalid")
         if self.direction not in {"buy_entropy", "sell_entropy"}:
             raise PendingExecutionStateError("direction is invalid")
-        if (self.campaign_id is not None
-                and (not isinstance(self.campaign_id, str)
-                     or not self.campaign_id)):
+        if not isinstance(self.campaign_id, str) or not self.campaign_id:
             raise PendingExecutionStateError(
-                "campaign_id must be a non-empty string or null")
-        if self.intent != "OPEN" and self.campaign_id is None:
-            raise PendingExecutionStateError(
-                "campaign_id is required for a non-OPEN execution")
+                "campaign_id must be a non-empty string")
         _finite("qty", self.qty, positive=True)
+        _finite("decided_at", self.decided_at)
+        if (not isinstance(self.frozen_model, ModelSnapshot)
+                or not self.frozen_model.ready):
+            raise PendingExecutionStateError(
+                "frozen_model must be a ready ModelSnapshot")
+        for name in ("version", "minute", "samples"):
+            value = getattr(self.frozen_model, name)
+            minimum = 1 if name in {"version", "samples"} else 0
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < minimum):
+                raise PendingExecutionStateError(
+                    f"frozen_model.{name} must be a valid integer")
+        quantiles = [
+            _signed_finite(
+                f"frozen_model.{name}", getattr(self.frozen_model, name))
+            for name in ("lower_bps", "q25_bps", "median_bps",
+                         "q75_bps", "upper_bps")
+        ]
+        if quantiles != sorted(quantiles):
+            raise PendingExecutionStateError(
+                "frozen_model quantiles must be ordered")
+        _signed_finite("entry_boundary_bps", self.entry_boundary_bps)
+        _signed_finite("exit_target_bps", self.exit_target_bps)
+        _finite("entropy_expected_px", self.entropy_expected_px,
+                positive=True)
+        _finite("hedge_expected_px", self.hedge_expected_px, positive=True)
+        _finite("entropy_fee_bps", self.entropy_fee_bps)
+        _finite("hedge_fee_bps", self.hedge_fee_bps)
+        if self.intent == "OPEN":
+            if self.campaign_before is not None:
+                raise PendingExecutionStateError(
+                    "campaign_before must be null for OPEN")
+        elif (not isinstance(self.campaign_before, PositionCampaign)
+              or self.campaign_before.campaign_id != self.campaign_id):
+            raise PendingExecutionStateError(
+                "campaign_before must match campaign_id for non-OPEN")
+        if (self.campaign_before is not None
+                and (self.campaign_before.mode != "live"
+                     or self.campaign_before.identity != self.identity)):
+            raise PendingExecutionStateError(
+                "campaign_before must match live market identity")
         if not isinstance(self.buy, PendingLegState) or not self.buy.is_buy:
             raise PendingExecutionStateError("buy leg is invalid")
         if not isinstance(self.sell, PendingLegState) or self.sell.is_buy:
@@ -149,9 +209,21 @@ def _execution_from_dict(raw) -> PendingExecutionState:
     except (TypeError, ValueError) as exc:
         raise PendingExecutionStateError(
             f"pending identity is invalid: {exc}") from exc
-    values["buy"] = _leg_from_dict(raw["buy"])
-    values["sell"] = _leg_from_dict(raw["sell"])
-    return PendingExecutionState(**values)
+    model = raw["frozen_model"]
+    if not isinstance(model, dict) or set(model) != _MODEL_FIELDS:
+        raise PendingExecutionStateError(
+            "pending frozen model fields are incompatible")
+    try:
+        values["frozen_model"] = ModelSnapshot(**model)
+        values["campaign_before"] = (
+            None if raw["campaign_before"] is None
+            else _campaign_from_dict(raw["campaign_before"]))
+        values["buy"] = _leg_from_dict(raw["buy"])
+        values["sell"] = _leg_from_dict(raw["sell"])
+        return PendingExecutionState(**values)
+    except (TypeError, ValueError) as exc:
+        raise PendingExecutionStateError(
+            f"pending execution state is invalid: {exc}") from exc
 
 
 class PendingExecutionStore:

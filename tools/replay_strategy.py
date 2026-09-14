@@ -76,6 +76,7 @@ class ReplayResult:
     max_slippage_budget_bps: float
     reference_gate_rejects: int
     invalid_reference_entries: int
+    entries_during_unstable_gap: int
     reverse_campaigns: int
 
 
@@ -426,6 +427,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     max_slippage = 0.0
     reference_rejects = 0
     invalid_reference_entries = 0
+    entries_during_unstable_gap = 0
     reverse_campaigns = 0
     actions = 0
     max_accumulated_notional = 0.0
@@ -519,6 +521,8 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         if decision.intent in {"OPEN", "ADD"}:
             entry_decisions += 1
             invalid_reference_entries += not reference_valid
+            entries_during_unstable_gap += (
+                snapshot.status == "REGIME_UNSTABLE")
         if (prior is not None and decision.intent == "OPEN"
                 and decision.direction != prior.direction):
             reverse_campaigns += 1
@@ -581,6 +585,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         max_slippage_budget_bps=max_slippage,
         reference_gate_rejects=reference_rejects,
         invalid_reference_entries=invalid_reference_entries,
+        entries_during_unstable_gap=entries_during_unstable_gap,
         reverse_campaigns=reverse_campaigns,
     )
 
@@ -638,6 +643,8 @@ def main() -> None:
     print(f"max slippage budget: {result.max_slippage_budget_bps:.2f} bps")
     print(f"reference rejects: {result.reference_gate_rejects}  "
           f"invalid-reference entries: {result.invalid_reference_entries}")
+    print("entries during unstable gaps: "
+          f"{result.entries_during_unstable_gap}")
     print(f"reverse campaigns: {result.reverse_campaigns}")
     print("Replay PnL is intentionally not reported: recorded signals do not "
           "contain full depth or actual strategy fills.")

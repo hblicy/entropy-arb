@@ -204,10 +204,12 @@ matched quantity agree. A missing/mismatched/corrupt state pauses dynamic
 trading for manual recovery; it is never reconstructed from positions.
 Every dynamic live submission also writes
 `logs/campaign-state.pending.json` before either leg can start. If that file
-contains an unfinished execution after a restart, live trading stays blocked
-until both exchange order histories and positions have been checked manually;
-the engine does not guess or resend the order. Only clear the pending state
-after that verification.
+contains an unfinished execution after a restart, the engine automatically
+resolves only legs with durable order references, applies the campaign change
+exactly once, and clears the journal only after both exchange positions have
+been refreshed and agree. Missing references, an incomplete trade audit, or
+contradictory state stays blocked for manual verification; the engine never
+guesses or resends the original order.
 Completing tests or replay is not authorization to set `live_enabled: true`.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with

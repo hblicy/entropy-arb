@@ -210,6 +210,7 @@ def test_replay_inserts_missing_minutes_before_signal(tmp_path):
 
     assert result.campaigns_opened == 0
     assert result.actions == 0
+    assert result.entries_during_unstable_gap == 0
 
 
 def test_replay_rejects_mixed_signal_pair_identity(tmp_path):

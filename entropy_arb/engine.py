@@ -130,6 +130,8 @@ class Engine:
         self.dynamic_strategy: Optional[DynamicResidualStrategy] = None
         self.campaign_store: Optional[CampaignStore] = None
         self.pending_execution_store: Optional[PendingExecutionStore] = None
+        self._startup_pending_execution: Optional[
+            PendingExecutionState] = None
         self.campaign: Optional[PositionCampaign] = None
         self.model_warm_start = None
         self._live_lock: Optional[LiveProcessLock] = None
@@ -536,11 +538,26 @@ class Engine:
             raise PendingExecutionStateError(
                 "saved pending execution market identity does not match "
                 "config")
+        recoverable = (pending.audit_ok and all(
+            not leg.unresolved or leg.order_ref is not None
+            for leg in (pending.buy, pending.sell)))
         self._campaign_recovery_blocked = True
-        self._auto_repair_disabled = True
         self._pause_for_recovery(
-            f"pending dynamic execution {pending.execution_id} requires "
-            "manual exchange-order and position verification")
+            f"recovering pending dynamic execution {pending.execution_id}")
+        if recoverable:
+            self._startup_pending_execution = pending
+            self._pending_snapshot_venues.update(
+                (pending.buy.venue_key, pending.sell.venue_key))
+            self._shutdown_reconcile_required = True
+            log.warning(
+                "saved pending dynamic execution will be resolved before "
+                "trading resumes: execution=%s intent=%s buy_ref=%s "
+                "sell_ref=%s",
+                pending.execution_id, pending.intent,
+                pending.buy.order_ref or "<terminal>",
+                pending.sell.order_ref or "<terminal>")
+            return
+        self._auto_repair_disabled = True
         log.critical(
             "saved pending dynamic execution blocks live trading: "
             "execution=%s intent=%s buy_ref=%s sell_ref=%s; verify both "
@@ -608,6 +625,139 @@ class Engine:
                 or not self._reconcile_live_campaign()):
             return False
         self.pending_execution_store.save(None)
+        if (self._startup_pending_execution is not None
+                and self._startup_pending_execution.execution_id
+                == pending.execution_id):
+            self._startup_pending_execution = None
+            self._campaign_recovery_blocked = False
+        return True
+
+    def _pending_execution_active(self) -> bool:
+        return (self.pending_execution_store is not None
+                and self.pending_execution_store.load() is not None)
+
+    @staticmethod
+    def _terminal_pending_leg(
+            leg: PendingLegState, result: OrderResult) -> PendingLegState:
+        if result.unresolved:
+            raise _OrderRecoveryInvariantError(
+                "persisted order reference did not resolve to a terminal "
+                "OrderResult")
+        if (result.order_ref is not None
+                and result.order_ref != leg.order_ref):
+            raise _OrderRecoveryInvariantError(
+                "resolved order reference does not match persisted state")
+        if result.filled_base + 1e-12 < leg.filled_base:
+            raise _OrderRecoveryInvariantError(
+                "resolved fill regressed below the persisted quantity")
+        return PendingLegState(
+            venue_key=leg.venue_key,
+            is_buy=leg.is_buy,
+            order_ref=result.order_ref or leg.order_ref,
+            status=result.status,
+            filled_base=result.filled_base,
+            avg_px=result.avg_px,
+            applied_fill=result.filled_base,
+            unresolved=False,
+        )
+
+    def _campaign_after_pending(
+            self, pending: PendingExecutionState) -> Optional[PositionCampaign]:
+        matched = min(pending.buy.filled_base, pending.sell.filled_base)
+        if matched <= 0:
+            return pending.campaign_before
+        buy_px = pending.buy.avg_px
+        sell_px = pending.sell.avg_px
+        if buy_px is None or sell_px is None:
+            raise _OrderRecoveryInvariantError(
+                "persisted matched fill has no average price")
+        entropy_px = buy_px if pending.buy.venue_key == "entropy" else sell_px
+        hedge_px = buy_px if pending.buy.venue_key == "hedge" else sell_px
+        fees = matched * (
+            entropy_px * pending.entropy_fee_bps
+            + hedge_px * pending.hedge_fee_bps) / 1e4
+        if pending.intent == "OPEN":
+            return PositionCampaign(
+                campaign_id=pending.campaign_id,
+                mode="live",
+                identity=pending.identity,
+                direction=pending.direction,
+                opened_at=pending.decided_at,
+                qty=matched,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=pending.frozen_model,
+                entry_boundary_bps=pending.entry_boundary_bps,
+                exit_target_bps=pending.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        if pending.campaign_before is None:
+            raise _OrderRecoveryInvariantError(
+                "persisted non-OPEN execution has no prior campaign")
+        return pending.campaign_before.apply_matched_fill(
+            intent=pending.intent,
+            direction=pending.campaign_before.direction,
+            qty=matched,
+            entropy_px=entropy_px,
+            hedge_px=hedge_px,
+            fees_usd=fees,
+        )
+
+    async def _resolve_startup_pending_execution(self) -> bool:
+        pending = self._startup_pending_execution
+        if pending is None:
+            return True
+        if self.pending_execution_store is None:
+            raise _OrderRecoveryInvariantError(
+                "pending execution store is not initialized")
+        for side in ("buy", "sell"):
+            leg = getattr(pending, side)
+            if not leg.unresolved:
+                continue
+            venue = self.venues.get(leg.venue_key)
+            if venue is None:
+                raise _OrderRecoveryInvariantError(
+                    f"persisted {side} venue {leg.venue_key!r} is unavailable")
+            result = await venue.resolve_order(leg.order_ref)
+            if result is None:
+                self._schedule_reconcile(1.0)
+                return False
+            if not isinstance(result, OrderResult):
+                raise _OrderRecoveryInvariantError(
+                    "venue resolver returned an invalid order result")
+            venue.last_traded_ts = time.monotonic()
+            pending = replace(
+                pending, **{side: self._terminal_pending_leg(leg, result)})
+            self.pending_execution_store.save(pending)
+            self._startup_pending_execution = pending
+        if (abs(pending.buy.filled_base - pending.sell.filled_base)
+                > self.cfg.net_tolerance_base):
+            raise _OrderRecoveryInvariantError(
+                "persisted execution has unmatched terminal fills; residual "
+                "repair requires manual verification after a restart")
+        expected = self._campaign_after_pending(pending)
+        durable_campaign = self.campaign_store.load()
+        if pending.campaign_applied:
+            if durable_campaign != expected:
+                raise _OrderRecoveryInvariantError(
+                    "persisted campaign_applied state does not match the "
+                    "durable campaign")
+            self.campaign = durable_campaign
+        else:
+            if durable_campaign == pending.campaign_before:
+                self.campaign_store.save(expected)
+                durable_campaign = expected
+            elif durable_campaign != expected:
+                raise _OrderRecoveryInvariantError(
+                    "durable campaign matches neither side of the pending "
+                    "execution transaction")
+            self.campaign = durable_campaign
+            pending = replace(pending, campaign_applied=True)
+            self.pending_execution_store.save(pending)
+            self._startup_pending_execution = pending
+        self._pending_snapshot_venues.update(
+            (pending.buy.venue_key, pending.sell.venue_key))
         return True
 
     def _close_dynamic_strategy(self) -> None:
@@ -974,7 +1124,8 @@ class Engine:
     def _apply_live_matched_fill(
             self, decision: StrategyDecision, *, buy, sell,
             buy_result: OrderResult, sell_result: OrderResult,
-            matched: float, now_wall: float) -> None:
+            matched: float, now_wall: float,
+            pending: Optional[PendingExecutionState] = None) -> None:
         if self.record_only:
             raise RuntimeError("live fills require live mode")
         self._record_live_slippage(
@@ -998,9 +1149,15 @@ class Engine:
         hedge_px = (
             buy_result.avg_px if buy.key == "hedge"
             else sell_result.avg_px)
+        entropy_fee_bps = (
+            self.entropy.fee_bps if pending is None
+            else pending.entropy_fee_bps)
+        hedge_fee_bps = (
+            self.hedge.fee_bps if pending is None
+            else pending.hedge_fee_bps)
         fees = matched * (
-            entropy_px * self.entropy.fee_bps
-            + hedge_px * self.hedge.fee_bps) / 1e4
+            entropy_px * entropy_fee_bps
+            + hedge_px * hedge_fee_bps) / 1e4
         prior = self.campaign
         final_pnl = None
         hold_seconds = None
@@ -1008,11 +1165,14 @@ class Engine:
             if prior is not None:
                 raise RuntimeError("cannot open a second live campaign")
             self.campaign = PositionCampaign(
-                campaign_id=uuid.uuid4().hex,
+                campaign_id=(
+                    uuid.uuid4().hex if pending is None
+                    else pending.campaign_id),
                 mode="live",
                 identity=self._market_identity(),
                 direction=decision.direction,
-                opened_at=now_wall,
+                opened_at=(
+                    now_wall if pending is None else pending.decided_at),
                 qty=matched,
                 entropy_avg_px=entropy_px,
                 hedge_avg_px=hedge_px,
@@ -1415,18 +1575,19 @@ class Engine:
                 if cfg.strategy_mode == "residual_dynamic":
                     self._load_dynamic_campaign()
                     self._load_pending_execution_state()
-                    try:
-                        reconcile_campaign(
-                            self.campaign,
-                            entropy_position=self.entropy.position,
-                            hedge_position=self.hedge.position,
-                            step=self._step,
-                            net_tolerance=cfg.net_tolerance_base,
-                        )
-                    except CampaignRecoveryError as exc:
-                        self._campaign_recovery_blocked = True
-                        self._auto_repair_disabled = True
-                        self._pause_for_recovery(str(exc))
+                    if self._startup_pending_execution is None:
+                        try:
+                            reconcile_campaign(
+                                self.campaign,
+                                entropy_position=self.entropy.position,
+                                hedge_position=self.hedge.position,
+                                step=self._step,
+                                net_tolerance=cfg.net_tolerance_base,
+                            )
+                        except CampaignRecoveryError as exc:
+                            self._campaign_recovery_blocked = True
+                            self._auto_repair_disabled = True
+                            self._pause_for_recovery(str(exc))
                 startup_net = sum(
                     v.position for v in self.venues.values())
                 if abs(startup_net) > cfg.net_tolerance_base:
@@ -1446,7 +1607,8 @@ class Engine:
                         name=f"reference-rest-{venue.key}"))
             if ((not self.record_only
                  or cfg.strategy_mode == "residual_dynamic")
-                    and not self._campaign_recovery_blocked):
+                    and (not self._campaign_recovery_blocked
+                         or self._startup_pending_execution is not None)):
                 if not self.record_only:
                     self._start_recorders(tasks)
                 self._track_task(
@@ -1774,6 +1936,16 @@ class Engine:
                     reason="POSITION_RECOVERY_REQUIRED", model=model),
                 now_wall=now_wall)
             return
+        if self._pending_execution_active():
+            self._pause_for_recovery(
+                "a dynamic execution journal is awaiting position "
+                "reconciliation")
+            self._record_dynamic_decision(
+                StrategyDecision(
+                    intent="SKIP", direction="",
+                    reason="PENDING_EXECUTION_RECOVERY", model=model),
+                now_wall=now_wall)
+            return
         decision = self._decide_dynamic(
             model=model, now_wall=now_wall, now_mono=now_mono)
         if decision.intent == "SKIP":
@@ -2058,15 +2230,36 @@ class Engine:
             if self.pending_execution_store is None:
                 raise RuntimeError(
                     "pending execution store is not initialized")
+            if self.pending_execution_store.load() is not None:
+                raise RuntimeError(
+                    "cannot overwrite an unfinished dynamic execution "
+                    "journal")
+            decided_at = time.time()
+            pending_campaign_id = (
+                uuid.uuid4().hex if self.campaign is None
+                else self.campaign.campaign_id)
+            expected_buy_px = decision.plan.buy_notional / decision.plan.qty
+            expected_sell_px = decision.plan.sell_notional / decision.plan.qty
             pending_state = PendingExecutionState(
                 execution_id=uuid.uuid4().hex,
                 identity=self._market_identity(),
                 intent=decision.intent,
                 direction=decision.direction,
-                campaign_id=(
-                    None if self.campaign is None
-                    else self.campaign.campaign_id),
+                campaign_id=pending_campaign_id,
                 qty=plan.qty,
+                decided_at=decided_at,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                entropy_expected_px=(
+                    expected_buy_px if buy.key == "entropy"
+                    else expected_sell_px),
+                hedge_expected_px=(
+                    expected_buy_px if buy.key == "hedge"
+                    else expected_sell_px),
+                entropy_fee_bps=self.entropy.fee_bps,
+                hedge_fee_bps=self.hedge.fee_bps,
+                campaign_before=self.campaign,
                 buy=self._pending_leg_state(buy, is_buy=True),
                 sell=self._pending_leg_state(sell, is_buy=False),
                 audit_ok=False,
@@ -2242,11 +2435,15 @@ class Engine:
                 sell_result=sinfo,
                 matched=matched,
                 now_wall=time.time(),
+                pending=pending_state,
             )
             pending_state = replace(
                 pending_state, campaign_applied=True)
             self.pending_execution_store.save(pending_state)
-            self._clear_pending_execution_if_safe(pending_state)
+            self._pending_snapshot_venues.update((buy.key, sell.key))
+            self._shutdown_reconcile_required = True
+            self._pause_for_recovery(
+                "dynamic execution awaits refreshed positions")
         elif dynamic_pending is not None:
             dynamic_pending.audit_ok = True
         if cancellation is not None:
@@ -2703,11 +2900,16 @@ class Engine:
                         dynamic.buy_result.filled_base,
                         dynamic.sell_result.filled_base),
                     now_wall=time.time(),
+                    pending=pending_execution,
                 )
                 pending_execution = replace(
                     pending_execution, campaign_applied=True)
                 self.pending_execution_store.save(pending_execution)
-                self._clear_pending_execution_if_safe(pending_execution)
+                self._pending_snapshot_venues.update(
+                    (dynamic.buy.key, dynamic.sell.key))
+                self._shutdown_reconcile_required = True
+                self._pause_for_recovery(
+                    "resolved dynamic execution awaits refreshed positions")
                 dynamic.applied = True
             except BaseException as exc:
                 self._auto_repair_disabled = True
@@ -2725,11 +2927,15 @@ class Engine:
         order_recovery = bool(
             self._post_order_recovery_active
             or self._pending_order_confirmations
-            or self._pending_snapshot_venues)
+            or self._pending_snapshot_venues
+            or self._startup_pending_execution is not None)
         try:
+            if not await self._resolve_startup_pending_execution():
+                return False
             if not await self._resolve_pending_orders():
                 return False
         except _OrderRecoveryInvariantError as exc:
+            startup_failure = self._startup_pending_execution is not None
             self._auto_repair_disabled = True
             manual = list(self._pending_order_confirmations)
             self._manual_order_confirmations.extend(manual)
@@ -2740,6 +2946,13 @@ class Engine:
                     ", ".join(
                         f"{item.venue.name}:{item.order_ref}"
                         for item in manual))
+            if startup_failure:
+                # No order was submitted by this process.  Keep the durable
+                # journal for manual recovery, but stop retrying an invariant
+                # that has already been classified as non-automatic so
+                # shutdown can release the live process lock.
+                self._startup_pending_execution = None
+                self._pending_snapshot_venues.clear()
             self._shutdown_reconcile_required = bool(
                 self._pending_snapshot_venues)
             self._residual_book_after.clear()
@@ -2770,11 +2983,26 @@ class Engine:
             self._residual_waiting_book_venues.clear()
             self._post_order_recovery_active = False
             return False
-        await self._maybe_hedge()
+        positions_were_refreshed = complete and not order_recovery
+        hedged = await self._maybe_hedge()
         net = sum(v.position for v in self.venues.values())
+        pending_execution = (
+            None if self.pending_execution_store is None
+            else self.pending_execution_store.load())
+        if (pending_execution is not None
+                and abs(net) <= self.cfg.net_tolerance_base
+                and (hedged or not positions_were_refreshed)):
+            complete = await self._reconcile_positions(
+                hedge=False, strict=strict)
+            if not complete:
+                return False
+            net = sum(v.position for v in self.venues.values())
         recovered = (generation == self._recovery_generation
                      and abs(net) <= self.cfg.net_tolerance_base
                      and self._reconcile_live_campaign())
+        if recovered and pending_execution is not None:
+            recovered = self._clear_pending_execution_if_safe(
+                pending_execution)
         if recovered:
             self._shutdown_reconcile_required = False
             self._recovery_required = False
