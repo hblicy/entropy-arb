@@ -205,8 +205,9 @@ def main() -> None:
     p.add_argument("--env-file", default=".env",
                    help="credentials file (default: .env)")
     p.add_argument("--record-only", action="store_true",
-                   help="only collect minute data, run no strategy, send no "
-                        "orders (needs no credentials)")
+                   help=("collect data and, in residual_dynamic mode, run "
+                         "the shadow strategy; send no orders (needs no "
+                         "credentials)"))
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()

@@ -202,6 +202,12 @@ Shadow and live state never share a file: the default live state is
 positions, then accepts the saved campaign only when its pair, direction and
 matched quantity agree. A missing/mismatched/corrupt state pauses dynamic
 trading for manual recovery; it is never reconstructed from positions.
+Every dynamic live submission also writes
+`logs/campaign-state.pending.json` before either leg can start. If that file
+contains an unfinished execution after a restart, live trading stays blocked
+until both exchange order histories and positions have been checked manually;
+the engine does not guess or resend the order. Only clear the pending state
+after that verification.
 Completing tests or replay is not authorization to set `live_enabled: true`.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
@@ -220,6 +226,12 @@ Running without `--record-only` uses real accounts. The fixed strategy can send
 as soon as both feeds are fresh and its band is crossed. The dynamic strategy
 also requires its independent live gate, ready model, persistence checks,
 reference checks, and campaign-state reconciliation.
+
+Live mode also holds an operating-system lock for the configured market and
+two account identities. A second process for that same combination exits
+before feeds or strategy tasks start. The lock is released automatically when
+the process exits; do not delete or bypass its file while another process may
+still be running. `--record-only` does not take this lock.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
@@ -332,6 +344,10 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   execution pathologies halt the engine entirely. An ambiguous order result
   freezes new entries until strict position reconciliation and any required
   reduce-only hedge leave the known net position within tolerance.
+- **Crash evidence and single instance**: dynamic live writes a non-secret
+  pending-execution journal before submission and fails closed when it finds
+  unfinished evidence at restart. An OS lock rejects a second live process for
+  the same accounts and market; record-only processes remain unaffected.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as
@@ -361,6 +377,8 @@ entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute bars + record-only signal lifecycles
 entropy_arb/strategy.py  rolling residual model and pure decisions
 entropy_arb/campaign.py  durable one-campaign state and reconciliation
+entropy_arb/recovery_state.py  durable pending-execution journal
+entropy_arb/live_lock.py cross-process live account/market lock
 tools/analyze.py         minute thresholds + optional campaign summary
 tools/replay_strategy.py read-only top-of-book strategy replay
 tests/                   python3 -m pytest tests/
