@@ -427,21 +427,28 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     end = time.time() if now_ts is None else float(now_ts)
     if not math.isfinite(end) or end < 0:
         raise ValueError("now_ts must be finite and non-negative")
-    signals = [row for row in signals if row["timestamp_ms"] / 1000 <= end]
+    available_signals = signals
     snapshot_times = [
         row["timestamp_ms"] / 1000.0
-        for row in signals
+        for row in available_signals
         if (row.get("event") or "").strip() == "snapshot"
+        and row["timestamp_ms"] / 1000.0 <= end
     ]
     has_snapshots = bool(snapshot_times)
     if has_snapshots:
         coverage_start = snapshot_times[0]
         signals = [
-            row for row in signals
-            if row["timestamp_ms"] / 1000.0 >= coverage_start
+            row for row in available_signals
+            if (coverage_start
+                <= row["timestamp_ms"] / 1000.0
+                <= end)
         ]
         approximation = SNAPSHOT_APPROXIMATION
     else:
+        signals = [
+            row for row in available_signals
+            if row["timestamp_ms"] / 1000.0 <= end
+        ]
         approximation = LEGACY_APPROXIMATION
     model = _make_model(config)
     strategy = _make_strategy(config)
@@ -598,10 +605,21 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     raw_sell = sum(
         row["direction"] == "sell_entropy" for row in lifecycle_rows)
     coverage_end = (
-        None if not signals else signals[-1]["timestamp_ms"] / 1000.0)
+        None if not available_signals
+        else available_signals[-1]["timestamp_ms"] / 1000.0)
+    coverage_timestamps = []
+    if has_snapshots:
+        for row in available_signals:
+            ts_ms = row["timestamp_ms"]
+            if ts_ms / 1000.0 < coverage_start:
+                continue
+            coverage_timestamps.append(ts_ms)
+            if ts_ms / 1000.0 >= end:
+                break
     timeline_gaps_ok = all(
         right - left <= 2_500.0
-        for left, right in zip(timestamps, timestamps[1:])
+        for left, right in zip(
+            coverage_timestamps, coverage_timestamps[1:])
     )
     timeline_complete = bool(
         has_snapshots
