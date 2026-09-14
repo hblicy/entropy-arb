@@ -1,8 +1,13 @@
+import csv
 import math
 
 import pytest
 
-from entropy_arb.strategy import ResidualModel
+from entropy_arb.strategy import (
+    MarketIdentity,
+    ResidualModel,
+    warm_start_residual_model,
+)
 
 
 def make_model(**overrides):
@@ -117,3 +122,117 @@ def test_model_rejects_invalid_observations(minute, residual, valid):
             residual_bps=residual,
             valid=valid,
         )
+
+
+HISTORY_HEADER = [
+    "minute_ts",
+    "entropy_symbol",
+    "entropy_dex",
+    "hedge_symbol",
+    "hedge_venue",
+    "entropy_reference_age_ms",
+    "hedge_reference_age_ms",
+    "reference_update_skew_ms",
+    "residual_close_bps",
+]
+
+
+def history_row(minute, residual="1", **overrides):
+    row = {
+        "minute_ts": str(minute * 60),
+        "entropy_symbol": "ANTH",
+        "entropy_dex": "io",
+        "hedge_symbol": "ANTHROPIC",
+        "hedge_venue": "lighter-rh",
+        "entropy_reference_age_ms": "100",
+        "hedge_reference_age_ms": "100",
+        "reference_update_skew_ms": "0",
+        "residual_close_bps": residual,
+    }
+    row.update(overrides)
+    return row
+
+
+def write_history(path, rows, header=HISTORY_HEADER):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_warm_start_filters_identity_age_skew_future_and_old_rows(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [
+        history_row(100, residual="1"),
+        history_row(101, residual="2", entropy_symbol="OTHER"),
+        history_row(102, residual="3", entropy_reference_age_ms="16000"),
+        history_row(103, residual="4", reference_update_skew_ms="16000"),
+        history_row(104, residual="nan"),
+        history_row(-100, residual="6"),
+        history_row(201, residual="5"),
+    ])
+    m = make_model(window_minutes=180, min_samples=1)
+
+    loaded = warm_start_residual_model(
+        m,
+        path=str(path),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=200,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    assert loaded.accepted == 1
+    assert loaded.rejected_identity == 1
+    assert loaded.rejected_reference == 2
+    assert loaded.rejected_value == 1
+    assert loaded.rejected_time == 2
+    assert m.snapshot(now_minute=200).samples == 1
+
+
+def test_warm_start_rejects_incompatible_header(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [], header=["minute_ts", "residual_close_bps"])
+
+    with pytest.raises(ValueError, match="minute history header"):
+        warm_start_residual_model(
+            make_model(),
+            path=str(path),
+            identity=MarketIdentity(
+                "ANTH", "io", "ANTHROPIC", "lighter-rh"),
+            now_minute=200,
+            max_age_sec=15,
+            max_skew_sec=15,
+        )
+
+
+def test_warm_start_missing_file_leaves_model_not_ready(tmp_path):
+    m = make_model()
+
+    loaded = warm_start_residual_model(
+        m,
+        path=str(tmp_path / "missing.csv"),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=200,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    assert loaded.accepted == 0
+    assert m.snapshot(now_minute=200).status == "MODEL_NOT_READY"
+
+
+def test_warm_start_counts_blank_identity_as_rejected_row(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [history_row(100, entropy_symbol="")])
+
+    loaded = warm_start_residual_model(
+        make_model(),
+        path=str(path),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=100,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    assert loaded.rejected_identity == 1

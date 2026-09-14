@@ -1,7 +1,9 @@
 """Exchange-independent dynamic residual strategy primitives."""
 from __future__ import annotations
 
+import csv
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -42,6 +44,33 @@ class ModelSnapshot:
         if self.q25_bps is None or self.q75_bps is None:
             return None
         return self.q75_bps - self.q25_bps
+
+
+@dataclass(frozen=True)
+class MarketIdentity:
+    entropy_symbol: str
+    entropy_dex: str
+    hedge_symbol: str
+    hedge_venue: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) and value.strip()
+                   for value in (
+                       self.entropy_symbol,
+                       self.entropy_dex,
+                       self.hedge_symbol,
+                       self.hedge_venue,
+                   )):
+            raise ValueError("market identity values must not be empty")
+
+
+@dataclass(frozen=True)
+class WarmStartResult:
+    accepted: int = 0
+    rejected_identity: int = 0
+    rejected_reference: int = 0
+    rejected_value: int = 0
+    rejected_time: int = 0
 
 
 class ResidualModel:
@@ -171,3 +200,100 @@ class ResidualModel:
         if main_iqr == 0:
             return median_shift > 0 or short_iqr > 0
         return median_shift > main_iqr or short_iqr > 2 * main_iqr
+
+
+_HISTORY_FIELDS = {
+    "minute_ts",
+    "entropy_symbol",
+    "entropy_dex",
+    "hedge_symbol",
+    "hedge_venue",
+    "entropy_reference_age_ms",
+    "hedge_reference_age_ms",
+    "reference_update_skew_ms",
+    "residual_close_bps",
+}
+
+
+def _finite_float(row: dict[str, str], field: str) -> float:
+    value = float(row[field])
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+def warm_start_residual_model(
+        model: ResidualModel, *, path: str, identity: MarketIdentity,
+        now_minute: int, max_age_sec: float,
+        max_skew_sec: float) -> WarmStartResult:
+    """Load recent, identity-matched, reference-valid minute closes."""
+    if (isinstance(now_minute, bool) or not isinstance(now_minute, int)
+            or now_minute < 0):
+        raise ValueError("now_minute must be a non-negative integer")
+    if any(not math.isfinite(value) or value <= 0
+           for value in (max_age_sec, max_skew_sec)):
+        raise ValueError("reference limits must be finite and positive")
+    if not os.path.exists(path):
+        return WarmStartResult()
+
+    accepted_rows: list[tuple[int, float]] = []
+    counts = {
+        "accepted": 0,
+        "rejected_identity": 0,
+        "rejected_reference": 0,
+        "rejected_value": 0,
+        "rejected_time": 0,
+    }
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        if not _HISTORY_FIELDS.issubset(set(reader.fieldnames or ())):
+            raise ValueError("minute history header is incompatible")
+        for row in reader:
+            try:
+                row_identity = MarketIdentity(
+                    (row.get("entropy_symbol") or "").strip(),
+                    (row.get("entropy_dex") or "").strip(),
+                    (row.get("hedge_symbol") or "").strip(),
+                    (row.get("hedge_venue") or "").strip(),
+                )
+            except ValueError:
+                counts["rejected_identity"] += 1
+                continue
+            if row_identity != identity:
+                counts["rejected_identity"] += 1
+                continue
+            try:
+                timestamp = _finite_float(row, "minute_ts")
+            except (KeyError, TypeError, ValueError):
+                counts["rejected_time"] += 1
+                continue
+            minute = math.floor(timestamp / 60.0)
+            first_minute = now_minute - model.window_minutes + 1
+            if timestamp < 0 or minute < first_minute or minute > now_minute:
+                counts["rejected_time"] += 1
+                continue
+            try:
+                entropy_age = _finite_float(
+                    row, "entropy_reference_age_ms")
+                hedge_age = _finite_float(row, "hedge_reference_age_ms")
+                skew = _finite_float(row, "reference_update_skew_ms")
+            except (KeyError, TypeError, ValueError):
+                counts["rejected_reference"] += 1
+                continue
+            if (min(entropy_age, hedge_age, skew) < 0
+                    or entropy_age > max_age_sec * 1000.0
+                    or hedge_age > max_age_sec * 1000.0
+                    or skew > max_skew_sec * 1000.0):
+                counts["rejected_reference"] += 1
+                continue
+            try:
+                residual = _finite_float(row, "residual_close_bps")
+            except (KeyError, TypeError, ValueError):
+                counts["rejected_value"] += 1
+                continue
+            accepted_rows.append((minute, residual))
+            counts["accepted"] += 1
+
+    for minute, residual in sorted(accepted_rows):
+        model.observe(minute=minute, residual_bps=residual, valid=True)
+    return WarmStartResult(**counts)
