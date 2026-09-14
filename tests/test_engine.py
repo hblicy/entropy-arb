@@ -23,6 +23,10 @@ from entropy_arb.campaign import (  # noqa: E402
 )
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
+from entropy_arb.live_lock import (  # noqa: E402
+    LiveProcessLock,
+    LiveProcessLockError,
+)
 from entropy_arb.models import OrderResult  # noqa: E402
 from entropy_arb.reference import (  # noqa: E402
     ReferenceAlertState,
@@ -68,6 +72,9 @@ class StubVenue:
 
     def ready_to_trade(self):
         return True
+
+    def account_lock_id(self):
+        return f"test-account:{self.key}"
 
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
@@ -914,6 +921,70 @@ def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
     finally:
         eng._shutdown_reconcile_required = False
         eng._close_dynamic_strategy()
+
+
+def test_live_process_lock_contention_fails_before_task_or_order_start(
+        tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        cfg.entropy.symbol = "LOCKTEST"
+        cfg.hedge.symbol = "LOCKTEST-HEDGE"
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=0.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=0.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        guard = LiveProcessLock.from_market(
+            eng._market_identity(),
+            venues["entropy"].account_lock_id(),
+            venues["hedge"].account_lock_id(),
+        )
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        guard.acquire()
+        try:
+            with pytest.raises(LiveProcessLockError, match="already running"):
+                await asyncio.wait_for(eng._run_inner(), timeout=0.3)
+        finally:
+            guard.release()
+            engine_module.create_venue = original
+
+        assert all(venue.send_calls == 0 for venue in venues.values())
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_record_only_engine_never_acquires_live_process_lock(tmp_path):
+    async def go():
+        cfg = make_cfg()
+        cfg.recorder_enabled = False
+        cfg.recorder_csv = str(tmp_path / "minutes.csv")
+        cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+        venues = {
+            "entropy": LifecycleVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                _wait_until(lambda: eng.markets_ready), timeout=0.3)
+            assert eng._live_lock is None
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def _wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
 
 
 def test_live_dynamic_waits_for_post_trade_books_before_adding(tmp_path):

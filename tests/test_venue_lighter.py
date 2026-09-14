@@ -3,7 +3,7 @@ import asyncio
 import aiohttp
 import pytest
 
-from entropy_arb.config import LighterProfile, VenueConf
+from entropy_arb.config import LighterCreds, LighterProfile, VenueConf
 from entropy_arb.reference import ReferenceState, ReferenceUpdate
 from entropy_arb.venue_lighter import (
     LighterVenue,
@@ -21,6 +21,18 @@ def test_lighter_venue_owns_reference_state():
     venue = LighterVenue(conf, object(), 5.0)
 
     assert isinstance(venue.reference, ReferenceState)
+
+
+def test_lighter_account_lock_id_uses_chain_and_account_not_api_key():
+    profile = LighterProfile("robinhood", "https://api", "wss://ws", 466324)
+    conf = VenueConf(
+        key="hedge", kind="lighter", label="RH", symbol="ANTHROPIC",
+        fee_bps=0.0, cap_usd=1000.0, orders_per_min=30,
+        lighter_profile=profile,
+        lighter_creds=LighterCreds(7, 3, "secret"))
+    venue = LighterVenue(conf, object(), 5.0)
+
+    assert venue.account_lock_id() == "lighter:466324:7"
 
 
 def test_lighter_rest_funding_converts_eight_hour_rate_to_hourly_bps():

@@ -36,6 +36,7 @@ from .campaign import (
     reconcile_campaign,
 )
 from .config import Config
+from .live_lock import LiveProcessLock
 from .models import OrderResult
 from .reference import (
     InvalidReference,
@@ -131,6 +132,7 @@ class Engine:
         self.pending_execution_store: Optional[PendingExecutionStore] = None
         self.campaign: Optional[PositionCampaign] = None
         self.model_warm_start = None
+        self._live_lock: Optional[LiveProcessLock] = None
         self._campaign_recovery_blocked = False
         self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
@@ -1299,6 +1301,13 @@ class Engine:
         if self.session is not None:
             await self._close_resource(
                 "HTTP session close", self.session.close)
+        if self._live_lock is not None:
+            try:
+                self._live_lock.release()
+            except BaseException as exc:
+                self._remember_error("live process lock release", exc)
+            finally:
+                self._live_lock = None
 
     async def _close_resource(self, label: str, close) -> None:
         task = asyncio.create_task(close(), name=f"close-{label}")
@@ -1358,6 +1367,13 @@ class Engine:
                 self.entropy.init_signer()
                 self.hedge.init_signer()
             self.entropy.configure_peer(self.hedge)
+            if live:
+                self._live_lock = LiveProcessLock.from_market(
+                    self._market_identity(),
+                    self.entropy.account_lock_id(),
+                    self.hedge.account_lock_id(),
+                )
+                self._live_lock.acquire()
 
             self._step = 10 ** -min(
                 self.entropy.size_decimals, self.hedge.size_decimals)

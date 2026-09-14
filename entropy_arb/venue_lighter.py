@@ -408,6 +408,13 @@ class LighterVenue:
         """Lighter deployments do not share Hyperliquid account state."""
         return
 
+    def account_lock_id(self) -> str:
+        c = self.conf.lighter_creds
+        if c is None or c.account_index is None:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        return f"lighter:{self.profile.chain_id}:{c.account_index}"
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         def book_notify() -> None:
             notify("book", self.key)

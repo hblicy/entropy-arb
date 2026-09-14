@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -16,6 +17,16 @@ def test_hl_venue_owns_reference_state():
     venue = HLVenue(conf, "https://api", "wss://ws", object(), 5.0)
 
     assert isinstance(venue.reference, ReferenceState)
+
+
+def test_hl_account_lock_id_uses_initialized_query_address():
+    conf = VenueConf(
+        key="entropy", kind="hl", label="ENTROPY", symbol="ANTH",
+        fee_bps=0.9, cap_usd=1000.0, orders_per_min=120, hl_dex="io")
+    venue = HLVenue(conf, "https://api", "wss://ws", object(), 5.0)
+    venue.account = SimpleNamespace(query_address="0xabc123")
+
+    assert venue.account_lock_id() == "hl:0xabc123"
 
 
 def test_hl_rest_asset_context_converts_hourly_fraction_to_bps():

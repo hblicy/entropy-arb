@@ -197,6 +197,13 @@ class HLVenue:
         if address and address == other._query_address():
             other.include_core_equity = False
 
+    def account_lock_id(self) -> str:
+        address = self._query_address()
+        if not address:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        return f"hl:{address.lower()}"
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         def book_notify() -> None:
             notify("book", self.key)
