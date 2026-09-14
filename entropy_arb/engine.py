@@ -27,7 +27,7 @@ from typing import Dict, List, Optional
 
 import aiohttp
 
-from .book import ArbPlan, floor_step, plan_arb
+from .book import ArbPlan, floor_step, plan_arb, walk_depth
 from .campaign import (
     CampaignRecoveryError,
     CampaignStateError,
@@ -576,11 +576,29 @@ class Engine:
             entropy_position = self.entropy.position
             hedge_position = self.hedge.position
         if direction == "sell_entropy":
-            entropy_room = self.entropy.cap_usd + entropy_position * entropy_mid
-            hedge_room = self.hedge.cap_usd - hedge_position * hedge_mid
+            entropy_room_base = (
+                self.entropy.cap_usd / entropy_mid + entropy_position)
+            hedge_room_base = (
+                self.hedge.cap_usd / hedge_mid - hedge_position)
+            entropy_levels = self.entropy.book.sorted_bids()
+            hedge_levels = self.hedge.book.sorted_asks()
         else:
-            entropy_room = self.entropy.cap_usd - entropy_position * entropy_mid
-            hedge_room = self.hedge.cap_usd + hedge_position * hedge_mid
+            entropy_room_base = (
+                self.entropy.cap_usd / entropy_mid - entropy_position)
+            hedge_room_base = (
+                self.hedge.cap_usd / hedge_mid + hedge_position)
+            entropy_levels = self.entropy.book.sorted_asks()
+            hedge_levels = self.hedge.book.sorted_bids()
+
+        def capacity_notional(levels, room_base: float) -> float:
+            if not levels or room_base <= 0:
+                return 0.0
+            quantity = min(room_base, sum(size for _, size in levels))
+            return walk_depth(levels, quantity)[1]
+
+        entropy_room = capacity_notional(
+            entropy_levels, entropy_room_base)
+        hedge_room = capacity_notional(hedge_levels, hedge_room_base)
         return max(0.0, min(
             self.cfg.max_order_notional, entropy_room, hedge_room))
 

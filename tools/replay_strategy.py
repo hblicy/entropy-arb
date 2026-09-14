@@ -14,13 +14,13 @@ import os
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from entropy_arb.book import OrderBook  # noqa: E402
+from entropy_arb.book import OrderBook, walk_depth  # noqa: E402
 from entropy_arb.campaign import PositionCampaign  # noqa: E402
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.slippage import SlippageModel  # noqa: E402
@@ -56,6 +56,7 @@ class ReplayResult:
     approximation: str
     minute_rows: int
     signal_rows: int
+    actions: int
     timestamps_monotonic: bool
     raw_buy_coverage: float
     raw_sell_coverage: float
@@ -71,6 +72,7 @@ class ReplayResult:
     hold_p95_seconds: Optional[float]
     hold_max_seconds: Optional[float]
     max_planned_leg_notional: float
+    max_accumulated_leg_notional: float
     max_slippage_budget_bps: float
     reference_gate_rejects: int
     invalid_reference_entries: int
@@ -228,7 +230,10 @@ def _book(bid: Optional[float], ask: Optional[float], notional: float,
     return book
 
 
-def _signal_market(row: dict, config) -> tuple[MarketView, bool]:
+def _signal_market(
+        row: dict, config, *,
+        entry_cap_notional: Optional[float] = None,
+) -> tuple[MarketView, bool]:
     values = {
         field: _finite(row, field)
         for field in (
@@ -244,7 +249,9 @@ def _signal_market(row: dict, config) -> tuple[MarketView, bool]:
     for field in ("planned_notional_usd", "crossable_notional_usd"):
         value = values[field]
         caps.append(value if value is not None and value > 0 else 0.0)
-    cap = min(caps)
+    recorded_cap = min(caps)
+    cap = recorded_cap if entry_cap_notional is None else min(
+        recorded_cap, max(entry_cap_notional, 0.0))
     book_limit_ms = config.staleness_sec * 1000.0
     books_ready = (
         values["entropy_book_age_ms"] is not None
@@ -253,7 +260,7 @@ def _signal_market(row: dict, config) -> tuple[MarketView, bool]:
         and values["hedge_book_age_ms"] <= book_limit_ms
         and values["entropy_book_age_ms"] >= 0
         and values["hedge_book_age_ms"] >= 0
-        and cap > 0)
+            and recorded_cap > 0)
     reference_valid = (
         values["entropy_oracle_px"] is not None
         and values["hedge_index_px"] is not None
@@ -273,10 +280,10 @@ def _signal_market(row: dict, config) -> tuple[MarketView, bool]:
         <= config.strategy_entry_reference_max_skew_sec * 1000.0)
     return MarketView(
         entropy_book=_book(
-            values["entropy_bid"], values["entropy_ask"], cap,
+            values["entropy_bid"], values["entropy_ask"], recorded_cap,
             config.take_fraction),
         hedge_book=_book(
-            values["hedge_bid"], values["hedge_ask"], cap,
+            values["hedge_bid"], values["hedge_ask"], recorded_cap,
             config.take_fraction),
         entropy_oracle_px=values["entropy_oracle_px"],
         hedge_index_px=values["hedge_index_px"],
@@ -298,6 +305,46 @@ def _signal_market(row: dict, config) -> tuple[MarketView, bool]:
         min_notional=config.min_order_notional,
         size_step=1e-12,
     ), reference_valid
+
+
+def _entry_headroom(config, campaign: Optional[PositionCampaign],
+                    direction: str, market: MarketView) -> float:
+    entropy_mid = market.entropy_book.mid()
+    hedge_mid = market.hedge_book.mid()
+    if entropy_mid is None or hedge_mid is None:
+        return 0.0
+    sign = 0.0
+    quantity = 0.0
+    if campaign is not None:
+        sign = -1.0 if campaign.direction == "sell_entropy" else 1.0
+        quantity = campaign.qty
+    entropy_position = sign * quantity
+    hedge_position = -sign * quantity
+    if direction == "sell_entropy":
+        entropy_room_base = (
+            config.entropy.cap_usd / entropy_mid + entropy_position)
+        hedge_room_base = (
+            config.hedge.cap_usd / hedge_mid - hedge_position)
+        entropy_levels = market.entropy_book.sorted_bids()
+        hedge_levels = market.hedge_book.sorted_asks()
+    else:
+        entropy_room_base = (
+            config.entropy.cap_usd / entropy_mid - entropy_position)
+        hedge_room_base = (
+            config.hedge.cap_usd / hedge_mid + hedge_position)
+        entropy_levels = market.entropy_book.sorted_asks()
+        hedge_levels = market.hedge_book.sorted_bids()
+
+    def capacity_notional(levels, room_base: float) -> float:
+        if not levels or room_base <= 0:
+            return 0.0
+        quantity = min(room_base, sum(size for _, size in levels))
+        return walk_depth(levels, quantity)[1]
+
+    entropy_room = capacity_notional(entropy_levels, entropy_room_base)
+    hedge_room = capacity_notional(hedge_levels, hedge_room_base)
+    return max(0.0, min(
+        config.max_order_notional, entropy_room, hedge_room))
 
 
 def _apply_shadow(
@@ -368,6 +415,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     model = _make_model(config)
     strategy = _make_strategy(config)
     minute_index = 0
+    last_model_minute = None
     campaign = None
     raw_buy = 0
     entry_decisions = 0
@@ -379,12 +427,26 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     reference_rejects = 0
     invalid_reference_entries = 0
     reverse_campaigns = 0
+    actions = 0
+    max_accumulated_notional = 0.0
+    last_action_ts = float("-inf")
+    armed = {"sell_entropy": None, "buy_entropy": None}
+
+    def clear_armed() -> None:
+        for direction in armed:
+            armed[direction] = None
 
     for row in signals:
         ts = row["timestamp_ms"] / 1000.0
+        closed_minute = int(ts // 60) - 1
         while (minute_index < len(minutes)
-               and minutes[minute_index]["timestamp"] + 60.0 <= ts):
+               and minutes[minute_index]["minute"] <= closed_minute):
             minute = minutes[minute_index]
+            if last_model_minute is not None:
+                for missing in range(
+                        last_model_minute + 1, minute["minute"]):
+                    model.observe(
+                        minute=missing, residual_bps=None, valid=False)
             ages = (minute["entropy_age_ms"], minute["hedge_age_ms"])
             valid = (
                 minute["residual"] is not None
@@ -400,7 +462,13 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
                 residual_bps=minute["residual"],
                 valid=valid,
             )
+            last_model_minute = minute["minute"]
             minute_index += 1
+        if last_model_minute is not None:
+            for missing in range(last_model_minute + 1, closed_minute + 1):
+                model.observe(
+                    minute=missing, residual_bps=None, valid=False)
+                last_model_minute = missing
 
         raw_buy += row["direction"] == "buy_entropy"
         market, reference_valid = _signal_market(row, config)
@@ -415,8 +483,39 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         )
         if decision.reason.startswith("REFERENCE_"):
             reference_rejects += 1
+        if decision.intent in {"OPEN", "ADD"}:
+            headroom = _entry_headroom(
+                config, campaign, decision.direction, market)
+            if headroom < market.entry_cap_notional:
+                limited_market = replace(
+                    market, entry_cap_notional=headroom)
+                decision = strategy.decide(
+                    market=limited_market,
+                    model=snapshot,
+                    campaign=campaign,
+                    now_wall=ts,
+                    now_mono=ts,
+                )
         if decision.intent not in {"OPEN", "ADD", "CLOSE", "FORCED_CLOSE"}:
+            clear_armed()
             continue
+        if decision.intent in {"OPEN", "ADD"}:
+            if ts - last_action_ts < config.cooldown_sec:
+                clear_armed()
+                continue
+            delay = config.premium_persist_sec
+            if delay > 0:
+                direction = decision.direction
+                other = (
+                    "buy_entropy" if direction == "sell_entropy"
+                    else "sell_entropy")
+                armed[other] = None
+                if armed[direction] is None:
+                    armed[direction] = ts
+                    continue
+                if ts - armed[direction] < delay:
+                    continue
+        clear_armed()
         if decision.intent in {"OPEN", "ADD"}:
             entry_decisions += 1
             invalid_reference_entries += not reference_valid
@@ -433,6 +532,16 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
                 max_slippage = max(max_slippage, budget)
         campaign = _apply_shadow(
             campaign, decision, signal_identity, ts, config)
+        actions += 1
+        last_action_ts = ts
+        if campaign is not None:
+            entropy_mid = market.entropy_book.mid()
+            hedge_mid = market.hedge_book.mid()
+            max_accumulated_notional = max(
+                max_accumulated_notional,
+                campaign.qty * entropy_mid,
+                campaign.qty * hedge_mid,
+            )
         if decision.intent == "OPEN":
             opened += 1
         if prior is not None and campaign is None:
@@ -451,6 +560,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         approximation=APPROXIMATION,
         minute_rows=len(minutes),
         signal_rows=total,
+        actions=actions,
         timestamps_monotonic=all(
             left <= right for left, right in zip(timestamps, timestamps[1:])),
         raw_buy_coverage=(raw_buy / total if total else 0.0),
@@ -467,6 +577,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         hold_p95_seconds=_percentile(holds, .95),
         hold_max_seconds=max(holds) if holds else None,
         max_planned_leg_notional=max_notional,
+        max_accumulated_leg_notional=max_accumulated_notional,
         max_slippage_budget_bps=max_slippage,
         reference_gate_rejects=reference_rejects,
         invalid_reference_entries=invalid_reference_entries,
@@ -505,6 +616,7 @@ def main() -> None:
     )
     print(f"\n=== dynamic residual replay ({result.approximation}) ===")
     print(f"minutes: {result.minute_rows}  signals: {result.signal_rows}")
+    print(f"simulated actions: {result.actions}")
     print(f"raw direction coverage: buy={result.raw_buy_coverage:.1%} "
           f"sell={result.raw_sell_coverage:.1%}")
     print(f"residual entry coverage: {result.residual_open_coverage:.1%}")
@@ -521,6 +633,8 @@ def main() -> None:
           f"max={_format_optional(result.hold_max_seconds)}")
     print(f"max planned leg notional: "
           f"${result.max_planned_leg_notional:.2f}")
+    print(f"max accumulated leg notional: "
+          f"${result.max_accumulated_leg_notional:.2f}")
     print(f"max slippage budget: {result.max_slippage_budget_bps:.2f} bps")
     print(f"reference rejects: {result.reference_gate_rejects}  "
           f"invalid-reference entries: {result.invalid_reference_entries}")

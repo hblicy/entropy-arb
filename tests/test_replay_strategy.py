@@ -73,8 +73,8 @@ def write_signals(path, rows):
     return path
 
 
-def replay_config():
-    return SimpleNamespace(
+def replay_config(**overrides):
+    values = dict(
         strategy_window_minutes=10,
         strategy_min_samples=4,
         strategy_lower_quantile=.10,
@@ -98,9 +98,13 @@ def replay_config():
         min_order_notional=10.0,
         take_fraction=.5,
         staleness_sec=5.0,
-        entropy=SimpleNamespace(fee_bps=.9),
-        hedge=SimpleNamespace(fee_bps=0.0),
+        premium_persist_sec=0.0,
+        cooldown_sec=0.0,
+        entropy=SimpleNamespace(fee_bps=.9, cap_usd=1000.0),
+        hedge=SimpleNamespace(fee_bps=0.0, cap_usd=1000.0),
     )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def test_replay_merges_gzip_signals_and_minutes_chronologically(tmp_path):
@@ -148,6 +152,64 @@ def test_replay_reports_coverage_and_campaign_invariants(tmp_path):
     assert result.max_planned_leg_notional <= 500
     assert result.max_slippage_budget_bps <= 20
     assert result.invalid_reference_entries == 0
+
+
+def test_replay_requires_entry_persistence(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    signals = write_signals(tmp_path / "signals.csv.gz", [
+        signal_row(300_000, "sell_entropy", 45, "s1"),
+        signal_row(302_000, "sell_entropy", 45, "s2"),
+    ])
+
+    result = replay_files(
+        minutes_path=str(minutes), signal_paths=[str(signals)],
+        config=replay_config(premium_persist_sec=3.0), now_ts=400.0)
+
+    assert result.campaigns_opened == 0
+    assert result.actions == 0
+
+
+def test_replay_applies_action_cooldown(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    signals = write_signals(tmp_path / "signals.csv.gz", [
+        signal_row(300_000 + index * 1000, "sell_entropy", 45, f"s{index}")
+        for index in range(10)
+    ])
+
+    result = replay_files(
+        minutes_path=str(minutes), signal_paths=[str(signals)],
+        config=replay_config(cooldown_sec=60.0), now_ts=400.0)
+
+    assert result.campaigns_opened == 1
+    assert result.actions == 1
+
+
+def test_replay_never_exceeds_accumulated_position_cap(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    signals = write_signals(tmp_path / "signals.csv.gz", [
+        signal_row(300_000 + index * 1000, "sell_entropy", 45, f"s{index}")
+        for index in range(20)
+    ])
+
+    result = replay_files(
+        minutes_path=str(minutes), signal_paths=[str(signals)],
+        config=replay_config(), now_ts=400.0)
+
+    assert result.max_accumulated_leg_notional <= 1000.0 + 1e-6
+
+
+def test_replay_inserts_missing_minutes_before_signal(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    signals = write_signals(tmp_path / "signals.csv.gz", [
+        signal_row(540_000, "sell_entropy", 45, "after-gap"),
+    ])
+
+    result = replay_files(
+        minutes_path=str(minutes), signal_paths=[str(signals)],
+        config=replay_config(), now_ts=700.0)
+
+    assert result.campaigns_opened == 0
+    assert result.actions == 0
 
 
 def test_replay_rejects_mixed_signal_pair_identity(tmp_path):

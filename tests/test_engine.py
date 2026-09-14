@@ -432,6 +432,30 @@ def test_dynamic_shadow_adds_never_exceed_cumulative_venue_caps(tmp_path):
     asyncio.run(go())
 
 
+def test_dynamic_entry_cap_converts_mid_headroom_through_sell_book(tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        eng.entropy.cap_usd = 10_000.0
+        eng.hedge.cap_usd = 1_000.0
+        eng.entropy.set_book(100.0, 100.1, sz=50.0)
+        eng.hedge.set_book(99.9, 100.0, sz=50.0)
+        eng.campaign = __import__("dataclasses").replace(
+            dynamic_live_campaign(),
+            mode="shadow",
+            direction="buy_entropy",
+            qty=9.5,
+        )
+        hedge_mid = eng.hedge.book.mid()
+        remaining_base = eng.hedge.cap_usd / hedge_mid - eng.campaign.qty
+        safe_sell_notional = remaining_base * eng.hedge.book.best_bid()
+
+        cap = eng._dynamic_entry_cap("buy_entropy")
+
+        assert cap <= safe_sell_notional + 1e-9
+    finally:
+        eng._close_dynamic_strategy()
+
+
 def test_dynamic_add_persistence_restarts_after_signal_disappears(tmp_path):
     async def go():
         eng = make_dynamic_engine(tmp_path)
