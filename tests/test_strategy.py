@@ -94,6 +94,20 @@ def test_five_missing_real_minutes_marks_unstable_then_recovers():
     assert m.snapshot(now_minute=199).status == "READY"
 
 
+def test_same_minute_replacement_does_not_advance_regime_recovery():
+    model = make_model()
+    seed(model, [float(index % 5) for index in range(180)])
+    seed(model, [None] * 5, start=180)
+    assert model.snapshot(now_minute=184).status == "REGIME_UNSTABLE"
+
+    for value in range(15):
+        model.observe(minute=185, residual_bps=float(value), valid=True)
+    assert model.snapshot(now_minute=185).status == "REGIME_UNSTABLE"
+
+    seed(model, [2.0] * 14, start=186)
+    assert model.snapshot(now_minute=199).status == "READY"
+
+
 def test_short_window_median_shift_marks_regime_unstable():
     m = make_model()
     seed(m, [0.0] * 149 + [100.0] * 31)
@@ -194,6 +208,37 @@ def test_warm_start_filters_identity_age_skew_future_and_old_rows(tmp_path):
     assert loaded.rejected_value == 1
     assert loaded.rejected_time == 2
     assert m.snapshot(now_minute=200).samples == 1
+
+
+def test_warm_start_last_duplicate_wins_and_excludes_current_minute(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [
+        history_row(198, residual="1"),
+        history_row(198, residual="9"),
+        history_row(199, residual="3"),
+        history_row(200, residual="7"),
+    ])
+    model = make_model(
+        window_minutes=10,
+        min_samples=1,
+        regime_window_minutes=2,
+        recovery_minutes=1,
+    )
+
+    loaded = warm_start_residual_model(
+        model,
+        path=str(path),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=200,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    snapshot = model.snapshot(now_minute=200)
+    assert loaded.accepted == 2
+    assert loaded.rejected_time == 1
+    assert snapshot.samples == 2
+    assert snapshot.median_bps == pytest.approx(6.0)
 
 
 def test_warm_start_rejects_incompatible_header(tmp_path):

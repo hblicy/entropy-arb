@@ -135,7 +135,7 @@ class ResidualModel:
         previous_latest = self._latest_minute
         self._latest_minute = max(self._latest_minute, minute)
         self._drop_expired(self._latest_minute)
-        if minute < previous_latest:
+        if minute <= previous_latest:
             return
         instant_unstable = self._instant_unstable(self._latest_minute)
         if instant_unstable:
@@ -242,7 +242,7 @@ def warm_start_residual_model(
     if not os.path.exists(path):
         return WarmStartResult()
 
-    accepted_rows: list[tuple[int, float]] = []
+    accepted_rows: dict[int, float] = {}
     counts = {
         "accepted": 0,
         "rejected_identity": 0,
@@ -275,7 +275,7 @@ def warm_start_residual_model(
                 continue
             minute = math.floor(timestamp / 60.0)
             first_minute = now_minute - model.window_minutes + 1
-            if timestamp < 0 or minute < first_minute or minute > now_minute:
+            if timestamp < 0 or minute < first_minute or minute >= now_minute:
                 counts["rejected_time"] += 1
                 continue
             try:
@@ -297,11 +297,11 @@ def warm_start_residual_model(
             except (KeyError, TypeError, ValueError):
                 counts["rejected_value"] += 1
                 continue
-            accepted_rows.append((minute, residual))
-            counts["accepted"] += 1
+            accepted_rows[minute] = residual
 
     previous_minute = None
-    for minute, residual in sorted(accepted_rows):
+    counts["accepted"] = len(accepted_rows)
+    for minute, residual in sorted(accepted_rows.items()):
         if previous_minute is not None:
             for missing in range(previous_minute + 1, minute):
                 model.observe(
