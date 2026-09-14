@@ -175,7 +175,7 @@ def reconcile_campaign(
     common_step = _finite("step", step, positive=True)
     tolerance = _finite(
         "net_tolerance", net_tolerance, nonnegative=True)
-    leg_tolerance = max(common_step, tolerance)
+    leg_tolerance = min(common_step / 2.0, max(tolerance, 1e-12))
 
     if campaign is None:
         if (abs(entropy) <= leg_tolerance

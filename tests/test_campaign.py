@@ -202,6 +202,17 @@ def test_reconcile_allows_flat_without_state():
     assert result.reason == ""
 
 
+def test_reconcile_rejects_one_whole_size_step_as_flat():
+    with pytest.raises(CampaignRecoveryError, match="no saved campaign"):
+        reconcile_campaign(
+            None,
+            entropy_position=0.01,
+            hedge_position=-0.01,
+            step=0.01,
+            net_tolerance=0.001,
+        )
+
+
 @pytest.mark.parametrize(
     ("direction", "entropy_position", "hedge_position"),
     [

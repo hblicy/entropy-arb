@@ -2323,7 +2323,33 @@ class Engine:
                     and all(result is True for result in got))
         if hedge and complete:
             await self._maybe_hedge()
+            if (abs(sum(v.position for v in self.venues.values()))
+                    <= self.cfg.net_tolerance_base
+                    and not self._reconcile_live_campaign()):
+                return False
         return complete
+
+    def _reconcile_live_campaign(self) -> bool:
+        if (self.record_only
+                or self.cfg.strategy_mode != "residual_dynamic"):
+            return True
+        try:
+            reconcile_campaign(
+                self.campaign,
+                entropy_position=self.entropy.position,
+                hedge_position=self.hedge.position,
+                step=self._step,
+                net_tolerance=self.cfg.net_tolerance_base,
+            )
+        except CampaignRecoveryError as exc:
+            self._campaign_recovery_blocked = True
+            self._auto_repair_disabled = True
+            self._pause_for_recovery(str(exc))
+            log.critical(
+                "dynamic campaign does not match refreshed positions; "
+                "manual recovery required: %s", exc)
+            return False
+        return True
 
     async def _reconcile_venue(self, v, strict: bool) -> bool:
         async with self._vlock(v.key):
@@ -2559,7 +2585,8 @@ class Engine:
         await self._maybe_hedge()
         net = sum(v.position for v in self.venues.values())
         recovered = (generation == self._recovery_generation
-                     and abs(net) <= self.cfg.net_tolerance_base)
+                     and abs(net) <= self.cfg.net_tolerance_base
+                     and self._reconcile_live_campaign())
         if recovered:
             self._shutdown_reconcile_required = False
             self._recovery_required = False

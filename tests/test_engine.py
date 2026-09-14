@@ -753,6 +753,61 @@ def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
     asyncio.run(go())
 
 
+def test_periodic_reconcile_blocks_zero_net_campaign_mismatch(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.campaign = dynamic_live_campaign()
+        eng.campaign_store.save(eng.campaign)
+        eng.entropy.position = -1.0
+        eng.hedge.position = 1.0
+        eng.entropy.chain_position = -0.5
+        eng.hedge.chain_position = 0.5
+        try:
+            complete = await eng._reconcile_positions(
+                hedge=True, strict=True)
+
+            assert complete is False
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_post_repair_flat_positions_cannot_resume_with_stale_campaign(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.campaign = __import__("dataclasses").replace(
+            dynamic_live_campaign(), qty=0.3)
+        eng.campaign_store.save(eng.campaign)
+        eng.entropy.position = 0.0
+        eng.hedge.position = 0.0
+        eng.entropy.chain_position = 0.0
+        eng.hedge.chain_position = 0.0
+        eng._recovery_required = True
+        try:
+            recovered = await eng._recover_positions(strict=True)
+
+            assert recovered is False
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert eng.campaign.qty == pytest.approx(0.3)
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
 def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
