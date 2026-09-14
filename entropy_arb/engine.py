@@ -49,6 +49,13 @@ from .recorder import (
     csv_tail_complete,
     next_archive_path,
 )
+from .recovery_state import (
+    PendingExecutionState,
+    PendingExecutionStateError,
+    PendingExecutionStore,
+    PendingLegState,
+    pending_execution_path,
+)
 from .slippage import SlippageModel
 from .strategy import (
     DynamicResidualStrategy,
@@ -95,6 +102,7 @@ class _PendingOrderConfirmation:
 
 @dataclass
 class _PendingDynamicExecution:
+    execution_id: str
     decision: StrategyDecision
     buy: VenueAdapter
     sell: VenueAdapter
@@ -120,6 +128,7 @@ class Engine:
         self.residual_model: Optional[ResidualModel] = None
         self.dynamic_strategy: Optional[DynamicResidualStrategy] = None
         self.campaign_store: Optional[CampaignStore] = None
+        self.pending_execution_store: Optional[PendingExecutionStore] = None
         self.campaign: Optional[PositionCampaign] = None
         self.model_warm_start = None
         self._campaign_recovery_blocked = False
@@ -484,6 +493,9 @@ class Engine:
         )
         self.campaign_store = CampaignStore(
             cfg.strategy_state_file, shadow=self.record_only)
+        if not self.record_only:
+            self.pending_execution_store = PendingExecutionStore(
+                pending_execution_path(cfg.strategy_state_file))
         if self.record_only:
             self._load_dynamic_campaign()
         self.strategy_events = StrategyEventRecorder(
@@ -511,6 +523,90 @@ class Engine:
                 and self.campaign.mode != expected_mode):
             raise CampaignStateError(
                 "saved campaign mode does not match engine mode")
+
+    def _load_pending_execution_state(self) -> None:
+        if self.pending_execution_store is None:
+            return
+        pending = self.pending_execution_store.load()
+        if pending is None:
+            return
+        if pending.identity != self._market_identity():
+            raise PendingExecutionStateError(
+                "saved pending execution market identity does not match "
+                "config")
+        self._campaign_recovery_blocked = True
+        self._auto_repair_disabled = True
+        self._pause_for_recovery(
+            f"pending dynamic execution {pending.execution_id} requires "
+            "manual exchange-order and position verification")
+        log.critical(
+            "saved pending dynamic execution blocks live trading: "
+            "execution=%s intent=%s buy_ref=%s sell_ref=%s; verify both "
+            "exchange orders and positions before clearing %s",
+            pending.execution_id, pending.intent,
+            pending.buy.order_ref or "<not-recorded>",
+            pending.sell.order_ref or "<not-recorded>",
+            self.pending_execution_store.path,
+        )
+
+    @staticmethod
+    def _pending_leg_state(venue, *, is_buy: bool,
+                           result: Optional[OrderResult] = None,
+                           applied_fill: float = 0.0) -> PendingLegState:
+        if result is None:
+            return PendingLegState(
+                venue_key=venue.key, is_buy=is_buy, order_ref=None,
+                status="sending", filled_base=0.0, avg_px=None,
+                applied_fill=0.0, unresolved=True)
+        return PendingLegState(
+            venue_key=venue.key,
+            is_buy=is_buy,
+            order_ref=result.order_ref,
+            status=result.status,
+            filled_base=result.filled_base,
+            avg_px=result.avg_px,
+            applied_fill=applied_fill,
+            unresolved=result.unresolved,
+        )
+
+    def _pending_execution_with_results(
+            self, pending: PendingExecutionState, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult,
+            audit_ok: bool, campaign_applied: bool) -> PendingExecutionState:
+        return replace(
+            pending,
+            buy=self._pending_leg_state(
+                buy, is_buy=True, result=buy_result,
+                applied_fill=buy_result.filled_base),
+            sell=self._pending_leg_state(
+                sell, is_buy=False, result=sell_result,
+                applied_fill=sell_result.filled_base),
+            audit_ok=audit_ok,
+            campaign_applied=campaign_applied,
+        )
+
+    def _load_matching_pending_execution(
+            self, execution_id: str) -> PendingExecutionState:
+        if self.pending_execution_store is None:
+            raise RuntimeError("pending execution store is not initialized")
+        pending = self.pending_execution_store.load()
+        if pending is None or pending.execution_id != execution_id:
+            raise _OrderRecoveryInvariantError(
+                "pending dynamic execution journal is missing or changed")
+        return pending
+
+    def _clear_pending_execution_if_safe(
+            self, pending: PendingExecutionState) -> bool:
+        if self.pending_execution_store is None:
+            raise RuntimeError("pending execution store is not initialized")
+        if (pending.buy.unresolved or pending.sell.unresolved
+                or not pending.audit_ok or not pending.campaign_applied
+                or abs(sum(v.position for v in self.venues.values()))
+                > self.cfg.net_tolerance_base
+                or not self._reconcile_live_campaign()):
+            return False
+        self.pending_execution_store.save(None)
+        return True
 
     def _close_dynamic_strategy(self) -> None:
         if self.strategy_events is not None:
@@ -1302,6 +1398,7 @@ class Engine:
                     sum(v.position for v in self.venues.values()))
                 if cfg.strategy_mode == "residual_dynamic":
                     self._load_dynamic_campaign()
+                    self._load_pending_execution_state()
                     try:
                         reconcile_campaign(
                             self.campaign,
@@ -1940,6 +2037,28 @@ class Engine:
             sell_bound = sell.px_round(
                 decision_best_bid / (1 + sell_slippage_bps / 1e4),
                 round_up=True)
+        pending_state = None
+        if decision is not None:
+            if self.pending_execution_store is None:
+                raise RuntimeError(
+                    "pending execution store is not initialized")
+            pending_state = PendingExecutionState(
+                execution_id=uuid.uuid4().hex,
+                identity=self._market_identity(),
+                intent=decision.intent,
+                direction=decision.direction,
+                campaign_id=(
+                    None if self.campaign is None
+                    else self.campaign.campaign_id),
+                qty=plan.qty,
+                buy=self._pending_leg_state(buy, is_buy=True),
+                sell=self._pending_leg_state(sell, is_buy=False),
+                audit_ok=False,
+                campaign_applied=False,
+            )
+            # The durable marker must exist before either submission coroutine
+            # can start.  A persistence failure therefore sends no order.
+            self.pending_execution_store.save(pending_state)
         self._record_send(buy)
         self._record_send(sell)
         order_submitted_at = {}
@@ -1985,6 +2104,7 @@ class Engine:
         dynamic_pending = None
         if decision is not None and (binfo.unresolved or sinfo.unresolved):
             dynamic_pending = _PendingDynamicExecution(
+                execution_id=pending_state.execution_id,
                 decision=decision,
                 buy=buy,
                 sell=sell,
@@ -2014,6 +2134,17 @@ class Engine:
             spx = sinfo.avg_px or plan.sell_limit
             sell.cash += sfill * spx * (1 - plan.sell_fee)
             sell.volume_usd += sfill * spx
+        if pending_state is not None:
+            pending_state = self._pending_execution_with_results(
+                pending_state,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+                audit_ok=False,
+                campaign_applied=False,
+            )
+            self.pending_execution_store.save(pending_state)
 
         matched = min(bfill, sfill)
         fill_edge = 0.0
@@ -2083,6 +2214,9 @@ class Engine:
             raise cancellation
         if audit_failure is not None:
             raise audit_failure from audit_failure.error
+        if pending_state is not None:
+            pending_state = replace(pending_state, audit_ok=True)
+            self.pending_execution_store.save(pending_state)
         if decision is not None and not unresolved:
             self._apply_live_matched_fill(
                 decision,
@@ -2093,6 +2227,10 @@ class Engine:
                 matched=matched,
                 now_wall=time.time(),
             )
+            pending_state = replace(
+                pending_state, campaign_applied=True)
+            self.pending_execution_store.save(pending_state)
+            self._clear_pending_execution_if_safe(pending_state)
         elif dynamic_pending is not None:
             dynamic_pending.audit_ok = True
         if cancellation is not None:
@@ -2526,8 +2664,19 @@ class Engine:
                 raise _OrderRecoveryInvariantError(
                     "dynamic order results resolved before trade audit "
                     "completed")
-            dynamic.applied = True
             try:
+                pending_execution = self._load_matching_pending_execution(
+                    dynamic.execution_id)
+                pending_execution = self._pending_execution_with_results(
+                    pending_execution,
+                    buy=dynamic.buy,
+                    sell=dynamic.sell,
+                    buy_result=dynamic.buy_result,
+                    sell_result=dynamic.sell_result,
+                    audit_ok=True,
+                    campaign_applied=False,
+                )
+                self.pending_execution_store.save(pending_execution)
                 self._apply_live_matched_fill(
                     dynamic.decision,
                     buy=dynamic.buy,
@@ -2539,6 +2688,11 @@ class Engine:
                         dynamic.sell_result.filled_base),
                     now_wall=time.time(),
                 )
+                pending_execution = replace(
+                    pending_execution, campaign_applied=True)
+                self.pending_execution_store.save(pending_execution)
+                self._clear_pending_execution_if_safe(pending_execution)
+                dynamic.applied = True
             except BaseException as exc:
                 self._auto_repair_disabled = True
                 self._remember_error(

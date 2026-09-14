@@ -850,6 +850,72 @@ def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
     asyncio.run(go())
 
 
+def test_dynamic_execution_journal_exists_before_send_and_clears_after_apply(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        original_buy = eng.hedge.send_taker
+        original_sell = eng.entropy.send_taker
+
+        async def checked_buy(**kwargs):
+            pending = eng.pending_execution_store.load()
+            assert pending is not None
+            assert pending.intent == "OPEN"
+            return await original_buy(**kwargs)
+
+        async def checked_sell(**kwargs):
+            assert eng.pending_execution_store.load() is not None
+            return await original_sell(**kwargs)
+
+        eng.hedge.send_taker = checked_buy
+        eng.entropy.send_taker = checked_sell
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            assert eng.pending_execution_store.load() is None
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        eng.pending_execution_store.save(
+            engine_module.PendingExecutionState(
+                execution_id="interrupted",
+                identity=eng._market_identity(),
+                intent="OPEN",
+                direction="sell_entropy",
+                campaign_id=None,
+                qty=1.0,
+                buy=engine_module.PendingLegState(
+                    venue_key="hedge", is_buy=True, order_ref=None,
+                    status="sending", filled_base=0.0, avg_px=None,
+                    applied_fill=0.0, unresolved=True),
+                sell=engine_module.PendingLegState(
+                    venue_key="entropy", is_buy=False, order_ref=None,
+                    status="sending", filled_base=0.0, avg_px=None,
+                    applied_fill=0.0, unresolved=True),
+                audit_ok=False,
+                campaign_applied=False,
+            ))
+
+        eng._load_pending_execution_state()
+
+        assert eng._recovery_required
+        assert eng._auto_repair_disabled
+        assert eng._campaign_recovery_blocked
+        assert eng.entropy.send_calls == 0
+        assert eng.hedge.send_calls == 0
+        assert eng.pending_execution_store.load() is not None
+    finally:
+        eng._shutdown_reconcile_required = False
+        eng._close_dynamic_strategy()
+
+
 def test_live_dynamic_waits_for_post_trade_books_before_adding(tmp_path):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
