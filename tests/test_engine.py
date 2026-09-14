@@ -800,6 +800,117 @@ def restart_open_pending(eng, *, unresolved=True,
     )
 
 
+def restart_close_pending(eng, *, campaign_applied=False):
+    campaign = dynamic_live_campaign()
+    model = campaign.frozen_model
+    return engine_module.PendingExecutionState(
+        execution_id="restart-close",
+        identity=eng._market_identity(),
+        intent="CLOSE",
+        direction=campaign.direction,
+        campaign_id=campaign.campaign_id,
+        qty=campaign.qty,
+        decided_at=campaign.opened_at + 60.0,
+        frozen_model=model,
+        entry_boundary_bps=campaign.entry_boundary_bps,
+        exit_target_bps=campaign.exit_target_bps,
+        entropy_expected_px=100.1,
+        hedge_expected_px=100.0,
+        entropy_fee_bps=eng.entropy.fee_bps,
+        hedge_fee_bps=eng.hedge.fee_bps,
+        campaign_before=campaign,
+        buy=engine_module.PendingLegState(
+            venue_key="entropy", is_buy=True, order_ref="close-buy",
+            status="filled", filled_base=1.0, avg_px=100.1,
+            applied_fill=1.0, unresolved=False),
+        sell=engine_module.PendingLegState(
+            venue_key="hedge", is_buy=False, order_ref="close-sell",
+            status="filled", filled_base=1.0, avg_px=100.0,
+            applied_fill=1.0, unresolved=False),
+        audit_ok=True,
+        campaign_applied=campaign_applied,
+    )
+
+
+def read_strategy_events(eng):
+    with open(eng.strategy_events.path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_live_matched_fill_uses_pending_execution_id_for_event(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            pending = eng.pending_execution_store.load()
+            changed = [row for row in read_strategy_events(eng)
+                       if row["event"] == "campaign_changed"]
+
+            assert len(changed) == 1
+            assert changed[0]["decision_id"] == (
+                f"execution-{pending.execution_id}")
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_pending_recovery_records_open_event_once(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_open_pending(eng, unresolved=False)
+        eng.pending_execution_store.save(pending)
+        eng._startup_pending_execution = pending
+        try:
+            assert await eng._resolve_startup_pending_execution()
+            assert await eng._resolve_startup_pending_execution()
+
+            changed = [row for row in read_strategy_events(eng)
+                       if row["event"] == "campaign_changed"]
+            assert len(changed) == 1
+            assert changed[0]["decision_id"] == "execution-restart-open"
+            assert changed[0]["campaign_id"] == "restart-campaign"
+            assert float(changed[0]["qty"]) == pytest.approx(1.0)
+            assert float(changed[0]["entropy_fill_px"]) == pytest.approx(
+                100.45)
+            assert float(changed[0]["hedge_fill_px"]) == pytest.approx(100.0)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_pending_recovery_records_close_analytics(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_close_pending(eng)
+        eng.campaign_store.save(pending.campaign_before)
+        eng.campaign = pending.campaign_before
+        eng.pending_execution_store.save(pending)
+        eng._startup_pending_execution = pending
+        try:
+            assert await eng._resolve_startup_pending_execution()
+
+            closed = [row for row in read_strategy_events(eng)
+                      if row["event"] == "campaign_closed"]
+            assert len(closed) == 1
+            event = closed[0]
+            assert event["decision_id"] == "execution-restart-close"
+            assert event["campaign_id"] == pending.campaign_id
+            assert float(event["qty"]) == pytest.approx(1.0)
+            assert float(event["entropy_fill_px"]) == pytest.approx(100.1)
+            assert float(event["hedge_fill_px"]) == pytest.approx(100.0)
+            assert float(event["hold_seconds"]) == pytest.approx(60.0)
+            assert float(event["realized_pnl_usd"]) == pytest.approx(0.1)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
 def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
     async def go():
         cfg = make_dynamic_live_cfg(tmp_path)
@@ -5162,7 +5273,9 @@ def test_record_only_captures_burst_signal_before_event_coalesces():
         assert os.path.exists(cfg.recorder_signal_csv)
         with open(cfg.recorder_signal_csv, newline="", encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
-        assert [(row["direction"], row["event"]) for row in rows] == [
+        lifecycle = [row for row in rows if row["event"] != "snapshot"]
+        assert [(row["direction"], row["event"])
+                for row in lifecycle] == [
             ("sell_entropy", "start"),
             ("sell_entropy", "end"),
         ]
