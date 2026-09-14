@@ -23,11 +23,16 @@ import gzip
 import math
 import sys
 import time
+from collections import Counter
 
 CANDIDATES = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 15.0, 20.0]
 NEW_IDENTITY = (
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue")
 LEGACY_IDENTITY = ("symbol", "entropy_dex", "hedge_venue")
+STRATEGY_REQUIRED_FIELDS = {
+    "ts_ms", "mode", "event", "intent", "reason", "campaign_id",
+    *NEW_IDENTITY, "direction", "hold_seconds", "realized_pnl_usd",
+}
 
 
 def open_csv_text(path: str):
@@ -218,6 +223,128 @@ def load_rows(path: str, hours: float, min_samples: int) -> list:
         key=lambda row: row["ts"])
 
 
+def load_strategy_events(path: str) -> list[dict]:
+    """Load one pair's low-frequency strategy journal."""
+    rows = []
+    markets = set()
+    with open_csv_text(path) as handle:
+        reader = csv.DictReader(handle)
+        fields = set(reader.fieldnames or [])
+        missing = STRATEGY_REQUIRED_FIELDS - fields
+        if missing:
+            raise ValueError(
+                "strategy event CSV missing required columns: "
+                + ", ".join(sorted(missing)))
+        for source in reader:
+            identity = tuple(
+                (source.get(field) or "").strip()
+                for field in NEW_IDENTITY)
+            if not all(identity):
+                raise ValueError(
+                    "strategy event market identity values must not be empty")
+            markets.add(identity)
+            _validate_market_set(markets)
+            try:
+                ts_ms = float(source["ts_ms"])
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "strategy event timestamp must be finite") from None
+            if not math.isfinite(ts_ms) or ts_ms < 0:
+                raise ValueError("strategy event timestamp must be finite")
+            parsed = dict(source)
+            parsed["ts_ms"] = ts_ms
+            for field in (
+                    "hold_seconds", "realized_pnl_usd",
+                    "projected_net_bps", "projected_net_usd",
+                    "estimated_campaign_pnl_usd"):
+                parsed[field] = _optional_finite_float(source, field)
+            rows.append(parsed)
+    return sorted(rows, key=lambda row: row["ts_ms"])
+
+
+def summarize_strategy_events(rows: list[dict]) -> dict:
+    opened = set()
+    completed = set()
+    holds = []
+    pnl_values = []
+    directions = Counter()
+    reasons = Counter()
+    forced_closes = 0
+    model_snapshots = 0
+    ready_snapshots = 0
+    unstable_snapshots = 0
+
+    for row in rows:
+        intent = row.get("intent", "")
+        event = row.get("event", "")
+        campaign_id = row.get("campaign_id", "")
+        if intent == "SKIP" and row.get("reason"):
+            reasons[row["reason"]] += 1
+        if intent == "OPEN" and campaign_id:
+            opened.add(campaign_id)
+            if row.get("direction"):
+                directions[row["direction"]] += 1
+        if event == "model_snapshot":
+            model_snapshots += 1
+            status = row.get("model_status", "")
+            ready_snapshots += status == "READY"
+            unstable_snapshots += status == "REGIME_UNSTABLE"
+        if event != "campaign_closed" or not campaign_id:
+            continue
+        completed.add(campaign_id)
+        forced_closes += intent == "FORCED_CLOSE"
+        if row.get("hold_seconds") is not None:
+            holds.append(row["hold_seconds"])
+        if row.get("realized_pnl_usd") is not None:
+            pnl_values.append(row["realized_pnl_usd"])
+
+    return {
+        "events": len(rows),
+        "completed_campaigns": len(completed),
+        "still_open": len(opened - completed),
+        "within_1h": sum(value <= 3600 for value in holds),
+        "within_6h": sum(value <= 21600 for value in holds),
+        "forced_closes": forced_closes,
+        "realized_pnl_usd": sum(pnl_values),
+        "realized_pnl_samples": len(pnl_values),
+        "directions": directions,
+        "reasons": reasons,
+        "model_snapshots": model_snapshots,
+        "model_ready_snapshots": ready_snapshots,
+        "model_unstable_snapshots": unstable_snapshots,
+    }
+
+
+def print_strategy_summary(path: str, rows: list[dict]) -> None:
+    summary = summarize_strategy_events(rows)
+    print(f"\n=== {path}: dynamic strategy events ===")
+    print(f"  completed campaigns: {summary['completed_campaigns']}")
+    print(f"  within 1h: {summary['within_1h']}")
+    print(f"  within 6h: {summary['within_6h']}")
+    print(f"  still open: {summary['still_open']}")
+    print(f"  forced closes: {summary['forced_closes']}")
+    if summary["realized_pnl_samples"]:
+        print("  realized/shadow PnL: "
+              f"{summary['realized_pnl_usd']:+.4f} USD")
+    if summary["model_snapshots"]:
+        total = summary["model_snapshots"]
+        ready = summary["model_ready_snapshots"]
+        unstable = summary["model_unstable_snapshots"]
+        print(f"  model ready: {ready}/{total} ({ready / total:.1%})")
+        print(f"  regime unstable: {unstable}/{total} "
+              f"({unstable / total:.1%})")
+    if summary["directions"]:
+        values = ", ".join(
+            f"{key}={value}"
+            for key, value in sorted(summary["directions"].items()))
+        print(f"  opened directions: {values}")
+    if summary["reasons"]:
+        values = ", ".join(
+            f"{key}={value}"
+            for key, value in summary["reasons"].most_common())
+        print(f"  skip reasons: {values}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="suggest thresholds from recorded "
                                             "minute data")
@@ -235,6 +362,8 @@ def main() -> None:
     p.add_argument("--fees-bps", type=float,
                    help="legacy approximate sum of both taker fees; cannot be "
                         "combined with the exact per-venue options")
+    p.add_argument("--strategy-csv",
+                   help="optional strategy-events.csv to summarize")
     args = p.parse_args()
 
     if ((args.entropy_fee_bps is None)
@@ -356,6 +485,13 @@ thresholds:
 Re-run with --hours to focus on recent regimes; premiums drift, so refresh
 these numbers regularly. / 溢价中枢会漂移，请定期重新分析并更新配置。
 """)
+    if args.strategy_csv:
+        try:
+            strategy_rows = load_strategy_events(args.strategy_csv)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"cannot analyze strategy events: {exc}", file=sys.stderr)
+            sys.exit(2)
+        print_strategy_summary(args.strategy_csv, strategy_rows)
 
 
 if __name__ == "__main__":

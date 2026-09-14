@@ -10,6 +10,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import tools.analyze as analyze  # noqa: E402
+from entropy_arb.strategy_recorder import (  # noqa: E402
+    STRATEGY_EVENT_HEADER,
+)
 
 
 ANALYZE_FIELDS = [
@@ -358,3 +361,110 @@ def test_exact_fee_arguments_must_be_supplied_as_a_pair(
 
     assert exc.value.code == 2
     assert "must be supplied together" in capsys.readouterr().err
+
+
+def write_strategy_rows(path, rows, *, compressed=False):
+    opener = gzip.open if compressed else open
+    with opener(path, "wt", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=STRATEGY_EVENT_HEADER)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def strategy_row(*, ts_ms, intent, campaign_id, event="decision",
+                 direction="sell_entropy", hold_seconds="",
+                 realized_pnl_usd="", reason=""):
+    return {
+        "ts_ms": ts_ms,
+        "time_utc": "1970-01-01T00:00:00Z",
+        "mode": "shadow",
+        "event": event,
+        "intent": intent,
+        "reason": reason,
+        "campaign_id": campaign_id,
+        "entropy_symbol": "ANTH",
+        "entropy_dex": "io",
+        "hedge_symbol": "ANTHROPIC",
+        "hedge_venue": "lighter-rh",
+        "direction": direction,
+        "hold_seconds": hold_seconds,
+        "realized_pnl_usd": realized_pnl_usd,
+    }
+
+
+def test_strategy_summary_reports_closed_open_and_hold_windows(tmp_path):
+    path = tmp_path / "strategy-events.csv"
+    write_strategy_rows(path, [
+        strategy_row(ts_ms=1_000, intent="OPEN", campaign_id="c1"),
+        strategy_row(ts_ms=2_000, intent="CLOSE", campaign_id="c1",
+                     event="campaign_closed", hold_seconds=1800,
+                     realized_pnl_usd=1.25),
+        strategy_row(ts_ms=3_000, intent="OPEN", campaign_id="c2",
+                     direction="buy_entropy"),
+        strategy_row(ts_ms=4_000, intent="FORCED_CLOSE", campaign_id="c2",
+                     event="campaign_closed", direction="buy_entropy",
+                     hold_seconds=7200, realized_pnl_usd=-0.5),
+        strategy_row(ts_ms=5_000, intent="OPEN", campaign_id="c3"),
+    ])
+
+    rows = analyze.load_strategy_events(str(path))
+    summary = analyze.summarize_strategy_events(rows)
+
+    assert summary["completed_campaigns"] == 2
+    assert summary["within_1h"] == 1
+    assert summary["within_6h"] == 2
+    assert summary["still_open"] == 1
+    assert summary["forced_closes"] == 1
+    assert summary["realized_pnl_usd"] == pytest.approx(0.75)
+
+
+def test_strategy_events_reject_mixed_pair_identity(tmp_path):
+    path = tmp_path / "strategy-events.csv"
+    second = strategy_row(ts_ms=2_000, intent="OPEN", campaign_id="c2")
+    second["hedge_symbol"] = "SNDK"
+    write_strategy_rows(path, [
+        strategy_row(ts_ms=1_000, intent="OPEN", campaign_id="c1"),
+        second,
+    ])
+
+    with pytest.raises(ValueError, match="multiple markets"):
+        analyze.load_strategy_events(str(path))
+
+
+def test_strategy_events_support_gzip(tmp_path):
+    path = tmp_path / "strategy-events.csv.gz"
+    write_strategy_rows(path, [
+        strategy_row(ts_ms=1_000, intent="OPEN", campaign_id="c1"),
+    ], compressed=True)
+
+    assert len(analyze.load_strategy_events(str(path))) == 1
+
+
+def test_main_prints_optional_strategy_summary(
+        monkeypatch, capsys, tmp_path):
+    minute_path = tmp_path / "minutes.csv"
+    minute_rows = [
+        [60 * index, 60, "ANTH", "io", "ANTHROPIC", "lighter-rh",
+         1, 1, 2, 3, 0.5, -0.25, 0.08]
+        for index in range(1, 31)
+    ]
+    write_analyze_rows(minute_path, minute_rows)
+    event_path = tmp_path / "strategy-events.csv"
+    write_strategy_rows(event_path, [
+        strategy_row(ts_ms=1_000, intent="OPEN", campaign_id="c1"),
+        strategy_row(ts_ms=2_000, intent="CLOSE", campaign_id="c1",
+                     event="campaign_closed", hold_seconds=1800),
+    ])
+    monkeypatch.setattr(sys, "argv", [
+        "analyze.py", "--csv", str(minute_path), "--min-samples", "1",
+        "--strategy-csv", str(event_path),
+    ])
+
+    analyze.main()
+
+    output = capsys.readouterr().out
+    assert "completed campaigns: 1" in output
+    assert "within 1h: 1" in output
+    assert "within 6h: 1" in output
+    assert "still open: 0" in output
