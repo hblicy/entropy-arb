@@ -238,6 +238,8 @@ class ConvergencePlan:
     buy_notional: float
     sell_notional: float
     q_max: float
+    buy_depth_slippage_bps: float
+    sell_depth_slippage_bps: float
     open_depth_slippage_bps: float
     convergence_bps: float
     projected_net_bps: float
@@ -436,6 +438,8 @@ def plan_convergence_trade(
         buy_notional=buy_notional,
         sell_notional=sell_notional,
         q_max=q_max,
+        buy_depth_slippage_bps=buy_slip,
+        sell_depth_slippage_bps=sell_slip,
         open_depth_slippage_bps=buy_slip + sell_slip,
         convergence_bps=convergence,
         projected_net_bps=projected,

@@ -278,6 +278,37 @@ def test_convergence_plan_keeps_both_legs_under_fixed_cap():
     assert plan.sell_notional <= 500.0
 
 
+def test_convergence_plan_reports_each_leg_depth_slippage():
+    buy = make_book(
+        bids=[(99.0, 10)],
+        asks=[(100.0, 1), (100.1, 1)],
+    )
+    sell = make_book(
+        bids=[(100.0, 1), (99.9, 1)],
+        asks=[(101.0, 10)],
+    )
+
+    plan, reason = plan_convergence_trade(
+        buy,
+        sell,
+        **convergence_common(
+            take_fraction=1.0,
+            cap_notional=500.0,
+            reference_basis_bps=0.0,
+            exit_residual_bps=-50.0,
+            buy_slippage_budget_bps=20.0,
+            sell_slippage_budget_bps=20.0,
+        ),
+    )
+
+    assert reason == "ok"
+    assert plan.buy_depth_slippage_bps == pytest.approx(10.0)
+    assert plan.sell_depth_slippage_bps == pytest.approx(
+        (100.0 / 99.9 - 1.0) * 1e4)
+    assert plan.open_depth_slippage_bps == pytest.approx(
+        plan.buy_depth_slippage_bps + plan.sell_depth_slippage_bps)
+
+
 def test_matched_close_only_uses_common_depth_inside_slippage_limit():
     buy = make_book(
         bids=[(99, 10)],

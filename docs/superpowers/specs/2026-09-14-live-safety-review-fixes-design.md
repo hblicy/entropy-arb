@@ -34,12 +34,16 @@ with `reduce_only=True`. `OPEN`, `ADD`, and all legacy fixed-premium orders keep
 
 The dynamic slippage budget is one total per-leg allowance measured from the
 decision-time best executable price. The depth planner may consume part of that
-allowance. The final IOC protection price must therefore use only the remaining
-budget:
+allowance. To avoid basis-point approximation compounding, reconstruct the
+decision-time best price from the planned marginal price and recorded depth,
+then apply the budget exactly once:
 
 ```text
-remaining_buy_bps = max(leg_budget_bps - buy_depth_slippage_bps, 0)
-remaining_sell_bps = max(leg_budget_bps - sell_depth_slippage_bps, 0)
+best_ask = buy_limit / (1 + buy_depth_slippage_bps / 10000)
+buy_protection = best_ask * (1 + leg_budget_bps / 10000)
+
+best_bid = sell_limit * (1 + sell_depth_slippage_bps / 10000)
+sell_protection = best_bid / (1 + leg_budget_bps / 10000)
 ```
 
 The submitted protection price relative to the decision-time best price must

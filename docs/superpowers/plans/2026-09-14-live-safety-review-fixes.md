@@ -84,14 +84,14 @@ reduce_only = (
     decision is not None
     and decision.intent in {"CLOSE", "FORCED_CLOSE"}
 )
-buy_remaining_bps = max(
-    buy_slippage_bps - decision.plan.buy_depth_slippage_bps, 0.0)
-sell_remaining_bps = max(
-    sell_slippage_bps - decision.plan.sell_depth_slippage_bps, 0.0)
+buy_depth = decision.plan.buy_depth_slippage_bps / 1e4
+sell_depth = decision.plan.sell_depth_slippage_bps / 1e4
+decision_best_ask = decision.plan.buy_limit / (1 + buy_depth)
+decision_best_bid = decision.plan.sell_limit * (1 + sell_depth)
 buy_bound = buy.px_round(
-    plan.buy_limit * (1 + buy_remaining_bps / 1e4), round_up=False)
+    decision_best_ask * (1 + buy_slippage_bps / 1e4), round_up=False)
 sell_bound = sell.px_round(
-    plan.sell_limit * (1 - sell_remaining_bps / 1e4), round_up=True)
+    decision_best_bid / (1 + sell_slippage_bps / 1e4), round_up=True)
 
 settlement = asyncio.gather(
     submit(buy, is_buy=True, qty=plan.qty, limit_px=buy_bound,

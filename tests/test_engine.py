@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import entropy_arb.engine as engine_module  # noqa: E402
-from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
+from entropy_arb.book import ArbPlan, MatchedClosePlan, OrderBook  # noqa: E402
 from entropy_arb.campaign import (  # noqa: E402
     CampaignStore,
     PositionCampaign,
@@ -99,6 +99,16 @@ class PositionVenue(ExecutingVenue):
 
     async def send_taker(self, **kwargs):
         self.send_calls += 1
+        return await super().send_taker(**kwargs)
+
+
+class RecordingPositionVenue(PositionVenue):
+    def __init__(self, key, label, result, chain_position=0.0):
+        super().__init__(key, label, result, chain_position)
+        self.send_args = []
+
+    async def send_taker(self, **kwargs):
+        self.send_args.append(kwargs)
         return await super().send_taker(**kwargs)
 
 
@@ -604,11 +614,11 @@ def make_live_dynamic_execution_engine(
     cfg.cooldown_sec = 0.0
     cfg.max_order_notional = 500.0
     eng = Engine(cfg, record_only=False)
-    eng.entropy = PositionVenue(
+    eng.entropy = RecordingPositionVenue(
         "entropy", "ENTROPY",
         OrderResult(status="filled", filled_base=sell_fill,
                     avg_px=100.45 if sell_fill else None))
-    eng.hedge = PositionVenue(
+    eng.hedge = RecordingPositionVenue(
         "hedge", "RH",
         OrderResult(status="filled", filled_base=buy_fill,
                     avg_px=100.0 if buy_fill else None))
@@ -871,6 +881,85 @@ def test_live_matched_close_clears_campaign_and_persists_flat_state(tmp_path):
             assert closed[0]["campaign_id"] == campaign_id
             assert closed[0]["intent"] == "CLOSE"
             assert closed[0]["realized_pnl_usd"]
+            assert eng.entropy.send_args[0]["reduce_only"] is False
+            assert eng.hedge.send_args[0]["reduce_only"] is False
+            assert eng.entropy.send_args[1]["reduce_only"] is True
+            assert eng.hedge.send_args[1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_forced_close_sends_both_legs_reduce_only(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            eng.campaign = __import__("dataclasses").replace(
+                eng.campaign,
+                opened_at=(
+                    time.time()
+                    - eng.cfg.strategy_hard_hold_minutes * 60.0
+                    - 1.0),
+            )
+            eng.campaign_store.save(eng.campaign)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_args[-1]["reduce_only"] is True
+            assert eng.hedge.send_args[-1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_protection_price_uses_one_total_slippage_budget(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.campaign = dynamic_live_campaign()
+        eng.campaign_store.save(eng.campaign)
+        buy, sell = eng.entropy, eng.hedge
+        buy.set_book(99.9, 100.0)
+        sell.set_book(100.0, 100.1)
+        buy.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0)
+        sell.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0)
+        source = MatchedClosePlan(
+            qty=1.0,
+            buy_limit=100.1,
+            sell_limit=99.9,
+            buy_notional=100.1,
+            sell_notional=99.9,
+            buy_depth_slippage_bps=10.0,
+            sell_depth_slippage_bps=(100.0 / 99.9 - 1.0) * 1e4,
+        )
+        decision = engine_module.StrategyDecision(
+            intent="FORCED_CLOSE",
+            direction="buy_entropy",
+            reason="HARD_HOLD_LIMIT",
+            plan=source,
+            model=eng.residual_model.snapshot(
+                now_minute=int(time.time() // 60)),
+            buy_slippage_budget_bps=20.0,
+            sell_slippage_budget_bps=20.0,
+        )
+        plan = eng._dynamic_execution_plan(decision, buy, sell)
+        try:
+            await eng._execute(buy, sell, plan, decision=decision)
+
+            buy_limit = buy.send_args[-1]["limit_px"]
+            sell_limit = sell.send_args[-1]["limit_px"]
+            assert (buy_limit / 100.0 - 1.0) * 1e4 <= 20.0 + 1e-9
+            assert (100.0 / sell_limit - 1.0) * 1e4 <= 20.0 + 1e-9
         finally:
             eng._close_dynamic_strategy()
 

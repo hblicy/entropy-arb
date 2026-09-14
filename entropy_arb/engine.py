@@ -1900,12 +1900,28 @@ class Engine:
             else decision.sell_slippage_budget_bps)
         if buy_slippage_bps is None or sell_slippage_bps is None:
             raise RuntimeError("execution is missing slippage protection")
-        buy_slip = buy_slippage_bps / 1e4
-        sell_slip = sell_slippage_bps / 1e4
-        buy_bound = buy.px_round(
-            plan.buy_limit * (1 + buy_slip), round_up=False)
-        sell_bound = sell.px_round(
-            plan.sell_limit * (1 - sell_slip), round_up=True)
+        reduce_only = bool(
+            decision is not None
+            and decision.intent in {"CLOSE", "FORCED_CLOSE"})
+        if decision is None:
+            buy_bound = buy.px_round(
+                plan.buy_limit * (1 + buy_slippage_bps / 1e4),
+                round_up=False)
+            sell_bound = sell.px_round(
+                plan.sell_limit * (1 - sell_slippage_bps / 1e4),
+                round_up=True)
+        else:
+            source = decision.plan
+            buy_depth = source.buy_depth_slippage_bps / 1e4
+            sell_depth = source.sell_depth_slippage_bps / 1e4
+            decision_best_ask = source.buy_limit / (1 + buy_depth)
+            decision_best_bid = source.sell_limit * (1 + sell_depth)
+            buy_bound = buy.px_round(
+                decision_best_ask * (1 + buy_slippage_bps / 1e4),
+                round_up=False)
+            sell_bound = sell.px_round(
+                decision_best_bid / (1 + sell_slippage_bps / 1e4),
+                round_up=True)
         self._record_send(buy)
         self._record_send(sell)
         order_submitted_at = {}
@@ -1915,8 +1931,10 @@ class Engine:
             return await venue.send_taker(**kwargs)
 
         settlement = asyncio.gather(
-            submit(buy, is_buy=True, qty=plan.qty, limit_px=buy_bound),
-            submit(sell, is_buy=False, qty=plan.qty, limit_px=sell_bound),
+            submit(buy, is_buy=True, qty=plan.qty, limit_px=buy_bound,
+                   reduce_only=reduce_only),
+            submit(sell, is_buy=False, qty=plan.qty, limit_px=sell_bound,
+                   reduce_only=reduce_only),
             return_exceptions=True)
         cancellation = None
         while True:
