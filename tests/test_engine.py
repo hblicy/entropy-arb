@@ -313,6 +313,174 @@ def make_engine(record_only=False, **thr):
     return eng
 
 
+def make_dynamic_engine(tmp_path, *, reference=True):
+    cfg = make_cfg()
+    cfg.strategy_mode = "residual_dynamic"
+    cfg.strategy_window_minutes = 10
+    cfg.strategy_min_samples = 4
+    cfg.strategy_regime_window_minutes = 2
+    cfg.strategy_regime_recovery_minutes = 1
+    cfg.strategy_state_file = str(tmp_path / "campaign-state.json")
+    cfg.strategy_event_csv = str(tmp_path / "strategy-events.csv")
+    cfg.recorder_csv = str(tmp_path / "minutes.csv")
+    cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+    cfg.premium_persist_sec = 0.0
+    cfg.cooldown_sec = 0.0
+    cfg.max_order_notional = 500.0
+    eng = Engine(cfg, record_only=True)
+    filled = OrderResult(status="filled", filled_base=0.0)
+    eng.entropy = PositionVenue("entropy", "ENTROPY", filled)
+    eng.hedge = PositionVenue("hedge", "RH", filled)
+    eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
+    eng._step, eng._min_base, eng._min_notional = 0.01, 0.01, 10.0
+    if reference:
+        now = time.monotonic()
+        eng.entropy.reference.apply(
+            ReferenceUpdate(oracle_px=100.0), source="websocket",
+            received_mono=now)
+        eng.hedge.reference.apply(
+            ReferenceUpdate(index_px=100.0), source="websocket",
+            received_mono=now)
+    eng._initialize_dynamic_strategy(now_wall=time.time())
+    return eng
+
+
+def seed_dynamic_model(eng):
+    now_minute = int(time.time() // 60)
+    for offset, value in enumerate((-20.0, 0.0, 20.0, 40.0)):
+        eng.residual_model.observe(
+            minute=now_minute - 3 + offset,
+            residual_bps=value,
+            valid=True)
+
+
+def set_dynamic_sell_market(eng, residual_bps):
+    hedge_bid, hedge_ask = 99.99, 100.0
+    entropy_bid = hedge_ask * (1.0 + residual_bps / 1e4)
+    eng.entropy.set_book(entropy_bid, entropy_bid + 0.01, sz=20.0)
+    eng.hedge.set_book(hedge_bid, hedge_ask, sz=20.0)
+
+
+def test_residual_record_only_shadow_open_and_close_never_sends_orders(
+        tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            assert eng.campaign.mode == "shadow"
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            eng.cfg.cooldown_sec = 3600.0
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.trades == 0
+            assert eng.entropy.position == 0
+            assert eng.hedge.position == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("ready,reference", [(False, True), (True, False)])
+def test_shadow_model_and_reference_gates_never_create_campaign(
+        tmp_path, ready, reference):
+    async def go():
+        eng = make_dynamic_engine(tmp_path, reference=reference)
+        try:
+            if ready:
+                seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_does_not_require_live_account_readiness(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            eng.entropy.ready_to_trade = lambda: False
+            eng.hedge.ready_to_trade = lambda: False
+
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_state_uses_separate_file_and_survives_restart(tmp_path):
+    async def go():
+        first = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(first)
+            set_dynamic_sell_market(first, 45.0)
+            await first._evaluate()
+            campaign_id = first.campaign.campaign_id
+        finally:
+            first._close_dynamic_strategy()
+
+        assert not (tmp_path / "campaign-state.json").exists()
+        assert (tmp_path / "campaign-state.shadow.json").exists()
+
+        second = make_dynamic_engine(tmp_path)
+        try:
+            assert second.campaign.campaign_id == campaign_id
+        finally:
+            second._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_minute_observation_commits_previous_close_and_gaps(
+        tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        set_dynamic_sell_market(eng, 12.0)
+        expected_close = (
+            eng.entropy.book.mid() / eng.hedge.book.mid() - 1.0) * 1e4
+        base = 60_000.0
+        now_mono = time.monotonic()
+        eng._advance_dynamic_model(now_wall=base, now_mono=now_mono)
+        set_dynamic_sell_market(eng, 18.0)
+        eng._advance_dynamic_model(
+            now_wall=base + 60.0 * 3, now_mono=now_mono)
+
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60)).samples == 1
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60)).median_bps == pytest.approx(
+                expected_close)
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60) + 2).samples == 1
+    finally:
+        eng._close_dynamic_strategy()
+
+
 def approx(a, b, tol=1e-9):
     assert abs(a - b) <= tol, f"{a} != {b}"
 

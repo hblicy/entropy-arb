@@ -8,9 +8,9 @@ The signal is a fixed band around a configured midline (config.yaml):
 Around the signal: per-direction persistence arming,
 per-venue inventory ladder + position caps, per-venue order budgets and
 reactive rate-limit exclusion, net-delta hedging, venue-outage pausing with
-probing, and periodic on-chain reconciliation. There is no paper mode: the
-bot either trades live or runs --record-only (data collection, no strategy).
-Both venues' books are recorded to 1-minute CSV bars throughout.
+probing, and periodic on-chain reconciliation. ``--record-only`` also runs
+the dynamic residual strategy as an isolated shadow campaign when selected;
+it never sends orders. Both books are recorded to 1-minute CSV bars.
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -27,6 +28,7 @@ from typing import Dict, List, Optional
 import aiohttp
 
 from .book import ArbPlan, floor_step, plan_arb
+from .campaign import CampaignStateError, CampaignStore, PositionCampaign
 from .config import Config
 from .models import OrderResult
 from .reference import (
@@ -41,6 +43,16 @@ from .recorder import (
     csv_tail_complete,
     next_archive_path,
 )
+from .slippage import SlippageModel
+from .strategy import (
+    DynamicResidualStrategy,
+    MarketIdentity,
+    MarketView,
+    ResidualModel,
+    StrategyDecision,
+    warm_start_residual_model,
+)
+from .strategy_recorder import StrategyEvent, StrategyEventRecorder
 from .venues.base import VenueAdapter
 from .venues.registry import VenueRuntime, create_venue
 
@@ -85,6 +97,12 @@ class Engine:
         self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.signal_recorder: Optional[SignalRecorder] = None
+        self.strategy_events: Optional[StrategyEventRecorder] = None
+        self.residual_model: Optional[ResidualModel] = None
+        self.dynamic_strategy: Optional[DynamicResidualStrategy] = None
+        self.campaign_store: Optional[CampaignStore] = None
+        self.campaign: Optional[PositionCampaign] = None
+        self.model_warm_start = None
         self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
         self._primary_error: Optional[BaseException] = None
@@ -96,6 +114,7 @@ class Engine:
         self.stop = asyncio.Event()
         self._feed_stop = asyncio.Event()
         self._update_evt = asyncio.Event()
+        self._strategy_evt = asyncio.Event()
         self._reconcile_evt = asyncio.Event()
         # per-venue locks: an execution holds both; a reconcile holds one, so
         # a chain read can never race an in-flight order on that venue
@@ -131,6 +150,11 @@ class Engine:
         self._last_skiplog = 0.0
         self._poke_due: Optional[float] = None
         self._reconcile_due: Optional[float] = None
+        self._dynamic_last_action_mono = 0.0
+        self._dynamic_pending_minute: Optional[int] = None
+        self._dynamic_pending_residual: Optional[float] = None
+        self._dynamic_pending_valid = False
+        self._last_model_event_minute: Optional[int] = None
         # per-direction persistence arming: direction key -> first-seen ts
         self._armed: Dict[str, Optional[float]] = {"sell_entropy": None,
                                                    "buy_entropy": None}
@@ -229,6 +253,7 @@ class Engine:
     def request_stop(self) -> None:
         self.stop.set()
         self._update_evt.set()
+        self._strategy_evt.set()
         self._reconcile_evt.set()
 
     def _remember_error(self, label: str, error: BaseException) -> None:
@@ -293,6 +318,7 @@ class Engine:
 
     def _record_only_book_update(self, *_args) -> None:
         self._update_evt.set()
+        self._strategy_evt.set()
         if self.signal_recorder is not None:
             try:
                 self.signal_recorder.observe(flush=False)
@@ -313,6 +339,7 @@ class Engine:
             self, source: str = "book",
             venue_key: Optional[str] = None) -> None:
         self._update_evt.set()
+        self._strategy_evt.set()
         if source == "order":
             keys = (venue_key,) if venue_key is not None else tuple(self.venues)
             for key in keys:
@@ -376,6 +403,397 @@ class Engine:
                 self.signal_recorder.run(self.stop, self._update_evt),
                 name="signal-recorder")
             self._track_task(tasks, self._signal_task)
+
+    def _market_identity(self) -> MarketIdentity:
+        return MarketIdentity(
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+        )
+
+    def _initialize_dynamic_strategy(
+            self, *, now_wall: Optional[float] = None) -> None:
+        """Create the residual model, shadow/live state and event journal."""
+        if self.cfg.strategy_mode != "residual_dynamic":
+            return
+        if self.dynamic_strategy is not None:
+            raise RuntimeError("dynamic strategy is already initialized")
+        cfg = self.cfg
+        wall = time.time() if now_wall is None else now_wall
+        self.residual_model = ResidualModel(
+            window_minutes=cfg.strategy_window_minutes,
+            min_samples=cfg.strategy_min_samples,
+            lower_quantile=cfg.strategy_lower_quantile,
+            upper_quantile=cfg.strategy_upper_quantile,
+            regime_window_minutes=cfg.strategy_regime_window_minutes,
+            recovery_minutes=cfg.strategy_regime_recovery_minutes,
+        )
+        self.model_warm_start = warm_start_residual_model(
+            self.residual_model,
+            path=cfg.recorder_csv,
+            identity=self._market_identity(),
+            now_minute=int(wall // 60),
+            max_age_sec=cfg.strategy_entry_reference_max_age_sec,
+            max_skew_sec=cfg.strategy_entry_reference_max_skew_sec,
+        )
+        slippage = SlippageModel(
+            bootstrap_bps=cfg.slippage_bootstrap_bps,
+            min_bps=cfg.slippage_min_bps,
+            safety_bps=cfg.slippage_safety_bps,
+            hard_max_bps=cfg.slippage_hard_max_bps,
+            min_live_samples=cfg.slippage_min_live_samples,
+        )
+        self.dynamic_strategy = DynamicResidualStrategy(
+            slippage=slippage,
+            reference_max_age_sec=(
+                cfg.strategy_entry_reference_max_age_sec),
+            reference_max_skew_sec=(
+                cfg.strategy_entry_reference_max_skew_sec),
+            exit_band_fraction=cfg.strategy_exit_band_fraction,
+            min_exit_band_bps=cfg.strategy_min_exit_band_bps,
+            min_expected_profit_bps=cfg.strategy_min_expected_profit_bps,
+            soft_hold_sec=cfg.strategy_soft_hold_minutes * 60.0,
+            hard_hold_sec=cfg.strategy_hard_hold_minutes * 60.0,
+            hard_slippage_bps=cfg.slippage_hard_max_bps,
+            max_edge_fraction=cfg.slippage_max_edge_fraction,
+        )
+        self.campaign_store = CampaignStore(
+            cfg.strategy_state_file, shadow=self.record_only)
+        self.campaign = self.campaign_store.load()
+        if (self.campaign is not None
+                and self.campaign.identity != self._market_identity()):
+            raise CampaignStateError(
+                "saved campaign market identity does not match config")
+        expected_mode = "shadow" if self.record_only else "live"
+        if (self.campaign is not None
+                and self.campaign.mode != expected_mode):
+            raise CampaignStateError(
+                "saved campaign mode does not match engine mode")
+        self.strategy_events = StrategyEventRecorder(
+            cfg.strategy_event_csv)
+        log.info(
+            "dynamic residual model warm start: accepted=%d "
+            "identity_rejected=%d reference_rejected=%d value_rejected=%d "
+            "time_rejected=%d",
+            self.model_warm_start.accepted,
+            self.model_warm_start.rejected_identity,
+            self.model_warm_start.rejected_reference,
+            self.model_warm_start.rejected_value,
+            self.model_warm_start.rejected_time,
+        )
+
+    def _close_dynamic_strategy(self) -> None:
+        if self.strategy_events is not None:
+            self.strategy_events.close()
+
+    def _dynamic_market_view(self, now_mono: float) -> MarketView:
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        entropy_age_ms = self.entropy.reference.age_ms(now_mono=now_mono)
+        hedge_age_ms = self.hedge.reference.age_ms(now_mono=now_mono)
+        skew = None
+        if entropy_ref.source and hedge_ref.source:
+            skew = abs(
+                entropy_ref.received_mono
+                - hedge_ref.received_mono)
+        account_ready = (
+            self.record_only
+            or (self.entropy.ready_to_trade()
+                and self.hedge.ready_to_trade()))
+        books_ready = (
+            self.entropy.book.is_fresh(self.cfg.staleness_sec)
+            and self.hedge.book.is_fresh(self.cfg.staleness_sec)
+            and account_ready
+            and not self._venue_down
+        )
+        return MarketView(
+            entropy_book=self.entropy.book,
+            hedge_book=self.hedge.book,
+            entropy_oracle_px=entropy_ref.oracle_px,
+            hedge_index_px=hedge_ref.index_px,
+            entropy_reference_age_sec=(
+                None if entropy_age_ms is None else entropy_age_ms / 1000.0),
+            hedge_reference_age_sec=(
+                None if hedge_age_ms is None else hedge_age_ms / 1000.0),
+            reference_skew_sec=skew,
+            books_ready=books_ready,
+            entropy_fee_bps=self.entropy.fee_bps,
+            hedge_fee_bps=self.hedge.fee_bps,
+            take_fraction=self.cfg.take_fraction,
+            entry_cap_notional=self.cfg.max_order_notional,
+            min_base=self._min_base,
+            min_notional=self._min_notional,
+            size_step=self._step,
+        )
+
+    def _current_dynamic_residual(
+            self, now_mono: float) -> tuple[Optional[float], bool]:
+        market = self._dynamic_market_view(now_mono)
+        gate = self.dynamic_strategy._book_gate(market)
+        if gate is None:
+            gate = self.dynamic_strategy._reference_gate(market)
+        if gate is not None:
+            return None, False
+        entropy_mid = market.entropy_book.mid()
+        hedge_mid = market.hedge_book.mid()
+        basis = (
+            market.entropy_oracle_px / market.hedge_index_px - 1.0) * 1e4
+        residual = (entropy_mid / hedge_mid - 1.0) * 1e4 - basis
+        return residual, True
+
+    def _advance_dynamic_model(
+            self, *, now_wall: float, now_mono: float) -> None:
+        """Retain the latest sample and commit one close per elapsed minute."""
+        minute = int(now_wall // 60)
+        residual, valid = self._current_dynamic_residual(now_mono)
+        pending = self._dynamic_pending_minute
+        if pending is None:
+            self._dynamic_pending_minute = minute
+        elif minute > pending:
+            self.residual_model.observe(
+                minute=pending,
+                residual_bps=self._dynamic_pending_residual,
+                valid=self._dynamic_pending_valid,
+            )
+            for missing in range(pending + 1, minute):
+                self.residual_model.observe(
+                    minute=missing, residual_bps=None, valid=False)
+            self._dynamic_pending_minute = minute
+        elif minute < pending:
+            return
+        self._dynamic_pending_residual = residual
+        self._dynamic_pending_valid = valid
+
+    def _record_model_snapshot(self, *, now_wall: float) -> None:
+        minute = int(now_wall // 60)
+        if self._last_model_event_minute == minute:
+            return
+        self._last_model_event_minute = minute
+        model = self.residual_model.snapshot(now_minute=minute)
+        self.strategy_events.record(StrategyEvent(
+            ts=now_wall,
+            mode="shadow" if self.record_only else "live",
+            event="model_snapshot",
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+            campaign_id=("" if self.campaign is None
+                         else self.campaign.campaign_id),
+            direction=("" if self.campaign is None
+                       else self.campaign.direction),
+            model_version=str(model.version),
+            model_samples=model.samples,
+            model_status=model.status,
+            model_median_bps=model.median_bps,
+            model_lower_bps=model.lower_bps,
+            model_upper_bps=model.upper_bps,
+            model_iqr_bps=model.iqr_bps,
+        ))
+
+    def _record_dynamic_decision(
+            self, decision: StrategyDecision, *, now_wall: float,
+            campaign_id: str = "", event: str = "decision",
+            entropy_fill_px: Optional[float] = None,
+            hedge_fill_px: Optional[float] = None,
+            realized_pnl_usd: Optional[float] = None,
+            hold_seconds: Optional[float] = None) -> None:
+        model = decision.model
+        plan = decision.plan
+        planned_notional = None
+        projected_net_bps = None
+        projected_net_usd = None
+        qty = None
+        if plan is not None:
+            qty = plan.qty
+            planned_notional = max(plan.buy_notional, plan.sell_notional)
+            projected_net_bps = getattr(plan, "projected_net_bps", None)
+            if projected_net_bps is not None:
+                projected_net_usd = (
+                    planned_notional * projected_net_bps / 1e4)
+        entropy_age = self.entropy.reference.age_ms()
+        hedge_age = self.hedge.reference.age_ms()
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        reference_skew_ms = None
+        if entropy_ref.source and hedge_ref.source:
+            reference_skew_ms = abs(
+                entropy_ref.received_mono
+                - hedge_ref.received_mono) * 1000.0
+        funding = None
+        if (entropy_ref.funding_current_bps_per_hour is not None
+                and hedge_ref.funding_current_bps_per_hour is not None):
+            funding = (entropy_ref.funding_current_bps_per_hour
+                       - hedge_ref.funding_current_bps_per_hour)
+            if decision.direction == "buy_entropy":
+                funding = -funding
+        active = self.campaign
+        self.strategy_events.record(StrategyEvent(
+            ts=now_wall,
+            mode="shadow" if self.record_only else "live",
+            event=event,
+            intent=decision.intent,
+            reason=decision.reason,
+            decision_id=uuid.uuid4().hex,
+            campaign_id=(campaign_id or (
+                "" if active is None else active.campaign_id)),
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+            direction=decision.direction,
+            campaign_status=("" if active is None else active.status_at(
+                now_wall,
+                soft_sec=self.cfg.strategy_soft_hold_minutes * 60.0,
+                hard_sec=self.cfg.strategy_hard_hold_minutes * 60.0)),
+            model_version=("" if model is None else str(model.version)),
+            model_samples=(None if model is None else model.samples),
+            model_status=("" if model is None else model.status),
+            model_median_bps=(None if model is None else model.median_bps),
+            model_lower_bps=(None if model is None else model.lower_bps),
+            model_upper_bps=(None if model is None else model.upper_bps),
+            model_iqr_bps=(None if model is None else model.iqr_bps),
+            signed_residual_bps=decision.signed_residual_bps,
+            reference_basis_bps=decision.reference_basis_bps,
+            entry_boundary_bps=decision.entry_boundary_bps,
+            exit_target_bps=decision.exit_target_bps,
+            convergence_bps=decision.convergence_bps,
+            round_trip_fee_bps=decision.round_trip_fee_bps,
+            buy_slippage_budget_bps=decision.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=decision.sell_slippage_budget_bps,
+            projected_net_bps=projected_net_bps,
+            projected_net_usd=projected_net_usd,
+            estimated_campaign_pnl_usd=(
+                decision.estimated_campaign_pnl_usd),
+            qty=qty,
+            planned_notional_usd=planned_notional,
+            entropy_reference_age_ms=entropy_age,
+            hedge_reference_age_ms=hedge_age,
+            reference_update_skew_ms=reference_skew_ms,
+            net_funding_bps_per_hour=funding,
+            entropy_fill_px=entropy_fill_px,
+            hedge_fill_px=hedge_fill_px,
+            hold_seconds=hold_seconds,
+            realized_pnl_usd=realized_pnl_usd,
+        ))
+
+    @staticmethod
+    def _shadow_fill_prices(
+            decision: StrategyDecision,
+            campaign_direction: Optional[str] = None) -> tuple[float, float]:
+        direction = campaign_direction or decision.direction
+        if decision.intent in {"OPEN", "ADD"}:
+            if direction == "sell_entropy":
+                return decision.plan.sell_limit, decision.plan.buy_limit
+            return decision.plan.buy_limit, decision.plan.sell_limit
+        if direction == "sell_entropy":
+            return decision.plan.buy_limit, decision.plan.sell_limit
+        return decision.plan.sell_limit, decision.plan.buy_limit
+
+    @staticmethod
+    def _close_fill_pnl(
+            campaign: PositionCampaign, *, qty: float,
+            entropy_px: float, hedge_px: float,
+            fees_usd: float) -> float:
+        if campaign.direction == "buy_entropy":
+            gross_per_base = (
+                entropy_px - campaign.entropy_avg_px
+                + campaign.hedge_avg_px - hedge_px)
+        else:
+            gross_per_base = (
+                campaign.entropy_avg_px - entropy_px
+                + hedge_px - campaign.hedge_avg_px)
+        return campaign.realized_pnl_usd + gross_per_base * qty - fees_usd
+
+    def _apply_shadow_decision(
+            self, decision: StrategyDecision, *, now_wall: float) -> None:
+        if decision.intent not in {"OPEN", "ADD", "CLOSE", "FORCED_CLOSE"}:
+            raise ValueError("only executable decisions can be applied")
+        if not self.record_only:
+            raise RuntimeError("shadow decisions require record-only mode")
+        prior = self.campaign
+        campaign_direction = (
+            decision.direction if prior is None else prior.direction)
+        entropy_px, hedge_px = self._shadow_fill_prices(
+            decision, campaign_direction)
+        qty = decision.plan.qty
+        fees = qty * (
+            entropy_px * self.entropy.fee_bps
+            + hedge_px * self.hedge.fee_bps) / 1e4
+        final_pnl = None
+        hold_seconds = None
+        if decision.intent == "OPEN":
+            if prior is not None:
+                raise RuntimeError("cannot open a second campaign")
+            self.campaign = PositionCampaign(
+                campaign_id=uuid.uuid4().hex,
+                mode="shadow",
+                identity=self._market_identity(),
+                direction=decision.direction,
+                opened_at=now_wall,
+                qty=qty,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        else:
+            if prior is None:
+                raise RuntimeError("campaign decision has no active campaign")
+            if decision.intent in {"CLOSE", "FORCED_CLOSE"}:
+                final_pnl = self._close_fill_pnl(
+                    prior, qty=qty, entropy_px=entropy_px,
+                    hedge_px=hedge_px, fees_usd=fees)
+                hold_seconds = max(now_wall - prior.opened_at, 0.0)
+            self.campaign = prior.apply_matched_fill(
+                intent=decision.intent,
+                direction=prior.direction,
+                qty=qty,
+                entropy_px=entropy_px,
+                hedge_px=hedge_px,
+                fees_usd=fees,
+            )
+        self.campaign_store.save(self.campaign)
+        campaign_id = (
+            prior.campaign_id if prior is not None
+            else self.campaign.campaign_id)
+        event = (
+            "campaign_closed"
+            if prior is not None and self.campaign is None
+            else "campaign_changed")
+        self._record_dynamic_decision(
+            decision, now_wall=now_wall,
+            campaign_id=campaign_id, event=event,
+            entropy_fill_px=entropy_px,
+            hedge_fill_px=hedge_px,
+            realized_pnl_usd=final_pnl,
+            hold_seconds=hold_seconds,
+        )
+
+    def _dynamic_entry_persisted(
+            self, decision: StrategyDecision, now_mono: float) -> bool:
+        if decision.intent not in {"OPEN", "ADD"}:
+            return True
+        delay = self.cfg.premium_persist_sec
+        if delay <= 0:
+            return True
+        direction = decision.direction
+        other = "buy_entropy" if direction == "sell_entropy" else "sell_entropy"
+        self._armed[other] = None
+        armed = self._armed.get(direction)
+        if armed is None:
+            self._armed[direction] = now_mono
+            self._schedule_poke(delay)
+            return False
+        elapsed = now_mono - armed
+        if elapsed < delay:
+            self._schedule_poke(delay - elapsed)
+            return False
+        return True
 
     # ------------------------------------------------------------- lifecycle
 
@@ -542,6 +960,10 @@ class Engine:
         for venue in self.venues.values():
             await self._close_resource(
                 f"[{venue.name}] close", venue.close)
+        try:
+            self._close_dynamic_strategy()
+        except BaseException as exc:
+            self._remember_error("strategy event recorder close", exc)
         if self.session is not None:
             await self._close_resource(
                 "HTTP session close", self.session.close)
@@ -620,10 +1042,18 @@ class Engine:
                 cfg.upper_bps, self.entropy.fee_bps, self.hedge.fee_bps,
                 self._step, self._min_notional)
 
+            if cfg.strategy_mode == "residual_dynamic":
+                self._initialize_dynamic_strategy()
+
             if self.record_only:
-                log.warning(
-                    "RECORD-ONLY — collecting minute data, no strategy, "
-                    "no orders")
+                if cfg.strategy_mode == "residual_dynamic":
+                    log.warning(
+                        "RECORD-ONLY SHADOW — evaluating dynamic residual "
+                        "campaigns, no orders")
+                else:
+                    log.warning(
+                        "RECORD-ONLY — collecting minute data, no strategy, "
+                        "no orders")
             else:
                 log.warning(
                     "LIVE — real orders will be sent (use --record-only "
@@ -651,11 +1081,14 @@ class Engine:
                     tasks, asyncio.create_task(
                         self._reference_recovery_loop(venue),
                         name=f"reference-rest-{venue.key}"))
-            if not self.record_only:
-                self._start_recorders(tasks)
+            if (not self.record_only
+                    or cfg.strategy_mode == "residual_dynamic"):
+                if not self.record_only:
+                    self._start_recorders(tasks)
                 self._track_task(
                     tasks, asyncio.create_task(
                         self._strategy_loop(), name="strategy"))
+            if not self.record_only:
                 self._track_task(
                     tasks, asyncio.create_task(
                         self._balance_loop(), name="balances"))
@@ -883,9 +1316,12 @@ class Engine:
     # -------------------------------------------------------------- strategy
 
     async def _strategy_loop(self) -> None:
+        wakeup = (self._strategy_evt
+                  if self.cfg.strategy_mode == "residual_dynamic"
+                  else self._update_evt)
         while not self.stop.is_set():
-            await self._update_evt.wait()
-            self._update_evt.clear()
+            await wakeup.wait()
+            wakeup.clear()
             if self.stop.is_set():
                 break
             try:
@@ -904,7 +1340,10 @@ class Engine:
 
         def _fire() -> None:
             self._poke_due = None
-            self._update_evt.set()
+            if self.cfg.strategy_mode == "residual_dynamic":
+                self._strategy_evt.set()
+            else:
+                self._update_evt.set()
 
         self._poke_due = due
         loop.call_at(due, _fire)
@@ -918,6 +1357,9 @@ class Engine:
     async def _evaluate(self) -> None:
         cfg = self.cfg
         if self.halted:
+            return
+        if cfg.strategy_mode == "residual_dynamic":
+            await self._evaluate_dynamic()
             return
         now = time.monotonic()
         if now - self.last_trade_mono < cfg.cooldown_sec:
@@ -938,6 +1380,55 @@ class Engine:
         self._exec_tasks.add(t)
         t.add_done_callback(self._execution_done)
         await asyncio.shield(t)
+
+    async def _evaluate_dynamic(self) -> None:
+        if self.dynamic_strategy is None or self.residual_model is None:
+            raise RuntimeError("dynamic strategy is not initialized")
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        self._advance_dynamic_model(
+            now_wall=now_wall, now_mono=now_mono)
+        self._record_model_snapshot(now_wall=now_wall)
+        model = self.residual_model.snapshot(
+            now_minute=int(now_wall // 60))
+        decision = self.dynamic_strategy.decide(
+            market=self._dynamic_market_view(now_mono),
+            model=model,
+            campaign=self.campaign,
+            now_wall=now_wall,
+            now_mono=now_mono,
+        )
+        if decision.intent == "SKIP":
+            if self.campaign is None:
+                self._clear_armed()
+            self._record_dynamic_decision(
+                decision, now_wall=now_wall)
+            return
+        if (decision.intent in {"OPEN", "ADD"}
+                and now_mono - self._dynamic_last_action_mono
+                < self.cfg.cooldown_sec):
+            self._schedule_poke(
+                self.cfg.cooldown_sec
+                - (now_mono - self._dynamic_last_action_mono))
+            deferred = StrategyDecision(
+                intent="SKIP", direction=decision.direction,
+                reason="COOLDOWN", model=decision.model)
+            self._record_dynamic_decision(
+                deferred, now_wall=now_wall)
+            return
+        if not self._dynamic_entry_persisted(decision, now_mono):
+            deferred = StrategyDecision(
+                intent="SKIP", direction=decision.direction,
+                reason="ENTRY_PERSISTING", model=decision.model)
+            self._record_dynamic_decision(
+                deferred, now_wall=now_wall)
+            return
+        self._clear_armed()
+        if not self.record_only:
+            raise RuntimeError(
+                "dynamic residual live execution is not initialized")
+        self._apply_shadow_decision(decision, now_wall=now_wall)
+        self._dynamic_last_action_mono = now_mono
 
     async def _execute_locked(self, buy, sell, plan: ArbPlan) -> None:
         """Run one execution while holding both venue locks (acquired by the
