@@ -5,10 +5,17 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_book.py)
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import entropy_arb.book as book_module  # noqa: E402
-from entropy_arb.book import OrderBook, plan_arb  # noqa: E402
+from entropy_arb.book import (  # noqa: E402
+    OrderBook,
+    plan_arb,
+    plan_convergence_trade,
+    plan_matched_close,
+)
 
 
 def make_book(bids, asks):
@@ -180,6 +187,124 @@ def test_feed_freshness_uses_monotonic_time_when_wall_clock_rolls_back(
     monotonic_clock[0] = 16.0
 
     assert book.is_fresh(5.0) is False
+
+
+def convergence_common(**overrides):
+    options = {
+        "direction": "sell_entropy",
+        "reference_basis_bps": -200.0,
+        "exit_residual_bps": 0.0,
+        "round_trip_fee_bps": 2.0,
+        "close_slippage_reserve_bps": 10.0,
+        "min_expected_profit_bps": 2.0,
+        "buy_slippage_budget_bps": 5.0,
+        "sell_slippage_budget_bps": 5.0,
+        "take_fraction": 1.0,
+        "cap_notional": 500.0,
+        "min_base": 0.01,
+        "min_notional": 10.0,
+        "size_step": 0.01,
+    }
+    options.update(overrides)
+    return options
+
+
+def test_convergence_plan_stops_before_depth_exceeds_budget():
+    buy = make_book(bids=[(99, 10)], asks=[(100, 1), (101, 1)])
+    sell = make_book(bids=[(99, 2)], asks=[(100, 10)])
+
+    plan, reason = plan_convergence_trade(
+        buy, sell, **convergence_common())
+
+    assert reason == "ok"
+    assert plan.qty == 1.0
+    assert plan.buy_limit == 100.0
+    assert plan.convergence_bps == pytest.approx(100.0)
+    assert plan.projected_net_bps == pytest.approx(88.0)
+
+
+def test_buy_entropy_convergence_uses_inverse_direction_sign():
+    entropy_buy = make_book(bids=[(98, 10)], asks=[(99, 10)])
+    hedge_sell = make_book(bids=[(100, 10)], asks=[(101, 10)])
+
+    plan, reason = plan_convergence_trade(
+        entropy_buy,
+        hedge_sell,
+        **convergence_common(
+            direction="buy_entropy",
+            reference_basis_bps=-50.0,
+            cap_notional=1000.0,
+        ),
+    )
+
+    assert reason == "ok"
+    assert plan.convergence_bps == pytest.approx(50.0)
+
+
+def test_convergence_plan_rejects_insufficient_round_trip_edge():
+    buy = make_book(bids=[(99, 10)], asks=[(100, 10)])
+    sell = make_book(bids=[(99, 10)], asks=[(100, 10)])
+
+    plan, reason = plan_convergence_trade(
+        buy,
+        sell,
+        **convergence_common(
+            reference_basis_bps=-100.0,
+            close_slippage_reserve_bps=10.0,
+        ),
+    )
+
+    assert plan is None
+    assert reason == "insufficient_net_edge"
+
+
+def test_convergence_plan_keeps_both_legs_under_fixed_cap():
+    buy = make_book(bids=[(99, 10)], asks=[(100, 10)])
+    sell = make_book(bids=[(149, 10)], asks=[(150, 10)])
+
+    plan, reason = plan_convergence_trade(
+        buy,
+        sell,
+        **convergence_common(
+            reference_basis_bps=0.0,
+            buy_slippage_budget_bps=20.0,
+            sell_slippage_budget_bps=20.0,
+        ),
+    )
+
+    assert reason == "ok"
+    assert plan.qty == 3.35
+    assert plan.buy_notional <= 500.0
+    assert plan.sell_notional <= 500.0
+
+
+def test_matched_close_only_uses_common_depth_inside_slippage_limit():
+    buy = make_book(
+        bids=[(99, 10)],
+        asks=[(100, 1), (100.1, 1), (101, 10)],
+    )
+    sell = make_book(
+        bids=[(100, 1), (99.9, 1), (98, 10)],
+        asks=[(101, 10)],
+    )
+
+    plan, reason = plan_matched_close(
+        buy,
+        sell,
+        max_qty=5.0,
+        cap_notional=500.0,
+        buy_slippage_bps=20.0,
+        sell_slippage_bps=20.0,
+        min_base=0.01,
+        min_notional=10.0,
+        size_step=0.01,
+    )
+
+    assert reason == "ok"
+    assert plan.qty == 2.0
+    assert plan.buy_limit == 100.1
+    assert plan.sell_limit == 99.9
+    assert plan.qty <= 5.0
 
 
 if __name__ == "__main__":
