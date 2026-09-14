@@ -44,6 +44,13 @@ class SlippageQuote:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class SlippageProtection:
+    budget_bps: float
+    sample_count: int
+    source: str
+
+
 class SlippageModel:
     """Keep small per-side histories and venue-level breach controls."""
 
@@ -84,7 +91,6 @@ class SlippageModel:
               convergence_bps: float, round_trip_fee_bps: float,
               min_profit_bps: float,
               max_edge_fraction: float) -> SlippageQuote:
-        key = self._key(venue, side)
         now = _finite("now", now)
         convergence = _finite("convergence_bps", convergence_bps)
         fees = _finite("round_trip_fee_bps", round_trip_fee_bps)
@@ -93,27 +99,38 @@ class SlippageModel:
         if now < 0 or fees < 0 or minimum < 0 or not 0 < fraction <= 1:
             raise ValueError("invalid slippage quote bounds")
 
+        protection = self.protection(venue=venue, side=side, now=now)
+        statistical = protection.budget_bps
+        source = protection.source
+        edge_cap = (convergence - fees - minimum) * fraction
+        budget = min(statistical, edge_cap, self.hard_max_bps)
+        if budget < self.min_bps:
+            return SlippageQuote(
+                None, statistical, edge_cap, protection.sample_count, source,
+                "SLIPPAGE_BUDGET_TOO_SMALL")
+        return SlippageQuote(
+            budget, statistical, edge_cap, protection.sample_count, source)
+
+    def protection(self, *, venue: str, side: str,
+                   now: float) -> SlippageProtection:
+        key = self._key(venue, side)
+        now = _finite("now", now)
+        if now < 0:
+            raise ValueError("now must be non-negative")
         selected = self._selected_samples(key, now)
         if len(selected) < self.min_live_samples:
-            statistical = min(
+            budget = min(
                 max(self.bootstrap_bps, self.min_bps), self.hard_max_bps)
             source = "bootstrap"
         else:
-            statistical = min(
+            budget = min(
                 max(_percentile(
                     [sample.adverse_bps for sample in selected], .95)
                     + self.safety_bps, self.min_bps),
                 self.hard_max_bps,
             )
             source = "live"
-        edge_cap = (convergence - fees - minimum) * fraction
-        budget = min(statistical, edge_cap, self.hard_max_bps)
-        if budget < self.min_bps:
-            return SlippageQuote(
-                None, statistical, edge_cap, len(selected), source,
-                "SLIPPAGE_BUDGET_TOO_SMALL")
-        return SlippageQuote(
-            budget, statistical, edge_cap, len(selected), source)
+        return SlippageProtection(budget, len(selected), source)
 
     def record(self, *, venue: str, side: str, now: float,
                adverse_bps: float, decision_budget_bps: float) -> None:

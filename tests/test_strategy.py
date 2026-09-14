@@ -4,10 +4,16 @@ import math
 import pytest
 
 from entropy_arb.strategy import (
+    DynamicResidualStrategy,
     MarketIdentity,
+    MarketView,
+    ModelSnapshot,
     ResidualModel,
     warm_start_residual_model,
 )
+from entropy_arb.book import OrderBook
+from entropy_arb.campaign import PositionCampaign
+from entropy_arb.slippage import SlippageModel
 
 
 def make_model(**overrides):
@@ -236,3 +242,246 @@ def test_warm_start_counts_blank_identity_as_rejected_row(tmp_path):
     )
 
     assert loaded.rejected_identity == 1
+
+
+def decision_book(bids, asks):
+    value = OrderBook()
+    value.apply_hl([
+        [{"px": str(px), "sz": str(size)} for px, size in bids],
+        [{"px": str(px), "sz": str(size)} for px, size in asks],
+    ])
+    return value
+
+
+def ready_snapshot(**overrides):
+    values = {
+        "version": 1,
+        "minute": 100,
+        "samples": 180,
+        "status": "READY",
+        "median_bps": 10.0,
+        "lower_bps": -20.0,
+        "q25_bps": 0.0,
+        "q75_bps": 20.0,
+        "upper_bps": 40.0,
+    }
+    values.update(overrides)
+    return ModelSnapshot(**values)
+
+
+def decision_strategy():
+    slippage = SlippageModel(
+        bootstrap_bps=5.0,
+        min_bps=1.0,
+        safety_bps=1.0,
+        hard_max_bps=20.0,
+        min_live_samples=10,
+    )
+    return DynamicResidualStrategy(
+        slippage=slippage,
+        reference_max_age_sec=15.0,
+        reference_max_skew_sec=15.0,
+        exit_band_fraction=0.25,
+        min_exit_band_bps=0.5,
+        min_expected_profit_bps=2.0,
+        soft_hold_sec=3600.0,
+        hard_hold_sec=21600.0,
+        hard_slippage_bps=20.0,
+        max_edge_fraction=0.25,
+    )
+
+
+def decision_market(*, sell_residual=None, buy_residual=None,
+                    reference=True, e_age=1.0, h_age=1.0, skew=0.0,
+                    books_ready=True, entropy_bid=None, entropy_ask=None,
+                    hedge_bid=99.9, hedge_ask=100.0):
+    if sell_residual is not None:
+        entropy_bid = hedge_ask * (1.0 + sell_residual / 1e4)
+        entropy_ask = entropy_bid + 0.01
+    elif buy_residual is not None:
+        entropy_ask = hedge_bid * (1.0 + buy_residual / 1e4)
+        entropy_bid = entropy_ask - 0.01
+    else:
+        entropy_bid = 99.99 if entropy_bid is None else entropy_bid
+        entropy_ask = 100.0 if entropy_ask is None else entropy_ask
+    return MarketView(
+        entropy_book=decision_book(
+            bids=[(entropy_bid, 20)], asks=[(entropy_ask, 20)]),
+        hedge_book=decision_book(
+            bids=[(hedge_bid, 20)], asks=[(hedge_ask, 20)]),
+        entropy_oracle_px=100.0 if reference else None,
+        hedge_index_px=100.0 if reference else None,
+        entropy_reference_age_sec=e_age if reference else None,
+        hedge_reference_age_sec=h_age if reference else None,
+        reference_skew_sec=skew if reference else None,
+        books_ready=books_ready,
+        entropy_fee_bps=0.9,
+        hedge_fee_bps=0.0,
+        take_fraction=0.5,
+        entry_cap_notional=500.0,
+        min_base=0.01,
+        min_notional=10.0,
+        size_step=0.01,
+    )
+
+
+def active_campaign(**overrides):
+    values = {
+        "campaign_id": "active",
+        "mode": "shadow",
+        "identity": MarketIdentity(
+            "ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        "direction": "buy_entropy",
+        "opened_at": 0.0,
+        "qty": 1.0,
+        "entropy_avg_px": 100.0,
+        "hedge_avg_px": 101.0,
+        "frozen_model": ready_snapshot(),
+        "entry_boundary_bps": -20.0,
+        "exit_target_bps": 2.5,
+        "fees_usd": 0.09,
+        "realized_pnl_usd": -0.09,
+    }
+    values.update(overrides)
+    return PositionCampaign(**values)
+
+
+def decide(market, *, campaign=None, snapshot=None, now=100.0):
+    return decision_strategy().decide(
+        market=market,
+        model=ready_snapshot() if snapshot is None else snapshot,
+        campaign=campaign,
+        now_wall=now,
+        now_mono=now,
+    )
+
+
+def test_ready_model_opens_sell_entropy_at_upper_quantile():
+    result = decide(decision_market(sell_residual=45.0))
+
+    assert result.intent == "OPEN"
+    assert result.direction == "sell_entropy"
+    assert result.entry_boundary_bps == 40.0
+    assert result.exit_target_bps == pytest.approx(17.5)
+    assert result.plan.projected_net_bps >= 2.0
+
+
+def test_ready_model_opens_buy_entropy_at_lower_quantile():
+    result = decide(decision_market(buy_residual=-25.0))
+
+    assert result.intent == "OPEN"
+    assert result.direction == "buy_entropy"
+    assert result.entry_boundary_bps == -20.0
+    assert result.exit_target_bps == pytest.approx(2.5)
+
+
+@pytest.mark.parametrize(
+    ("market", "snapshot", "reason"),
+    [
+        (decision_market(sell_residual=45.0),
+         ready_snapshot(status="MODEL_NOT_READY", samples=119),
+         "MODEL_NOT_READY"),
+        (decision_market(sell_residual=45.0),
+         ready_snapshot(status="REGIME_UNSTABLE"),
+         "REGIME_UNSTABLE"),
+        (decision_market(sell_residual=45.0, reference=False),
+         ready_snapshot(), "REFERENCE_INCOMPLETE"),
+        (decision_market(sell_residual=45.0, e_age=15.001),
+         ready_snapshot(), "REFERENCE_STALE"),
+        (decision_market(sell_residual=45.0, skew=15.001),
+         ready_snapshot(), "REFERENCE_SKEW"),
+        (decision_market(sell_residual=45.0, books_ready=False),
+         ready_snapshot(), "BOOK_NOT_READY"),
+    ],
+)
+def test_new_risk_fails_closed(market, snapshot, reason):
+    assert decide(market, snapshot=snapshot).reason == reason
+
+
+def test_active_campaign_adds_only_at_frozen_boundary():
+    campaign = active_campaign()
+
+    missed = decide(
+        decision_market(buy_residual=-19.0), campaign=campaign)
+    reached = decide(
+        decision_market(buy_residual=-25.0), campaign=campaign)
+
+    assert missed.intent == "SKIP"
+    assert missed.reason == "ENTRY_NOT_REACHED"
+    assert reached.intent == "ADD"
+    assert reached.direction == "buy_entropy"
+
+
+def test_active_campaign_uses_opposite_signal_only_to_close():
+    result = decide(
+        decision_market(sell_residual=45.0),
+        campaign=active_campaign(direction="buy_entropy"),
+    )
+
+    assert result.intent == "CLOSE"
+    assert result.direction == "sell_entropy"
+    assert result.plan.qty <= 1.0
+
+
+def test_normal_close_has_priority_over_new_entries():
+    campaign = active_campaign(
+        direction="sell_entropy",
+        entropy_avg_px=101.0,
+        hedge_avg_px=100.0,
+        entry_boundary_bps=40.0,
+        exit_target_bps=17.5,
+    )
+
+    result = decide(
+        decision_market(entropy_bid=99.99, entropy_ask=100.0,
+                        hedge_bid=100.0, hedge_ask=100.01),
+        campaign=campaign,
+    )
+
+    assert result.intent == "CLOSE"
+    assert result.direction == "buy_entropy"
+
+
+def test_soft_exit_closes_at_nonnegative_estimated_campaign_pnl():
+    campaign = active_campaign(
+        direction="sell_entropy",
+        entropy_avg_px=102.0,
+        hedge_avg_px=100.0,
+        entry_boundary_bps=40.0,
+        exit_target_bps=-50.0,
+    )
+    market = decision_market(
+        entropy_bid=99.99,
+        entropy_ask=100.0,
+        hedge_bid=100.0,
+        hedge_ask=100.01,
+    )
+
+    before_soft = decide(market, campaign=campaign, now=3599.0)
+    at_soft = decide(market, campaign=campaign, now=3600.0)
+
+    assert before_soft.intent == "SKIP"
+    assert at_soft.intent == "CLOSE"
+    assert at_soft.reason == "SOFT_EXIT_NONNEGATIVE"
+
+
+def test_hard_exit_uses_fresh_books_even_without_reference():
+    result = decide(
+        decision_market(reference=False),
+        campaign=active_campaign(),
+        now=21600.0,
+    )
+
+    assert result.intent == "FORCED_CLOSE"
+    assert result.plan.qty == 1.0
+
+
+def test_reference_failure_blocks_add_but_not_hard_exit():
+    result = decide(
+        decision_market(buy_residual=-25.0, reference=False),
+        campaign=active_campaign(),
+        now=100.0,
+    )
+
+    assert result.intent == "SKIP"
+    assert result.reason == "REFERENCE_INCOMPLETE"

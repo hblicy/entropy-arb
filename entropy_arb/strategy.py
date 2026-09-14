@@ -5,7 +5,13 @@ import csv
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+from .book import OrderBook, plan_convergence_trade, plan_matched_close
+from .slippage import SlippageModel
+
+if TYPE_CHECKING:
+    from .campaign import PositionCampaign
 
 
 MODEL_NOT_READY = "MODEL_NOT_READY"
@@ -297,3 +303,445 @@ def warm_start_residual_model(
     for minute, residual in sorted(accepted_rows):
         model.observe(minute=minute, residual_bps=residual, valid=True)
     return WarmStartResult(**counts)
+
+
+@dataclass(frozen=True)
+class MarketView:
+    entropy_book: OrderBook
+    hedge_book: OrderBook
+    entropy_oracle_px: Optional[float]
+    hedge_index_px: Optional[float]
+    entropy_reference_age_sec: Optional[float]
+    hedge_reference_age_sec: Optional[float]
+    reference_skew_sec: Optional[float]
+    books_ready: bool
+    entropy_fee_bps: float
+    hedge_fee_bps: float
+    take_fraction: float
+    entry_cap_notional: float
+    min_base: float
+    min_notional: float
+    size_step: float
+
+
+@dataclass(frozen=True)
+class StrategyDecision:
+    intent: str = "SKIP"
+    direction: str = ""
+    reason: str = ""
+    plan: Optional[Any] = None
+    model: Optional[ModelSnapshot] = None
+    signed_residual_bps: Optional[float] = None
+    reference_basis_bps: Optional[float] = None
+    entry_boundary_bps: Optional[float] = None
+    exit_target_bps: Optional[float] = None
+    convergence_bps: Optional[float] = None
+    round_trip_fee_bps: Optional[float] = None
+    buy_slippage_budget_bps: Optional[float] = None
+    sell_slippage_budget_bps: Optional[float] = None
+    estimated_campaign_pnl_usd: Optional[float] = None
+
+
+class DynamicResidualStrategy:
+    """Pure strategy decision layer over normalized books and references."""
+
+    def __init__(
+            self, *, slippage: SlippageModel,
+            reference_max_age_sec: float,
+            reference_max_skew_sec: float,
+            exit_band_fraction: float,
+            min_exit_band_bps: float,
+            min_expected_profit_bps: float,
+            soft_hold_sec: float,
+            hard_hold_sec: float,
+            hard_slippage_bps: float,
+            max_edge_fraction: float) -> None:
+        self.slippage = slippage
+        self.reference_max_age_sec = reference_max_age_sec
+        self.reference_max_skew_sec = reference_max_skew_sec
+        self.exit_band_fraction = exit_band_fraction
+        self.min_exit_band_bps = min_exit_band_bps
+        self.min_expected_profit_bps = min_expected_profit_bps
+        self.soft_hold_sec = soft_hold_sec
+        self.hard_hold_sec = hard_hold_sec
+        self.hard_slippage_bps = hard_slippage_bps
+        self.max_edge_fraction = max_edge_fraction
+
+    @staticmethod
+    def _skip(reason: str, *, direction: str = "",
+              model: Optional[ModelSnapshot] = None) -> StrategyDecision:
+        return StrategyDecision(
+            intent="SKIP", direction=direction, reason=reason, model=model)
+
+    @staticmethod
+    def _book_gate(market: MarketView) -> Optional[str]:
+        if not market.books_ready:
+            return "BOOK_NOT_READY"
+        prices = (
+            market.entropy_book.best_bid(), market.entropy_book.best_ask(),
+            market.hedge_book.best_bid(), market.hedge_book.best_ask())
+        if any(value is None or not math.isfinite(value) or value <= 0
+               for value in prices):
+            return "BOOK_NOT_READY"
+        return None
+
+    def _reference_gate(self, market: MarketView) -> Optional[str]:
+        values = (
+            market.entropy_oracle_px, market.hedge_index_px,
+            market.entropy_reference_age_sec,
+            market.hedge_reference_age_sec,
+            market.reference_skew_sec,
+        )
+        if any(value is None for value in values):
+            return "REFERENCE_INCOMPLETE"
+        if any(not math.isfinite(value) or value < 0 for value in values):
+            return "REFERENCE_INCOMPLETE"
+        if market.entropy_oracle_px <= 0 or market.hedge_index_px <= 0:
+            return "REFERENCE_INCOMPLETE"
+        if (market.entropy_reference_age_sec > self.reference_max_age_sec
+                or market.hedge_reference_age_sec
+                > self.reference_max_age_sec):
+            return "REFERENCE_STALE"
+        if market.reference_skew_sec > self.reference_max_skew_sec:
+            return "REFERENCE_SKEW"
+        return None
+
+    @staticmethod
+    def _model_gate(model: ModelSnapshot) -> Optional[str]:
+        if model.status == MODEL_NOT_READY:
+            return MODEL_NOT_READY
+        if model.status != READY:
+            return REGIME_UNSTABLE
+        return None
+
+    @staticmethod
+    def _reference_values(
+            market: MarketView) -> tuple[float, float, float]:
+        basis = (
+            market.entropy_oracle_px / market.hedge_index_px - 1.0) * 1e4
+        sell_residual = (
+            market.entropy_book.best_bid()
+            / market.hedge_book.best_ask() - 1.0) * 1e4 - basis
+        buy_residual = (
+            market.entropy_book.best_ask()
+            / market.hedge_book.best_bid() - 1.0) * 1e4 - basis
+        return basis, sell_residual, buy_residual
+
+    def decide(
+            self, *, market: MarketView, model: ModelSnapshot,
+            campaign: Optional["PositionCampaign"], now_wall: float,
+            now_mono: float) -> StrategyDecision:
+        book_error = self._book_gate(market)
+        if book_error is not None:
+            return self._skip(book_error, model=model)
+        if campaign is not None:
+            status = campaign.status_at(
+                now_wall, soft_sec=self.soft_hold_sec,
+                hard_sec=self.hard_hold_sec)
+            if status == "HARD_EXIT":
+                return self._hard_close(
+                    market=market, model=model, campaign=campaign)
+            reference_error = self._reference_gate(market)
+            if reference_error is not None:
+                return self._skip(
+                    reference_error, direction=campaign.direction,
+                    model=model)
+            close = self._normal_or_soft_close(
+                market=market, model=model, campaign=campaign,
+                status=status, now_mono=now_mono)
+            if close is not None:
+                return close
+            if status != "OPEN":
+                return self._skip(
+                    "SOFT_EXIT_WAITING", direction=campaign.direction,
+                    model=model)
+            model_error = self._model_gate(model)
+            if model_error is not None:
+                return self._skip(
+                    model_error, direction=campaign.direction, model=model)
+            return self._add_or_skip(
+                market=market, model=model, campaign=campaign,
+                now_mono=now_mono)
+
+        model_error = self._model_gate(model)
+        if model_error is not None:
+            return self._skip(model_error, model=model)
+        reference_error = self._reference_gate(market)
+        if reference_error is not None:
+            return self._skip(reference_error, model=model)
+        return self._open_or_skip(
+            market=market, model=model, now_mono=now_mono)
+
+    def _open_or_skip(
+            self, *, market: MarketView, model: ModelSnapshot,
+            now_mono: float) -> StrategyDecision:
+        basis, sell_residual, buy_residual = self._reference_values(market)
+        candidates = []
+        if sell_residual >= model.upper_bps:
+            candidates.append((
+                "sell_entropy", sell_residual, model.upper_bps))
+        if buy_residual <= model.lower_bps:
+            candidates.append((
+                "buy_entropy", buy_residual, model.lower_bps))
+        if not candidates:
+            return self._skip("ENTRY_NOT_REACHED", model=model)
+        decisions = [
+            self._entry_decision(
+                intent="OPEN", direction=direction, residual=residual,
+                entry_boundary=boundary, market=market, model=model,
+                basis=basis, now_mono=now_mono,
+                exit_target=None)
+            for direction, residual, boundary in candidates
+        ]
+        executable = [decision for decision in decisions
+                      if decision.intent == "OPEN"]
+        if executable:
+            return max(
+                executable,
+                key=lambda decision: decision.plan.projected_net_bps)
+        return decisions[0]
+
+    def _add_or_skip(
+            self, *, market: MarketView, model: ModelSnapshot,
+            campaign: "PositionCampaign", now_mono: float) -> StrategyDecision:
+        basis, sell_residual, buy_residual = self._reference_values(market)
+        residual = (sell_residual if campaign.direction == "sell_entropy"
+                    else buy_residual)
+        reached = (
+            residual >= campaign.entry_boundary_bps
+            if campaign.direction == "sell_entropy"
+            else residual <= campaign.entry_boundary_bps)
+        if not reached:
+            opposite_reached = (
+                buy_residual <= model.lower_bps
+                if campaign.direction == "sell_entropy"
+                else sell_residual >= model.upper_bps)
+            return self._skip(
+                "CAMPAIGN_DIRECTION_LOCKED" if opposite_reached
+                else "ENTRY_NOT_REACHED",
+                direction=campaign.direction, model=model)
+        return self._entry_decision(
+            intent="ADD", direction=campaign.direction,
+            residual=residual,
+            entry_boundary=campaign.entry_boundary_bps,
+            exit_target=campaign.exit_target_bps,
+            market=market, model=model, basis=basis,
+            now_mono=now_mono)
+
+    def _entry_decision(
+            self, *, intent: str, direction: str, residual: float,
+            entry_boundary: float, exit_target: Optional[float],
+            market: MarketView, model: ModelSnapshot, basis: float,
+            now_mono: float) -> StrategyDecision:
+        if (self.slippage.entry_paused("entropy", now_mono)
+                or self.slippage.entry_paused("hedge", now_mono)):
+            return self._skip(
+                "SLIPPAGE_PAUSED", direction=direction, model=model)
+        if exit_target is None:
+            band = abs(entry_boundary - model.median_bps)
+            exit_band = max(
+                self.min_exit_band_bps, band * self.exit_band_fraction)
+            exit_target = (
+                model.median_bps + exit_band
+                if direction == "sell_entropy"
+                else model.median_bps - exit_band)
+        convergence = (
+            residual - exit_target
+            if direction == "sell_entropy"
+            else exit_target - residual)
+        fees = 2.0 * (
+            market.entropy_fee_bps + market.hedge_fee_bps)
+        if direction == "sell_entropy":
+            legs = (
+                ("hedge", "buy"), ("entropy", "sell"),
+                ("entropy", "buy"), ("hedge", "sell"))
+            buy_book, sell_book = market.hedge_book, market.entropy_book
+        else:
+            legs = (
+                ("entropy", "buy"), ("hedge", "sell"),
+                ("hedge", "buy"), ("entropy", "sell"))
+            buy_book, sell_book = market.entropy_book, market.hedge_book
+        quotes = [
+            self.slippage.quote(
+                venue=venue, side=side, now=now_mono,
+                convergence_bps=convergence,
+                round_trip_fee_bps=fees,
+                min_profit_bps=self.min_expected_profit_bps,
+                max_edge_fraction=self.max_edge_fraction)
+            for venue, side in legs
+        ]
+        if any(quote.budget_bps is None for quote in quotes):
+            return self._skip(
+                "SLIPPAGE_BUDGET_TOO_SMALL", direction=direction,
+                model=model)
+        buy_budget = quotes[0].budget_bps
+        sell_budget = quotes[1].budget_bps
+        close_reserve = quotes[2].budget_bps + quotes[3].budget_bps
+        size_factor = min(
+            self.slippage.entry_size_factor("entropy", now_mono),
+            self.slippage.entry_size_factor("hedge", now_mono))
+        cap = market.entry_cap_notional * size_factor
+        plan, reason = plan_convergence_trade(
+            buy_book, sell_book,
+            direction=direction,
+            reference_basis_bps=basis,
+            exit_residual_bps=exit_target,
+            round_trip_fee_bps=fees,
+            close_slippage_reserve_bps=close_reserve,
+            min_expected_profit_bps=self.min_expected_profit_bps,
+            buy_slippage_budget_bps=buy_budget,
+            sell_slippage_budget_bps=sell_budget,
+            take_fraction=market.take_fraction,
+            cap_notional=cap,
+            min_base=market.min_base,
+            min_notional=market.min_notional,
+            size_step=market.size_step,
+        )
+        if plan is None:
+            return self._skip(
+                reason.upper(), direction=direction, model=model)
+        return StrategyDecision(
+            intent=intent,
+            direction=direction,
+            reason="ENTRY_SIGNAL",
+            plan=plan,
+            model=model,
+            signed_residual_bps=residual,
+            reference_basis_bps=basis,
+            entry_boundary_bps=entry_boundary,
+            exit_target_bps=exit_target,
+            convergence_bps=convergence,
+            round_trip_fee_bps=fees,
+            buy_slippage_budget_bps=buy_budget,
+            sell_slippage_budget_bps=sell_budget,
+        )
+
+    def _close_books_and_sides(
+            self, market: MarketView,
+            campaign: "PositionCampaign"):
+        if campaign.direction == "sell_entropy":
+            return (market.entropy_book, market.hedge_book,
+                    "buy_entropy", ("entropy", "buy"),
+                    ("hedge", "sell"))
+        return (market.hedge_book, market.entropy_book,
+                "sell_entropy", ("hedge", "buy"),
+                ("entropy", "sell"))
+
+    def _hard_close(
+            self, *, market: MarketView, model: ModelSnapshot,
+            campaign: "PositionCampaign") -> StrategyDecision:
+        buy_book, sell_book, direction, _, _ = self._close_books_and_sides(
+            market, campaign)
+        plan, reason = plan_matched_close(
+            buy_book, sell_book,
+            max_qty=campaign.qty,
+            cap_notional=market.entry_cap_notional,
+            buy_slippage_bps=self.hard_slippage_bps,
+            sell_slippage_bps=self.hard_slippage_bps,
+            min_base=market.min_base,
+            min_notional=market.min_notional,
+            size_step=market.size_step,
+        )
+        if plan is None:
+            return self._skip(
+                f"HARD_EXIT_{reason.upper()}", direction=direction,
+                model=model)
+        return StrategyDecision(
+            intent="FORCED_CLOSE", direction=direction,
+            reason="HARD_HOLD_LIMIT", plan=plan, model=model,
+            entry_boundary_bps=campaign.entry_boundary_bps,
+            exit_target_bps=campaign.exit_target_bps,
+            buy_slippage_budget_bps=self.hard_slippage_bps,
+            sell_slippage_budget_bps=self.hard_slippage_bps,
+        )
+
+    def _normal_or_soft_close(
+            self, *, market: MarketView, model: ModelSnapshot,
+            campaign: "PositionCampaign", status: str,
+            now_mono: float) -> Optional[StrategyDecision]:
+        basis, sell_residual, buy_residual = self._reference_values(market)
+        if campaign.direction == "sell_entropy":
+            residual = buy_residual
+            target_hit = residual <= campaign.exit_target_bps
+        else:
+            residual = sell_residual
+            target_hit = residual >= campaign.exit_target_bps
+        buy_book, sell_book, direction, buy_leg, sell_leg = (
+            self._close_books_and_sides(market, campaign))
+        buy_protection = self.slippage.protection(
+            venue=buy_leg[0], side=buy_leg[1], now=now_mono)
+        sell_protection = self.slippage.protection(
+            venue=sell_leg[0], side=sell_leg[1], now=now_mono)
+        estimated_pnl = self._estimate_close_pnl(
+            market=market, campaign=campaign,
+            buy_budget=buy_protection.budget_bps,
+            sell_budget=sell_protection.budget_bps)
+        soft_profitable = status == "SOFT_EXIT" and estimated_pnl >= 0
+        if not target_hit and not soft_profitable:
+            return None
+        plan, reason = plan_matched_close(
+            buy_book, sell_book,
+            max_qty=campaign.qty,
+            cap_notional=market.entry_cap_notional,
+            buy_slippage_bps=buy_protection.budget_bps,
+            sell_slippage_bps=sell_protection.budget_bps,
+            min_base=market.min_base,
+            min_notional=market.min_notional,
+            size_step=market.size_step,
+        )
+        if plan is None:
+            return self._skip(
+                f"CLOSE_{reason.upper()}", direction=direction,
+                model=model)
+        return StrategyDecision(
+            intent="CLOSE", direction=direction,
+            reason=("RESIDUAL_EXIT_TARGET" if target_hit
+                    else "SOFT_EXIT_NONNEGATIVE"),
+            plan=plan,
+            model=model,
+            signed_residual_bps=residual,
+            reference_basis_bps=basis,
+            entry_boundary_bps=campaign.entry_boundary_bps,
+            exit_target_bps=campaign.exit_target_bps,
+            buy_slippage_budget_bps=buy_protection.budget_bps,
+            sell_slippage_budget_bps=sell_protection.budget_bps,
+            estimated_campaign_pnl_usd=estimated_pnl,
+        )
+
+    @staticmethod
+    def _estimate_close_pnl(
+            *, market: MarketView, campaign: "PositionCampaign",
+            buy_budget: float, sell_budget: float) -> float:
+        quantity = campaign.qty
+        if campaign.direction == "buy_entropy":
+            entropy_close = market.entropy_book.best_bid()
+            hedge_close = market.hedge_book.best_ask()
+            gross = (entropy_close - campaign.entropy_avg_px
+                     + campaign.hedge_avg_px - hedge_close) * quantity
+            entropy_side = entropy_close
+            hedge_side = hedge_close
+            buy_notional = hedge_close * quantity
+            sell_notional = entropy_close * quantity
+            buy_fee = market.hedge_fee_bps
+            sell_fee = market.entropy_fee_bps
+        else:
+            entropy_close = market.entropy_book.best_ask()
+            hedge_close = market.hedge_book.best_bid()
+            gross = (campaign.entropy_avg_px - entropy_close
+                     + hedge_close - campaign.hedge_avg_px) * quantity
+            entropy_side = entropy_close
+            hedge_side = hedge_close
+            buy_notional = entropy_close * quantity
+            sell_notional = hedge_close * quantity
+            buy_fee = market.entropy_fee_bps
+            sell_fee = market.hedge_fee_bps
+        close_fees = (
+            buy_notional * buy_fee / 1e4
+            + sell_notional * sell_fee / 1e4)
+        slippage_reserve = (
+            buy_notional * buy_budget / 1e4
+            + sell_notional * sell_budget / 1e4)
+        if entropy_side <= 0 or hedge_side <= 0:
+            raise ValueError("close prices must be positive")
+        return (campaign.realized_pnl_usd + gross
+                - close_fees - slippage_reserve)

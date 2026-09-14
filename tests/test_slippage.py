@@ -160,3 +160,13 @@ def test_shadow_path_can_avoid_recording_by_not_calling_record():
     model = make_model()
 
     assert model.sample_count("entropy", "buy") == 0
+
+
+def test_protection_exposes_statistical_budget_without_entry_edge_cap():
+    model = make_model()
+
+    result = model.protection(venue="entropy", side="buy", now=100.0)
+
+    assert result.budget_bps == 5.0
+    assert result.source == "bootstrap"
+    assert result.sample_count == 0
