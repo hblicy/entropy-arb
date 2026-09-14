@@ -74,8 +74,9 @@ cp .env.example .env                     # 密钥——交易必填
 `lighter`、`lighter-rh`、`tradexyz`）。如果同一标的在对冲交易所使用
 不同名称，再传 `--hedge-symbol`；不传时默认与 `--symbol` 相同。
 
-本机器人**没有模拟盘**——要么采集数据（`--record-only`），要么实盘交易。
-请用采集的数据和最小的仓位上限来验证策略，而不是模拟成交。
+`--record-only` 永远不会发单。使用 `strategy.mode: residual_dynamic` 时，
+它还会按计划价格推进一套隔离的影子批次；这些假设成交只用于验证，不是实际
+成交或真实盈亏。旧 `fixed_premium` 模式仍然只采集数据。
 
 **第一步：先采集数据**（不需要任何密钥）：
 
@@ -90,6 +91,18 @@ python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
   --hedge-symbol ANTHROPIC --no-dashboard
 ```
 
+在 VPS 或 `screen` 中建议显式保存控制台日志：
+
+```bash
+python -u main.py \
+  --record-only \
+  --symbol ANTH \
+  --hedge lighter-rh \
+  --hedge-symbol ANTHROPIC \
+  --no-dashboard \
+  2>&1 | tee -a logs/engine.log
+```
+
 至少运行几个小时（最好一整天——溢价存在日内规律）。分钟聚合写入
 `logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
 `logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
@@ -99,7 +112,9 @@ python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
 
 参考价格和资金费复用现有行情 WebSocket 采集，启动时通过 REST 初始化，参考
 WebSocket 过期后再用 REST 定时恢复。Hyperliquid 与 Lighter 的资金费统一为
-`bps/hour`。参考异常和残差告警只记录、只告警，不会阻止开仓或改变交易阈值。
+`bps/hour`。`fixed` 模式下，参考异常和残差告警仍只记录、只告警；
+`residual_dynamic` 模式增加风险时必须具备新鲜且更新时间差合格的参考数据，
+硬退出则不依赖参考数据。
 信号行会追加两腿的参考价格、资金费、数据龄，以及按方向计算的有符号可成交
 溢价、残差、残差 edge 和净资金费；参考值缺失时留空，但不会丢弃原信号。
 
@@ -122,6 +137,9 @@ CSV writer 后 `flush()` 才报告结果不确定的 I/O 错误，采集器不�
 python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
   --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
+python3 tools/analyze.py --csv logs/minutes.csv \
+  --strategy-csv logs/strategy-events.csv \
+  --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 它只分析 `logs/minutes.csv`，输出溢价分布、各档带宽的历史触发频率，
@@ -129,7 +147,37 @@ python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
 重启片段会先合并再做样本数过滤，因此每分钟只计一次；它不会分析
 `logs/signals.csv`，也不会把同一分钟文件中的多个已标识市场混合计算。
 新参考列存在有效值时，分析器还会输出分钟 close 的参考基差、有符号残差和
-每小时资金费差分布；普通 `.csv` 与 `.csv.gz` 使用完全相同的分析逻辑。
+每小时资金费差分布。传入 `--strategy-csv` 后，还会汇总已完成/未平批次、
+持仓时限、强制退出、模型可用率、拒绝原因及影子/实盘结果；普通 `.csv` 与
+`.csv.gz` 使用完全相同的分析逻辑。
+
+考虑实盘前，先回放轮转后的原始信号文件。它是只读的 **top-of-book
+approximation**（最优盘口近似），不会把假设成交冒充为实际盈亏：
+
+```bash
+python3 tools/replay_strategy.py \
+  --minutes logs/minutes.csv \
+  --signals logs/signals-20260912.csv.gz \
+            logs/signals-20260913.csv.gz \
+            logs/signals.csv \
+  --config config.yaml
+```
+
+### 动态残差从影子到实盘的闸门
+
+`strategy.mode: residual_dynamic` 启用滚动有符号残差模型；默认的
+`strategy.live_enabled: false` 是独立的第二道实盘开关。只有以下三个条件同时
+满足，动态策略才可能发送真实订单：
+
+1. `strategy.mode` 为 `residual_dynamic`；
+2. `strategy.live_enabled` 为 `true`；
+3. 启动命令中没有 `--record-only`。
+
+影子与实盘绝不共用状态：默认实盘文件为 `logs/campaign-state.json`，
+`--record-only` 自动使用 `logs/campaign-state.shadow.json`。动态实盘启动时会先
+读取两边真实仓位，仅当保存批次的交易对、方向和匹配数量均一致时才恢复。
+状态缺失但仓位非零、状态损坏或两边不一致时会暂停并要求人工恢复，不会从仓位
+猜测冻结模型。测试或回放完成也不代表已获授权把 `live_enabled` 改为 `true`。
 
 **第三步：实盘** —— 填写 `.env`，安装签名 SDK，仓位上限从刚好满足
 交易所最小名义的水平开始：
@@ -142,8 +190,9 @@ python3 main.py --symbol SNDK --hedge lighter-rh
 运行时和签名 SDK 的直接依赖都已固定版本，Lighter 也固定到了具体 Git 提交。
 升级依赖必须主动修改版本，并在部署新环境前重新跑完整测试和仅采集检查。
 
-不带 `--record-only` 运行时，只要两边行情就绪且溢价越过带宽，就会立即
-发送真实订单。
+不带 `--record-only` 会连接真实账户。固定策略在两边行情就绪且越过带宽时
+可能发单；动态策略还必须同时通过独立实盘开关、模型就绪、持续性检查、参考
+数据检查和批次状态对账。
 
 **仪表盘。** 在终端运行时会显示实时 Rich 仪表盘：两边盘口（含数据龄/点差）、
 持仓与上限、账户权益与本次会话盈亏、两个方向的可成交溢价对比完整门槛
@@ -205,6 +254,9 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
 | `recorder.signal_rotate_daily` | 按 UTC 日轮转并校验压缩信号明细 | true |
 | `reference.rest_recovery_sec` / `stale_sec` | REST 恢复周期 / 参考数据过期阈值 | 15 / 60 |
 | `reference.residual_alert_bps` / `residual_persist_sec` | 状态化观察告警的残差阈值 / 持续时间 | 20 / 30 |
+| `strategy.mode` / `strategy.live_enabled` | 固定带或滚动残差策略；独立动态实盘闸门 | `residual_dynamic` / false |
+| `strategy.state_file` / `strategy.event_csv` | 持久批次状态与低频策略日志 | `logs/campaign-state.json`；`logs/strategy-events.csv` |
+| `slippage.*` | 真实成交 p95 预算、硬上限及开仓降级控制 | 见配置文件 |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
 
 ## 密钥配置（`.env`，仅实盘需要）
@@ -245,8 +297,8 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
   主动取消在途下单任务。初始化失败时也会关闭此前已创建的全部任务和交易所；
   任一受监督后台任务报错或意外提前退出，都会触发停机，并在清理完成后让进程
   以非零状态退出。
-- **仅实盘**：没有模拟成交模式。`--record-only` 是唯一无风险的运行方式，
-  其余都是真金白银。
+- **无订单影子**：`--record-only` 不会提交订单。动态影子成交只使用计划价格，
+  不能当作实盘结果；不带 `--record-only` 时，只要实盘闸门允许就可能动用真金白银。
 
 ## 目录结构
 
@@ -263,7 +315,10 @@ entropy_arb/venues/registry.py  显式适配器工厂注册表
 entropy_arb/engine.py    双交易所策略主循环
 entropy_arb/dashboard.py Rich 终端仪表盘
 entropy_arb/recorder.py  分钟级盘口 + 只读信号生命周期采集
-tools/analyze.py         minutes.csv -> 阈值建议
+entropy_arb/strategy.py  滚动残差模型与纯策略决策
+entropy_arb/campaign.py  单批次持久状态与启动对账
+tools/analyze.py         分钟阈值 + 可选批次汇总
+tools/replay_strategy.py 只读最优盘口策略回放
 tests/                   python3 -m pytest tests/
 ```
 
@@ -277,8 +332,8 @@ tests/                   python3 -m pytest tests/
   `config.yaml` 与市场同步。
 - **USDG 基差**（`lighter-rh`）：对冲腿以 USDG 计价，持续溢价中有
   一部分是稳定币本身的基差；midline 吸收其水平，但 USDG 的*变动*是真实盈亏。
-- **资金费**：两个交易所有独立费率。当前会统一单位、记录并告警，但持仓成本
-  仍不会阻止开仓或改变阈值——仓位上限请设小一些。
+- **资金费**：两个交易所有独立费率。固定策略只统一单位、记录并告警；动态
+  残差策略会把持仓期资金费估计计入入场判断，但实际费率仍可能突变。
 - **薄盘口**：Entropy 深度可能很小；`take_fraction` 与名义上限控制单笔规模，
   但部分成交后对冲腿的滑点是真实存在的。
 - **交易时段**：股票类永续（如 SNDK）盘后各所预言机行为不同，建议加宽带宽
