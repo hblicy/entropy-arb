@@ -16,6 +16,8 @@ from entropy_arb.config import (  # noqa: E402
     load_config,
     validate_output_paths,
 )
+from entropy_arb.runtime_paths import strategy_paths  # noqa: E402
+from entropy_arb.strategy import MarketIdentity  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 EXAMPLE = os.path.join(ROOT, "config.example.yaml")
@@ -289,6 +291,66 @@ def test_record_only_rejects_signal_and_log_path_collision():
             + "logging:\n"
             + "  file: ./logs/shared.csv\n",
             record_only=True,
+        )
+
+
+def test_record_only_rejects_final_shadow_campaign_path_collision(tmp_path):
+    cfg = load_config(
+        EXAMPLE,
+        NO_ENV,
+        symbol="ANTH",
+        hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh",
+        record_only=True,
+        validate_outputs=False,
+    )
+    cfg.strategy_state_file = str(tmp_path / "campaign.json")
+    cfg.strategy_event_csv = str(tmp_path / "events.csv")
+    market = MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh")
+    paths = strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        market,
+        shadow=True,
+    )
+    cfg.recorder_csv = str(paths.campaign)
+    cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+
+    with pytest.raises(ConfigError, match="must use different paths"):
+        validate_output_paths(
+            cfg,
+            record_only=True,
+            log_file_active=False,
+        )
+
+
+def test_live_rejects_final_pending_state_path_collision(tmp_path):
+    cfg = load_config(
+        EXAMPLE,
+        NO_ENV,
+        symbol="ANTH",
+        hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh",
+        record_only=True,
+        validate_outputs=False,
+    )
+    cfg.strategy_state_file = str(tmp_path / "campaign.json")
+    cfg.strategy_event_csv = str(tmp_path / "events.csv")
+    cfg.recorder_enabled = False
+    market = MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh")
+    paths = strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        market,
+        shadow=False,
+    )
+    cfg.trades_csv = str(paths.pending)
+
+    with pytest.raises(ConfigError, match="must use different paths"):
+        validate_output_paths(
+            cfg,
+            record_only=False,
+            log_file_active=False,
         )
 
 

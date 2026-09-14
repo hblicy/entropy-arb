@@ -32,6 +32,9 @@ from typing import Any, Dict, Optional
 import yaml
 from dotenv import load_dotenv
 
+from .runtime_paths import strategy_paths
+from .strategy import MarketIdentity
+
 HL_API_URL = "https://api.hyperliquid.xyz"
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"   # official ws — the only HL feed used
 
@@ -449,10 +452,24 @@ def validate_output_paths(cfg: Config, *, record_only: bool,
     if log_file_active:
         outputs.append(("logging.file", cfg.log_file))
     if cfg.strategy_mode == "residual_dynamic":
+        identity = MarketIdentity(
+            cfg.entropy.symbol,
+            cfg.entropy.hl_dex,
+            cfg.hedge.symbol,
+            cfg.hedge_venue,
+        )
+        paths = strategy_paths(
+            cfg.strategy_state_file,
+            cfg.strategy_event_csv,
+            identity,
+            shadow=record_only,
+        )
         outputs.extend((
-            ("strategy.state_file", cfg.strategy_state_file),
-            ("strategy.event_csv", cfg.strategy_event_csv),
+            ("strategy.state_file", str(paths.campaign)),
+            ("strategy.event_csv", str(paths.events)),
         ))
+        if paths.pending is not None:
+            outputs.append(("strategy.pending_file", str(paths.pending)))
     for name, path in outputs:
         if not path or not path.strip():
             raise ConfigError(

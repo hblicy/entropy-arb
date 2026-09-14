@@ -57,6 +57,7 @@ from .recovery_state import (
     PendingLegState,
     pending_execution_path,
 )
+from .runtime_paths import StrategyPaths, strategy_paths
 from .slippage import SlippageModel
 from .strategy import (
     DynamicResidualStrategy,
@@ -449,6 +450,19 @@ class Engine:
             hedge_venue=self.cfg.hedge_venue,
         )
 
+    @staticmethod
+    def _reject_legacy_strategy_state(paths: StrategyPaths) -> None:
+        candidates = [(paths.legacy_campaign, paths.campaign)]
+        if paths.legacy_pending is not None and paths.pending is not None:
+            candidates.append((paths.legacy_pending, paths.pending))
+        for legacy, current in candidates:
+            if (os.path.abspath(legacy) != os.path.abspath(current)
+                    and legacy.exists()):
+                raise RuntimeError(
+                    "legacy unscoped strategy state exists; verify exchange "
+                    "positions, then move it manually before restart: "
+                    f"{legacy} -> {current}")
+
     def _initialize_dynamic_strategy(
             self, *, now_wall: Optional[float] = None) -> None:
         """Create the residual model, shadow/live state and event journal."""
@@ -457,6 +471,13 @@ class Engine:
         if self.dynamic_strategy is not None:
             raise RuntimeError("dynamic strategy is already initialized")
         cfg = self.cfg
+        paths = strategy_paths(
+            cfg.strategy_state_file,
+            cfg.strategy_event_csv,
+            self._market_identity(),
+            shadow=self.record_only,
+        )
+        self._reject_legacy_strategy_state(paths)
         wall = time.time() if now_wall is None else now_wall
         self.residual_model = ResidualModel(
             window_minutes=cfg.strategy_window_minutes,
@@ -495,15 +516,12 @@ class Engine:
             hard_slippage_bps=cfg.slippage_hard_max_bps,
             max_edge_fraction=cfg.slippage_max_edge_fraction,
         )
-        self.campaign_store = CampaignStore(
-            cfg.strategy_state_file, shadow=self.record_only)
-        if not self.record_only:
-            self.pending_execution_store = PendingExecutionStore(
-                pending_execution_path(cfg.strategy_state_file))
+        self.campaign_store = CampaignStore(str(paths.campaign), shadow=False)
+        if paths.pending is not None:
+            self.pending_execution_store = PendingExecutionStore(paths.pending)
         if self.record_only:
             self._load_dynamic_campaign()
-        self.strategy_events = StrategyEventRecorder(
-            cfg.strategy_event_csv)
+        self.strategy_events = StrategyEventRecorder(paths.events)
 
         log.info(
             "dynamic residual model warm start: accepted=%d "

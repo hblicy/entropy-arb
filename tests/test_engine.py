@@ -6,6 +6,7 @@ import asyncio
 import csv
 import logging
 import os
+from pathlib import Path
 import sys
 import tempfile
 import time
@@ -33,6 +34,7 @@ from entropy_arb.reference import (  # noqa: E402
     ReferenceState,
     ReferenceUpdate,
 )
+from entropy_arb.runtime_paths import strategy_paths  # noqa: E402
 from entropy_arb.strategy import MarketIdentity, ModelSnapshot  # noqa: E402
 from entropy_arb.venue_lighter import LighterVenue  # noqa: E402
 
@@ -344,7 +346,8 @@ def make_engine(record_only=False, **thr):
     return eng
 
 
-def make_dynamic_engine(tmp_path, *, reference=True):
+def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
+                                      reference=True):
     cfg = make_cfg()
     cfg.strategy_mode = "residual_dynamic"
     cfg.strategy_window_minutes = 10
@@ -358,7 +361,7 @@ def make_dynamic_engine(tmp_path, *, reference=True):
     cfg.premium_persist_sec = 0.0
     cfg.cooldown_sec = 0.0
     cfg.max_order_notional = 500.0
-    eng = Engine(cfg, record_only=True)
+    eng = Engine(cfg, record_only=record_only)
     filled = OrderResult(status="filled", filled_base=0.0)
     eng.entropy = PositionVenue("entropy", "ENTROPY", filled)
     eng.hedge = PositionVenue("hedge", "RH", filled)
@@ -372,8 +375,82 @@ def make_dynamic_engine(tmp_path, *, reference=True):
         eng.hedge.reference.apply(
             ReferenceUpdate(index_px=100.0), source="websocket",
             received_mono=now)
+    return eng
+
+
+def make_dynamic_engine(tmp_path, *, reference=True):
+    eng = make_uninitialized_dynamic_engine(
+        tmp_path,
+        record_only=True,
+        reference=reference,
+    )
     eng._initialize_dynamic_strategy(now_wall=time.time())
     return eng
+
+
+def configured_strategy_paths(cfg, *, shadow):
+    return strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        MarketIdentity(
+            cfg.entropy.symbol,
+            cfg.entropy.hl_dex,
+            cfg.hedge.symbol,
+            cfg.hedge_venue,
+        ),
+        shadow=shadow,
+    )
+
+
+@pytest.mark.parametrize("legacy_kind", ["campaign", "pending"])
+def test_live_dynamic_rejects_legacy_unscoped_state(
+        tmp_path, legacy_kind):
+    eng = make_uninitialized_dynamic_engine(tmp_path, record_only=False)
+    legacy = (
+        Path(eng.cfg.strategy_state_file)
+        if legacy_kind == "campaign"
+        else engine_module.pending_execution_path(
+            eng.cfg.strategy_state_file)
+    )
+    legacy.write_text("legacy-live-state", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as error:
+        eng._initialize_dynamic_strategy(now_wall=time.time())
+
+    message = str(error.value)
+    assert str(legacy) in message
+    paths = strategy_paths(
+        eng.cfg.strategy_state_file,
+        eng.cfg.strategy_event_csv,
+        eng._market_identity(),
+        shadow=False,
+    )
+    expected = paths.campaign if legacy_kind == "campaign" else paths.pending
+    assert str(expected) in message
+    assert legacy.read_text(encoding="utf-8") == "legacy-live-state"
+
+
+def test_record_only_dynamic_rejects_legacy_unscoped_shadow_state(tmp_path):
+    eng = make_uninitialized_dynamic_engine(tmp_path, record_only=True)
+    legacy = CampaignStore(
+        eng.cfg.strategy_state_file,
+        shadow=True,
+    ).path
+    legacy.write_text("legacy-shadow-state", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as error:
+        eng._initialize_dynamic_strategy(now_wall=time.time())
+
+    message = str(error.value)
+    assert str(legacy) in message
+    paths = strategy_paths(
+        eng.cfg.strategy_state_file,
+        eng.cfg.strategy_event_csv,
+        eng._market_identity(),
+        shadow=True,
+    )
+    assert str(paths.campaign) in message
+    assert legacy.read_text(encoding="utf-8") == "legacy-shadow-state"
 
 
 def seed_dynamic_model(eng):
@@ -550,7 +627,7 @@ def test_shadow_state_uses_separate_file_and_survives_restart(tmp_path):
             first._close_dynamic_strategy()
 
         assert not (tmp_path / "campaign-state.json").exists()
-        assert (tmp_path / "campaign-state.shadow.json").exists()
+        assert first.campaign_store.path.exists()
 
         second = make_dynamic_engine(tmp_path)
         try:
@@ -727,7 +804,8 @@ def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
     async def go():
         cfg = make_dynamic_live_cfg(tmp_path)
         expected = dynamic_live_campaign()
-        CampaignStore(cfg.strategy_state_file, shadow=False).save(expected)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        CampaignStore(str(paths.campaign), shadow=False).save(expected)
         venues = {
             "entropy": LiveLifecycleVenue(
                 "entropy", "ENTROPY", chain_position=-1.0),
@@ -781,9 +859,8 @@ def test_live_startup_pending_recovery_resumes_strategy_without_new_orders(
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
             audit_ok=True, campaign_applied=False)
-        engine_module.PendingExecutionStore(
-            engine_module.pending_execution_path(
-                cfg.strategy_state_file)).save(pending)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        engine_module.PendingExecutionStore(paths.pending).save(pending)
         venues = {
             "entropy": RecoveringLifecycleVenue(
                 "entropy", "ENTROPY", -1.0, {
@@ -851,9 +928,8 @@ def test_live_startup_unmatched_pending_exits_and_releases_lock(tmp_path):
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
             audit_ok=True, campaign_applied=False)
-        engine_module.PendingExecutionStore(
-            engine_module.pending_execution_path(
-                cfg.strategy_state_file)).save(pending)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        engine_module.PendingExecutionStore(paths.pending).save(pending)
         venues = {
             "entropy": RecoveringLifecycleVenue(
                 "entropy", "ENTROPY", -0.7, {
@@ -930,7 +1006,8 @@ def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
         tmp_path):
     async def go():
         cfg = make_dynamic_live_cfg(tmp_path)
-        CampaignStore(cfg.strategy_state_file, shadow=False).save(
+        paths = configured_strategy_paths(cfg, shadow=False)
+        CampaignStore(str(paths.campaign), shadow=False).save(
             dynamic_live_campaign())
         venues = {
             "entropy": LiveLifecycleVenue(
@@ -1558,7 +1635,7 @@ def test_live_matched_close_clears_campaign_and_persists_flat_state(tmp_path):
 
             assert eng.campaign is None
             assert eng.campaign_store.load() is None
-            with open(eng.cfg.strategy_event_csv, newline="",
+            with open(eng.strategy_events.path, newline="",
                       encoding="utf-8") as handle:
                 events = list(csv.DictReader(handle))
             closed = [row for row in events
