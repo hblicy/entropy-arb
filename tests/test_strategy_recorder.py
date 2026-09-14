@@ -14,13 +14,14 @@ from entropy_arb.strategy_recorder import (  # noqa: E402
 
 
 def event(*, ts=60.1, intent="SKIP", reason="REFERENCE_STALE",
-          campaign_id="", direction="sell_entropy"):
+          campaign_id="", direction="sell_entropy", decision_id=""):
     return StrategyEvent(
         ts=ts,
         mode="shadow",
         event="decision",
         intent=intent,
         reason=reason,
+        decision_id=decision_id,
         campaign_id=campaign_id,
         entropy_symbol="ANTH",
         entropy_dex="io",
@@ -71,12 +72,52 @@ def test_lifecycle_events_are_never_coalesced(tmp_path):
         "OPEN", "OPEN", "CLOSE"]
 
 
-def test_existing_incompatible_header_is_rejected(tmp_path):
+def test_existing_incompatible_header_is_archived(tmp_path):
     path = tmp_path / "events.csv"
     path.write_text("wrong,header\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="header"):
-        StrategyEventRecorder(path)
+    recorder = StrategyEventRecorder(path)
+    recorder.close()
+
+    assert (tmp_path / "events.csv.old").read_text(
+        encoding="utf-8") == "wrong,header\n"
+    assert read_rows(path) == []
+
+
+def test_incomplete_tail_is_archived_without_modifying_original_bytes(tmp_path):
+    path = tmp_path / "events.csv"
+    recorder = StrategyEventRecorder(path)
+    recorder.record(event(intent="OPEN", decision_id="execution-first"))
+    recorder.close()
+    damaged = path.read_bytes() + b"123,partial"
+    path.write_bytes(damaged)
+
+    restarted = StrategyEventRecorder(path)
+    restarted.close()
+
+    assert (tmp_path / "events.csv.old").read_bytes() == damaged
+    assert read_rows(path) == []
+
+
+def test_decision_id_is_deduplicated_across_restart(tmp_path):
+    path = tmp_path / "events.csv"
+    first = StrategyEventRecorder(path)
+    assert first.record(event(
+        intent="OPEN",
+        decision_id="execution-abc",
+    ))
+    first.close()
+
+    second = StrategyEventRecorder(path)
+    assert not second.record(event(
+        ts=61.0,
+        intent="OPEN",
+        decision_id="execution-abc",
+    ))
+    second.close()
+
+    assert [row["decision_id"] for row in read_rows(path)] == [
+        "execution-abc"]
 
 
 def test_close_is_idempotent_and_record_after_close_fails(tmp_path):

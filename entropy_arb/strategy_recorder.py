@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import csv
+import io
 import math
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from .recorder import next_archive_path
 
 
 STRATEGY_EVENT_HEADER = [
@@ -82,16 +86,16 @@ class StrategyEventRecorder:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._closed = False
         self._last_skip_key: Optional[tuple] = None
+        self._decision_ids = set()
         exists = self.path.exists()
         if exists and self.path.stat().st_size:
-            with self.path.open("r", newline="", encoding="utf-8") as handle:
-                try:
-                    header = next(csv.reader(handle))
-                except StopIteration:
-                    header = []
-            if header != STRATEGY_EVENT_HEADER:
-                raise ValueError(
-                    f"strategy event CSV header does not match: {self.path}")
+            valid, decision_ids = self._inspect_existing()
+            if not valid:
+                archive = next_archive_path(str(self.path))
+                os.replace(self.path, archive)
+                exists = False
+            else:
+                self._decision_ids = decision_ids
         self._handle = self.path.open("a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(
             self._handle, fieldnames=STRATEGY_EVENT_HEADER,
@@ -100,11 +104,43 @@ class StrategyEventRecorder:
             self._writer.writeheader()
             self._handle.flush()
 
+    def _inspect_existing(self) -> tuple[bool, set[str]]:
+        try:
+            content = self.path.read_bytes()
+            if not content.endswith((b"\n", b"\r")):
+                return False, set()
+            rows = list(csv.reader(
+                io.StringIO(content.decode("utf-8"), newline=""),
+                strict=True,
+            ))
+        except (UnicodeError, csv.Error):
+            return False, set()
+        if not rows or rows[0] != STRATEGY_EVENT_HEADER:
+            return False, set()
+        timestamp_index = STRATEGY_EVENT_HEADER.index("ts_ms")
+        event_index = STRATEGY_EVENT_HEADER.index("event")
+        decision_index = STRATEGY_EVENT_HEADER.index("decision_id")
+        decision_ids = set()
+        for row in rows[1:]:
+            if len(row) != len(STRATEGY_EVENT_HEADER) or not row[event_index]:
+                return False, set()
+            try:
+                timestamp = float(row[timestamp_index])
+            except ValueError:
+                return False, set()
+            if not math.isfinite(timestamp) or timestamp < 0:
+                return False, set()
+            if row[decision_index]:
+                decision_ids.add(row[decision_index])
+        return True, decision_ids
+
     def record(self, event: StrategyEvent) -> bool:
         if self._closed:
             raise ValueError("strategy event recorder is closed")
         if not math.isfinite(event.ts) or event.ts < 0:
             raise ValueError("strategy event timestamp must be finite and >= 0")
+        if event.decision_id and event.decision_id in self._decision_ids:
+            return False
         if event.intent == "SKIP":
             skip_key = (
                 int(event.ts // 60), event.reason, event.campaign_id,
@@ -126,6 +162,8 @@ class StrategyEventRecorder:
                     for key, value in values.items()})
         self._writer.writerow(row)
         self._handle.flush()
+        if event.decision_id:
+            self._decision_ids.add(event.decision_id)
         return True
 
     def close(self) -> None:
