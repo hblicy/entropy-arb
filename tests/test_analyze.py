@@ -406,6 +406,8 @@ def test_strategy_summary_reports_closed_open_and_hold_windows(tmp_path):
                      event="campaign_closed", direction="buy_entropy",
                      hold_seconds=7200, realized_pnl_usd=-0.5),
         strategy_row(ts_ms=5_000, intent="OPEN", campaign_id="c3"),
+        strategy_row(ts_ms=6_000, intent="ADD", campaign_id="c4",
+                     event="campaign_changed"),
     ])
 
     rows = analyze.load_strategy_events(str(path))
@@ -414,7 +416,7 @@ def test_strategy_summary_reports_closed_open_and_hold_windows(tmp_path):
     assert summary["completed_campaigns"] == 2
     assert summary["within_1h"] == 1
     assert summary["within_6h"] == 2
-    assert summary["still_open"] == 1
+    assert summary["still_open"] == 2
     assert summary["forced_closes"] == 1
     assert summary["realized_pnl_usd"] == pytest.approx(0.75)
 

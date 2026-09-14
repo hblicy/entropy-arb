@@ -80,6 +80,21 @@ class PositionCampaign:
                 or not self.frozen_model.ready):
             raise CampaignInvariantError(
                 "frozen_model must be a ready ModelSnapshot")
+        model = self.frozen_model
+        for name in ("version", "minute", "samples"):
+            value = getattr(model, name)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < (1 if name in {"version", "samples"} else 0)):
+                raise CampaignInvariantError(
+                    f"frozen_model.{name} must be a valid integer")
+        quantiles = [
+            _finite(f"frozen_model.{name}", getattr(model, name))
+            for name in ("lower_bps", "q25_bps", "median_bps",
+                         "q75_bps", "upper_bps")
+        ]
+        if quantiles != sorted(quantiles):
+            raise CampaignInvariantError(
+                "frozen_model quantiles must be ordered")
         _finite("entry_boundary_bps", self.entry_boundary_bps)
         _finite("exit_target_bps", self.exit_target_bps)
         _finite("fees_usd", self.fees_usd, nonnegative=True)

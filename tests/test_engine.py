@@ -364,6 +364,9 @@ def set_dynamic_sell_market(eng, residual_bps):
     entropy_bid = hedge_ask * (1.0 + residual_bps / 1e4)
     eng.entropy.set_book(entropy_bid, entropy_bid + 0.01, sz=20.0)
     eng.hedge.set_book(hedge_bid, hedge_ask, sz=20.0)
+    for venue in (eng.entropy, eng.hedge):
+        venue.book.last_update_mono = max(
+            venue.book.last_update_mono, venue.last_traded_ts + 1e-6)
 
 
 def test_residual_record_only_shadow_open_and_close_never_sends_orders(
@@ -391,6 +394,53 @@ def test_residual_record_only_shadow_open_and_close_never_sends_orders(
             assert eng.trades == 0
             assert eng.entropy.position == 0
             assert eng.hedge.position == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_shadow_adds_never_exceed_cumulative_venue_caps(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            eng.entropy.cap_usd = 100.0
+            eng.hedge.cap_usd = 100.0
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+            first_qty = eng.campaign.qty
+            await eng._evaluate()
+
+            assert eng.campaign.qty == first_qty
+            assert (eng.campaign.qty * eng.entropy.book.mid()
+                    <= eng.entropy.cap_usd + 1.0)
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_add_persistence_restarts_after_signal_disappears(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+            first_qty = eng.campaign.qty
+
+            eng.cfg.premium_persist_sec = 10.0
+            await eng._evaluate()
+            eng._armed["sell_entropy"] -= 11.0
+            set_dynamic_sell_market(eng, 30.0)
+            await eng._evaluate()
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+
+            assert eng.campaign.qty == first_qty
+            assert eng._armed["sell_entropy"] is not None
         finally:
             eng._close_dynamic_strategy()
 
@@ -484,6 +534,28 @@ def test_dynamic_minute_observation_commits_previous_close_and_gaps(
             now_minute=int(base // 60) + 2).samples == 1
     finally:
         eng._close_dynamic_strategy()
+
+
+def test_dynamic_strategy_loop_wakes_at_minute_boundary_without_book_event(
+        tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        calls = 0
+
+        async def evaluate():
+            nonlocal calls
+            calls += 1
+            eng.stop.set()
+
+        eng._evaluate = evaluate
+        eng._dynamic_wakeup_timeout = lambda: 0.01
+        try:
+            await asyncio.wait_for(eng._strategy_loop(), timeout=0.1)
+            assert calls == 1
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
 
 
 def dynamic_live_campaign():
@@ -587,6 +659,47 @@ def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
     asyncio.run(go())
 
 
+def test_live_dynamic_recovery_state_blocks_new_execution(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            eng._recovery_required = True
+
+            await eng._evaluate()
+
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.campaign is None
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_revalidates_signal_after_waiting_for_execution_lock(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        lock = eng._vlock("hedge")
+        await lock.acquire()
+        try:
+            evaluation = asyncio.create_task(eng._evaluate())
+            await asyncio.sleep(0)
+            set_dynamic_sell_market(eng, 10.0)
+            lock.release()
+            await evaluation
+
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.campaign is None
+        finally:
+            if lock.locked():
+                lock.release()
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
 def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
         tmp_path):
     async def go():
@@ -642,6 +755,22 @@ def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
                     == eng.campaign.campaign_id)
             assert eng.entropy.send_calls == 1
             assert eng.hedge.send_calls == 1
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_waits_for_post_trade_books_before_adding(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await eng._evaluate()
+
+            assert eng.entropy.send_calls == 1
+            assert eng.hedge.send_calls == 1
+            assert eng.campaign.qty == pytest.approx(1.0)
         finally:
             eng._close_dynamic_strategy()
 

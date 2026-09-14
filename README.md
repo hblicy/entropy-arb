@@ -125,7 +125,7 @@ native symbol, the Entropy DEX, and the hedge venue on every row.
 Reference prices and funding are collected on the existing market-data
 WebSockets, initialized by REST, and refreshed by REST while a reference
 stream is stale. Hyperliquid and Lighter funding are normalized to
-`bps/hour`. In `fixed` mode, reference failures and residual alerts remain
+`bps/hour`. In `fixed_premium` mode, reference failures and residual alerts remain
 observational only. In `residual_dynamic` mode, fresh, sufficiently aligned
 reference data is required for new risk; hard exits remain available without it.
 Signal rows append both legs' reference price/funding/age fields plus the
@@ -378,9 +378,9 @@ foundation for the staged multi-hedge design in
 - **USDG basis** (`lighter-rh`): the hedge quotes in USDG. Part of any
   persistent premium is the stablecoin itself; your midline absorbs the
   level, but a USDG *move* is real PnL.
-- **Funding**: two venues have independent funding rates. They are normalized,
-  recorded, and alerted on, but carry still does not gate entries or alter
-  thresholds. Position caps bound it — keep them modest.
+- **Funding**: two venues have independent funding rates. In both strategy
+  modes they are normalized, recorded, and alerted on, but carry does not gate
+  entries or alter thresholds. Position caps bound it — keep them modest.
 - **Thin books**: Entropy depth can be tiny; `take_fraction` and notional
   caps keep clips small, but slippage on the hedge leg after a partial fill
   is real.

@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 import aiohttp
@@ -530,10 +530,17 @@ class Engine:
             self.record_only
             or (self.entropy.ready_to_trade()
                 and self.hedge.ready_to_trade()))
+        post_trade_books = (
+            self.record_only
+            or (self.entropy.book.last_update_mono
+                > self.entropy.last_traded_ts
+                and self.hedge.book.last_update_mono
+                > self.hedge.last_traded_ts))
         books_ready = (
             self.entropy.book.is_fresh(self.cfg.staleness_sec)
             and self.hedge.book.is_fresh(self.cfg.staleness_sec)
             and account_ready
+            and post_trade_books
             and not self._venue_down
         )
         return MarketView(
@@ -554,6 +561,50 @@ class Engine:
             min_base=self._min_base,
             min_notional=self._min_notional,
             size_step=self._step,
+        )
+
+    def _dynamic_entry_cap(self, direction: str) -> float:
+        entropy_mid = self.entropy.book.mid()
+        hedge_mid = self.hedge.book.mid()
+        if entropy_mid is None or hedge_mid is None:
+            return 0.0
+        if self.record_only and self.campaign is not None:
+            sign = -1.0 if self.campaign.direction == "sell_entropy" else 1.0
+            entropy_position = sign * self.campaign.qty
+            hedge_position = -sign * self.campaign.qty
+        else:
+            entropy_position = self.entropy.position
+            hedge_position = self.hedge.position
+        if direction == "sell_entropy":
+            entropy_room = self.entropy.cap_usd + entropy_position * entropy_mid
+            hedge_room = self.hedge.cap_usd - hedge_position * hedge_mid
+        else:
+            entropy_room = self.entropy.cap_usd - entropy_position * entropy_mid
+            hedge_room = self.hedge.cap_usd + hedge_position * hedge_mid
+        return max(0.0, min(
+            self.cfg.max_order_notional, entropy_room, hedge_room))
+
+    def _decide_dynamic(self, *, model, now_wall: float,
+                        now_mono: float) -> StrategyDecision:
+        market = self._dynamic_market_view(now_mono)
+        decision = self.dynamic_strategy.decide(
+            market=market,
+            model=model,
+            campaign=self.campaign,
+            now_wall=now_wall,
+            now_mono=now_mono,
+        )
+        if decision.intent not in {"OPEN", "ADD"}:
+            return decision
+        entry_cap = self._dynamic_entry_cap(decision.direction)
+        if entry_cap >= market.entry_cap_notional:
+            return decision
+        return self.dynamic_strategy.decide(
+            market=replace(market, entry_cap_notional=entry_cap),
+            model=model,
+            campaign=self.campaign,
+            now_wall=now_wall,
+            now_mono=now_mono,
         )
 
     def _current_dynamic_residual(
@@ -1497,12 +1548,23 @@ class Engine:
 
     # -------------------------------------------------------------- strategy
 
+    @staticmethod
+    def _dynamic_wakeup_timeout() -> float:
+        now = time.time()
+        return max(60.0 - now % 60.0 + 0.01, 0.01)
+
     async def _strategy_loop(self) -> None:
-        wakeup = (self._strategy_evt
-                  if self.cfg.strategy_mode == "residual_dynamic"
-                  else self._update_evt)
+        dynamic = self.cfg.strategy_mode == "residual_dynamic"
+        wakeup = self._strategy_evt if dynamic else self._update_evt
         while not self.stop.is_set():
-            await wakeup.wait()
+            if dynamic:
+                try:
+                    await asyncio.wait_for(
+                        wakeup.wait(), timeout=self._dynamic_wakeup_timeout())
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await wakeup.wait()
             wakeup.clear()
             if self.stop.is_set():
                 break
@@ -1573,16 +1635,18 @@ class Engine:
         self._record_model_snapshot(now_wall=now_wall)
         model = self.residual_model.snapshot(
             now_minute=int(now_wall // 60))
-        decision = self.dynamic_strategy.decide(
-            market=self._dynamic_market_view(now_mono),
-            model=model,
-            campaign=self.campaign,
-            now_wall=now_wall,
-            now_mono=now_mono,
-        )
+        if self._recovery_required:
+            self._clear_armed()
+            self._record_dynamic_decision(
+                StrategyDecision(
+                    intent="SKIP", direction="",
+                    reason="POSITION_RECOVERY_REQUIRED", model=model),
+                now_wall=now_wall)
+            return
+        decision = self._decide_dynamic(
+            model=model, now_wall=now_wall, now_mono=now_mono)
         if decision.intent == "SKIP":
-            if self.campaign is None:
-                self._clear_armed()
+            self._clear_armed()
             self._record_dynamic_decision(
                 decision, now_wall=now_wall)
             return
@@ -1597,6 +1661,7 @@ class Engine:
                 reason="COOLDOWN", model=decision.model)
             self._record_dynamic_decision(
                 deferred, now_wall=now_wall)
+            self._clear_armed()
             return
         if not self._dynamic_entry_persisted(decision, now_mono):
             deferred = StrategyDecision(
@@ -1614,14 +1679,62 @@ class Engine:
             buy, sell = self.hedge, self.entropy
         else:
             buy, sell = self.entropy, self.hedge
-        await self._vlock(buy.key).acquire()
-        await self._vlock(sell.key).acquire()
-        execution_plan = self._dynamic_execution_plan(
-            decision, buy, sell)
-        task = asyncio.create_task(
-            self._execute_locked(
-                buy, sell, execution_plan, decision=decision),
-            name=f"dynamic-{decision.intent.lower()}")
+        buy_lock = self._vlock(buy.key)
+        sell_lock = self._vlock(sell.key)
+        await buy_lock.acquire()
+        try:
+            await sell_lock.acquire()
+        except BaseException:
+            buy_lock.release()
+            raise
+        handed_to_execution = False
+        try:
+            recheck_wall = time.time()
+            recheck_mono = time.monotonic()
+            self._advance_dynamic_model(
+                now_wall=recheck_wall, now_mono=recheck_mono)
+            self._record_model_snapshot(now_wall=recheck_wall)
+            recheck_model = self.residual_model.snapshot(
+                now_minute=int(recheck_wall // 60))
+            if self._recovery_required:
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="POSITION_RECOVERY_REQUIRED", model=recheck_model)
+            elif (self._venue_limited(buy) or self._venue_limited(sell)):
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="VENUE_RATE_LIMITED", model=recheck_model)
+            elif not (self._venue_rate_ok(buy) and self._venue_rate_ok(sell)):
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="VENUE_ORDER_BUDGET", model=recheck_model)
+            else:
+                revalidated = self._decide_dynamic(
+                    model=recheck_model, now_wall=recheck_wall,
+                    now_mono=recheck_mono)
+            if (revalidated.intent != decision.intent
+                    or revalidated.direction != decision.direction
+                    or revalidated.plan is None):
+                self._clear_armed()
+                self._record_dynamic_decision(
+                    StrategyDecision(
+                        intent="SKIP", direction=decision.direction,
+                        reason=f"PRE_SEND_{revalidated.reason}",
+                        model=recheck_model),
+                    now_wall=recheck_wall)
+                return
+            decision = revalidated
+            execution_plan = self._dynamic_execution_plan(
+                decision, buy, sell)
+            task = asyncio.create_task(
+                self._execute_locked(
+                    buy, sell, execution_plan, decision=decision),
+                name=f"dynamic-{decision.intent.lower()}")
+            handed_to_execution = True
+        finally:
+            if not handed_to_execution:
+                buy_lock.release()
+                sell_lock.release()
         self._exec_tasks.add(task)
         task.add_done_callback(self._execution_done)
         await asyncio.shield(task)

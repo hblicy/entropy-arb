@@ -185,6 +185,13 @@ def test_campaign_rejects_nonfinite_persisted_values(tmp_path):
     with pytest.raises(CampaignStateError, match="qty"):
         CampaignStore(str(path), shadow=False).load()
 
+    payload["campaign"]["qty"] = 1
+    payload["campaign"]["frozen_model"]["median_bps"] = math.nan
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CampaignStateError, match="frozen_model.median_bps"):
+        CampaignStore(str(path), shadow=False).load()
+
 
 def test_reconcile_allows_flat_without_state():
     result = reconcile_campaign(

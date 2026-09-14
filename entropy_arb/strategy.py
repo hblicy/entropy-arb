@@ -533,6 +533,10 @@ class DynamicResidualStrategy:
             entry_boundary: float, exit_target: Optional[float],
             market: MarketView, model: ModelSnapshot, basis: float,
             now_mono: float) -> StrategyDecision:
+        if (market.entry_cap_notional <= 0
+                or market.entry_cap_notional < market.min_notional):
+            return self._skip(
+                "POSITION_CAP_REACHED", direction=direction, model=model)
         if (self.slippage.entry_paused("entropy", now_mono)
                 or self.slippage.entry_paused("hedge", now_mono)):
             return self._skip(

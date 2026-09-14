@@ -278,10 +278,11 @@ def summarize_strategy_events(rows: list[dict]) -> dict:
         intent = row.get("intent", "")
         event = row.get("event", "")
         campaign_id = row.get("campaign_id", "")
+        if campaign_id and event != "campaign_closed":
+            opened.add(campaign_id)
         if intent == "SKIP" and row.get("reason"):
             reasons[row["reason"]] += 1
         if intent == "OPEN" and campaign_id:
-            opened.add(campaign_id)
             if row.get("direction"):
                 directions[row["direction"]] += 1
         if event == "model_snapshot":

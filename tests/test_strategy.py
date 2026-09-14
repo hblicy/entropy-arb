@@ -292,9 +292,10 @@ def decision_strategy():
 
 
 def decision_market(*, sell_residual=None, buy_residual=None,
-                    reference=True, e_age=1.0, h_age=1.0, skew=0.0,
-                    books_ready=True, entropy_bid=None, entropy_ask=None,
-                    hedge_bid=99.9, hedge_ask=100.0):
+                     reference=True, e_age=1.0, h_age=1.0, skew=0.0,
+                     books_ready=True, entropy_bid=None, entropy_ask=None,
+                     hedge_bid=99.9, hedge_ask=100.0,
+                     entry_cap_notional=500.0):
     if sell_residual is not None:
         entropy_bid = hedge_ask * (1.0 + sell_residual / 1e4)
         entropy_ask = entropy_bid + 0.01
@@ -318,7 +319,7 @@ def decision_market(*, sell_residual=None, buy_residual=None,
         entropy_fee_bps=0.9,
         hedge_fee_bps=0.0,
         take_fraction=0.5,
-        entry_cap_notional=500.0,
+        entry_cap_notional=entry_cap_notional,
         min_base=0.01,
         min_notional=10.0,
         size_step=0.01,
@@ -410,6 +411,14 @@ def test_active_campaign_adds_only_at_frozen_boundary():
     assert missed.reason == "ENTRY_NOT_REACHED"
     assert reached.intent == "ADD"
     assert reached.direction == "buy_entropy"
+
+
+def test_new_risk_stops_cleanly_when_position_cap_is_exhausted():
+    result = decide(decision_market(
+        sell_residual=45.0, entry_cap_notional=0.0))
+
+    assert result.intent == "SKIP"
+    assert result.reason == "POSITION_CAP_REACHED"
 
 
 def test_active_campaign_uses_opposite_signal_only_to_close():
