@@ -228,6 +228,47 @@ def test_warm_start_missing_file_leaves_model_not_ready(tmp_path):
     assert m.snapshot(now_minute=200).status == "MODEL_NOT_READY"
 
 
+def test_warm_start_marks_five_minute_tail_gap_unstable(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [
+        history_row(minute, residual=str(float(minute % 5)))
+        for minute in range(15, 195)
+    ])
+    model = make_model()
+
+    loaded = warm_start_residual_model(
+        model,
+        path=str(path),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=200,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    assert loaded.accepted >= model.min_samples
+    assert model.snapshot(now_minute=200).status == "REGIME_UNSTABLE"
+
+
+def test_warm_start_one_minute_tail_gap_stays_ready(tmp_path):
+    path = tmp_path / "minutes.csv"
+    write_history(path, [
+        history_row(minute, residual=str(float(minute % 5)))
+        for minute in range(20, 199)
+    ])
+    model = make_model()
+
+    warm_start_residual_model(
+        model,
+        path=str(path),
+        identity=MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        now_minute=200,
+        max_age_sec=15,
+        max_skew_sec=15,
+    )
+
+    assert model.snapshot(now_minute=200).status == "READY"
+
+
 def test_warm_start_counts_blank_identity_as_rejected_row(tmp_path):
     path = tmp_path / "minutes.csv"
     write_history(path, [history_row(100, entropy_symbol="")])

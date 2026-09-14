@@ -300,8 +300,17 @@ def warm_start_residual_model(
             accepted_rows.append((minute, residual))
             counts["accepted"] += 1
 
+    previous_minute = None
     for minute, residual in sorted(accepted_rows):
+        if previous_minute is not None:
+            for missing in range(previous_minute + 1, minute):
+                model.observe(
+                    minute=missing, residual_bps=None, valid=False)
         model.observe(minute=minute, residual_bps=residual, valid=True)
+        previous_minute = minute
+    if previous_minute is not None:
+        for missing in range(previous_minute + 1, now_minute):
+            model.observe(minute=missing, residual_bps=None, valid=False)
     return WarmStartResult(**counts)
 
 
