@@ -104,11 +104,12 @@ python -u main.py \
 ```
 
 至少运行几个小时（最好一整天——溢价存在日内规律）。分钟聚合写入
-`logs/minutes.csv`；仅在 `--record-only` 下，信号生命周期明细写入
-`logs/signals.csv`：越过费后门槛立即写 `start`，持续时每秒写一次
-`sample`，信号消失、盘口过期或程序关闭时写 `end`。这些数据只用于观察，
-不会阻止开仓或改变实盘策略；可用 `recorder.signal_csv` 修改明细路径。两个
-文件的每行都包含两条腿各自的原生 symbol、Entropy DEX 和对冲交易所。
+`logs/minutes.csv`；仅在 `--record-only` 下，连续最优盘口观测写入
+`logs/signals.csv`。没有固定价差信号时约每秒写一条中性的 `snapshot`；信号
+活跃时改为写 `start`、每秒 `sample`，并在信号消失、盘口过期或程序关闭时写
+`end`。这些数据只用于观察，不会阻止开仓或改变实盘策略；可用
+`recorder.signal_csv` 修改明细路径。两个文件的每行都包含两条腿各自的原生
+symbol、Entropy DEX 和对冲交易所。
 
 参考价格和资金费复用现有行情 WebSocket 采集，启动时通过 REST 初始化，参考
 WebSocket 过期后再用 REST 定时恢复。Hyperliquid 与 Lighter 的资金费统一为
@@ -138,7 +139,7 @@ python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
   --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 python3 tools/analyze.py --csv logs/minutes.csv \
-  --strategy-csv logs/strategy-events.csv \
+  --strategy-csv logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.shadow.csv \
   --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
@@ -152,7 +153,11 @@ python3 tools/analyze.py --csv logs/minutes.csv \
 `.csv.gz` 使用完全相同的分析逻辑。
 
 考虑实盘前，先回放轮转后的原始信号文件。它是只读的 **top-of-book
-approximation**（最优盘口近似），不会把假设成交冒充为实际盈亏：
+approximation**（最优盘口近似），不会把假设成交冒充为实际盈亏。当前版本
+生成的文件包含连续 `snapshot`；只有门槛触发生命周期的旧文件仍可读取，但结果
+会明确标记为 `threshold-censored legacy`，不能当成完整时间轴。回放还会输出
+请求截止时间和实际数据覆盖截止时间；覆盖不完整时会告警，不会用最后一笔盘口
+外推到请求截止时间：
 
 ```bash
 python3 tools/replay_strategy.py \
@@ -173,12 +178,25 @@ python3 tools/replay_strategy.py \
 2. `strategy.live_enabled` 为 `true`；
 3. 启动命令中没有 `--record-only`。
 
-影子与实盘绝不共用状态：默认实盘文件为 `logs/campaign-state.json`，
-`--record-only` 自动使用 `logs/campaign-state.shadow.json`。动态实盘启动时会先
+`strategy.state_file` 和 `strategy.event_csv` 是基础路径。引擎会先追加确定性的
+市场标签，再追加模式标记，因此不同 symbol、交易所及实盘/影子不会共用策略
+状态。以 ANTH 为例，实际实盘文件是
+`logs/campaign-state.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.json`、对应的
+`.pending.json` 日志，以及
+`logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.csv`；
+`--record-only` 使用对应的 `.shadow.json` 和 `.shadow.csv`。
+
+升级后，如果检测到 `logs/campaign-state.json`、
+`logs/campaign-state.pending.json` 或 `logs/campaign-state.shadow.json` 等旧版未隔离
+状态，引擎会拒绝启动。必须先核对两边交易所真实仓位，确认该文件所属的市场和
+模式，备份后再人工移动到启动错误提示的新路径；不要盲目改名，也不要把旧状态
+用于另一市场。
+
+动态实盘启动时会先
 读取两边真实仓位，仅当保存批次的交易对、方向和匹配数量均一致时才恢复。
 状态缺失但仓位非零、状态损坏或两边不一致时会暂停并要求人工恢复，不会从仓位
-猜测冻结模型。每次动态实盘发单还会在任一腿开始前写入
-`logs/campaign-state.pending.json`。重启后，引擎只会自动查询已持久化订单引用的
+猜测冻结模型。每次动态实盘发单还会在任一腿开始前写入市场隔离的
+`.pending.json` 日志。重启后，引擎只会自动查询已持久化订单引用的
 未决腿，批次变化只应用一次，并且仅在重新读取两边交易所仓位且一致后删除日志。
 缺少订单引用、交易审计未完成或状态互相矛盾时仍会禁止交易并要求人工核对；
 引擎不会猜测结果或重发原订单。
@@ -264,7 +282,7 @@ Entropy + `tradexyz` 使用 `0.9` 和 `1.0`。旧脚本仍可使用合计值
 | `reference.rest_recovery_sec` / `stale_sec` | REST 恢复周期 / 参考数据过期阈值 | 15 / 60 |
 | `reference.residual_alert_bps` / `residual_persist_sec` | 状态化观察告警的残差阈值 / 持续时间 | 20 / 30 |
 | `strategy.mode` / `strategy.live_enabled` | 固定带或滚动残差策略；独立动态实盘闸门 | `residual_dynamic` / false |
-| `strategy.state_file` / `strategy.event_csv` | 持久批次状态与低频策略日志 | `logs/campaign-state.json`；`logs/strategy-events.csv` |
+| `strategy.state_file` / `strategy.event_csv` | 基础路径；运行时追加市场哈希及实盘/影子标记 | `logs/campaign-state.json`；`logs/strategy-events.csv` |
 | `slippage.*` | 真实成交 p95 预算、硬上限及开仓降级控制 | 见配置文件 |
 | `logging.dashboard` / `logging.file` | 终端仪表盘；开启时日志写入文件 | 开启，`logs/engine.log` |
 

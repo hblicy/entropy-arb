@@ -112,7 +112,11 @@ reference:
 # ================= DYNAMIC RESIDUAL STRATEGY / 动态残差策略 ===============
 # This example is deliberately shadow-only. Removing --record-only still
 # refuses live startup until live_enabled is explicitly changed to true.
+# state_file and event_csv are base paths. Runtime adds a deterministic market
+# tag and then a live/shadow marker; do not pre-build the final filename here.
 # 示例默认只允许影子运行；即使误删 --record-only，也必须显式启用实盘才会下单。
+# state_file 与 event_csv 是基础路径；程序会自动追加市场标签和实盘/影子标记，
+# 此处不要预先填写最终文件名。
 strategy:
   mode: residual_dynamic
   live_enabled: false

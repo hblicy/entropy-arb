@@ -115,12 +115,14 @@ python -u main.py \
 
 Let it run for at least a few hours (a day is better — premiums have
 intraday regimes). It writes minute aggregates to `logs/minutes.csv` and,
-in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
-row is written immediately on `start`, once per second as `sample`, and on
-disappearance, stale books, or shutdown as `end`. These rows are observation
-only: they do not gate entries or change live strategy behavior. The signal
-path can be changed with `recorder.signal_csv`. Both files include each leg's
-native symbol, the Entropy DEX, and the hedge venue on every row.
+in `--record-only` only, continuous top-of-book observations to
+`logs/signals.csv`. While no fixed-premium signal is active it writes a neutral
+`snapshot` about once per second; an active signal instead writes `start`,
+one-second `sample` rows, then `end` on disappearance, stale books, or shutdown.
+These rows are observation only: they do not gate entries or change live
+strategy behavior. The signal path can be changed with `recorder.signal_csv`.
+Both files include each leg's native symbol, the Entropy DEX, and the hedge
+venue on every row.
 
 Reference prices and funding are collected on the existing market-data
 WebSockets, initialized by REST, and refreshed by REST while a reference
@@ -156,7 +158,7 @@ python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
   --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 python3 tools/analyze.py --csv logs/minutes.csv \
-  --strategy-csv logs/strategy-events.csv \
+  --strategy-csv logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.shadow.csv \
   --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
@@ -175,7 +177,12 @@ same logic.
 
 Replay rotated raw signal files before considering live operation. This is a
 read-only **top-of-book approximation**; it deliberately does not report its
-assumed fills as actual PnL:
+assumed fills as actual PnL. Files produced by current versions contain
+continuous `snapshot` coverage. Legacy files containing only threshold-triggered
+lifecycles remain readable, but the result is explicitly marked
+`threshold-censored legacy` and must not be treated as a complete timeline.
+The replay also reports its requested and actual coverage end; an incomplete
+timeline is flagged instead of extending the last quote to the requested end:
 
 ```bash
 python3 tools/replay_strategy.py \
@@ -196,14 +203,28 @@ gate. Real dynamic orders are possible only when all three conditions hold:
 2. `strategy.live_enabled` is `true`;
 3. the command does not contain `--record-only`.
 
-Shadow and live state never share a file: the default live state is
-`logs/campaign-state.json`, while record-only automatically uses
-`logs/campaign-state.shadow.json`. Live startup first reads both real
+`strategy.state_file` and `strategy.event_csv` are base paths. The engine adds
+a deterministic market tag and then the mode marker, so different symbols,
+venues, and live/shadow runs never share strategy state. For the ANTH example,
+the derived live files are
+`logs/campaign-state.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.json`, its
+`.pending.json` journal, and
+`logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.csv`;
+record-only uses the corresponding `.shadow.json` and `.shadow.csv` files.
+
+After upgrading, startup deliberately refuses an old unscoped state such as
+`logs/campaign-state.json`, `logs/campaign-state.pending.json`, or
+`logs/campaign-state.shadow.json`. First verify both exchange positions and
+identify the exact market and mode that own the file; then back it up and move
+it manually to the path named in the startup error. Never rename an old state
+blindly or reuse one file for another market.
+
+Live startup first reads both real
 positions, then accepts the saved campaign only when its pair, direction and
 matched quantity agree. A missing/mismatched/corrupt state pauses dynamic
 trading for manual recovery; it is never reconstructed from positions.
-Every dynamic live submission also writes
-`logs/campaign-state.pending.json` before either leg can start. If that file
+Every dynamic live submission also writes the market-scoped `.pending.json`
+journal before either leg can start. If that file
 contains an unfinished execution after a restart, the engine automatically
 resolves only legs with durable order references, applies the campaign change
 exactly once, and clears the journal only after both exchange positions have
@@ -301,7 +322,7 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `reference.rest_recovery_sec` / `stale_sec` | REST recovery cadence / reference stale threshold | 15 / 60 |
 | `reference.residual_alert_bps` / `residual_persist_sec` | stateful observational residual alert threshold / persistence | 20 / 30 |
 | `strategy.mode` / `strategy.live_enabled` | fixed or rolling-residual strategy; independent dynamic live gate | `residual_dynamic` / false |
-| `strategy.state_file` / `strategy.event_csv` | durable campaign state and low-frequency strategy journal | `logs/campaign-state.json`; `logs/strategy-events.csv` |
+| `strategy.state_file` / `strategy.event_csv` | base paths; runtime adds a market hash and live/shadow marker | `logs/campaign-state.json`; `logs/strategy-events.csv` |
 | `slippage.*` | real-fill p95 budget, hard cap and entry degradation controls | see file |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
