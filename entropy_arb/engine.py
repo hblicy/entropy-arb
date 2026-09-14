@@ -89,6 +89,19 @@ class _PendingOrderConfirmation:
     is_buy: bool
     applied_fill: float
     is_residual_hedge: bool = False
+    dynamic_execution: Optional["_PendingDynamicExecution"] = None
+    dynamic_side: str = ""
+
+
+@dataclass
+class _PendingDynamicExecution:
+    decision: StrategyDecision
+    buy: VenueAdapter
+    sell: VenueAdapter
+    buy_result: OrderResult
+    sell_result: OrderResult
+    audit_ok: bool = False
+    applied: bool = False
 
 
 class Engine:
@@ -215,7 +228,9 @@ class Engine:
     def _register_unresolved_order(
             self, venue: VenueAdapter, result: OrderResult, *,
             is_buy: bool, applied_fill: float,
-            is_residual_hedge: bool = False) -> None:
+            is_residual_hedge: bool = False,
+            dynamic_execution: Optional[_PendingDynamicExecution] = None,
+            dynamic_side: str = "") -> None:
         if result.order_ref is None:
             self._unreferenced_unknown = True
             self._auto_repair_disabled = True
@@ -232,6 +247,8 @@ class Engine:
                 is_buy=is_buy,
                 applied_fill=applied_fill,
                 is_residual_hedge=is_residual_hedge,
+                dynamic_execution=dynamic_execution,
+                dynamic_side=dynamic_side,
             ))
         self._post_order_recovery_active = True
 
@@ -607,6 +624,7 @@ class Engine:
     def _record_dynamic_decision(
             self, decision: StrategyDecision, *, now_wall: float,
             campaign_id: str = "", event: str = "decision",
+            filled_qty: Optional[float] = None,
             entropy_fill_px: Optional[float] = None,
             hedge_fill_px: Optional[float] = None,
             realized_pnl_usd: Optional[float] = None,
@@ -678,7 +696,7 @@ class Engine:
             projected_net_usd=projected_net_usd,
             estimated_campaign_pnl_usd=(
                 decision.estimated_campaign_pnl_usd),
-            qty=qty,
+            qty=qty if filled_qty is None else filled_qty,
             planned_notional_usd=planned_notional,
             entropy_reference_age_ms=entropy_age,
             hedge_reference_age_ms=hedge_age,
@@ -784,6 +802,108 @@ class Engine:
             hedge_fill_px=hedge_px,
             realized_pnl_usd=final_pnl,
             hold_seconds=hold_seconds,
+        )
+
+    def _apply_live_matched_fill(
+            self, decision: StrategyDecision, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult,
+            matched: float, now_wall: float) -> None:
+        if self.record_only:
+            raise RuntimeError("live fills require live mode")
+        if matched <= 0:
+            self._record_dynamic_decision(
+                decision, now_wall=now_wall,
+                event="execution_settled", filled_qty=0.0)
+            return
+        if buy_result.avg_px is None or sell_result.avg_px is None:
+            raise RuntimeError(
+                "matched live fill is missing an average price")
+        entropy_px = (
+            buy_result.avg_px if buy.key == "entropy"
+            else sell_result.avg_px)
+        hedge_px = (
+            buy_result.avg_px if buy.key == "hedge"
+            else sell_result.avg_px)
+        fees = matched * (
+            entropy_px * self.entropy.fee_bps
+            + hedge_px * self.hedge.fee_bps) / 1e4
+        prior = self.campaign
+        final_pnl = None
+        hold_seconds = None
+        if decision.intent == "OPEN":
+            if prior is not None:
+                raise RuntimeError("cannot open a second live campaign")
+            self.campaign = PositionCampaign(
+                campaign_id=uuid.uuid4().hex,
+                mode="live",
+                identity=self._market_identity(),
+                direction=decision.direction,
+                opened_at=now_wall,
+                qty=matched,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        else:
+            if prior is None:
+                raise RuntimeError(
+                    "live campaign fill has no active campaign")
+            if decision.intent in {"CLOSE", "FORCED_CLOSE"}:
+                final_pnl = self._close_fill_pnl(
+                    prior, qty=matched, entropy_px=entropy_px,
+                    hedge_px=hedge_px, fees_usd=fees)
+                hold_seconds = max(now_wall - prior.opened_at, 0.0)
+            self.campaign = prior.apply_matched_fill(
+                intent=decision.intent,
+                direction=prior.direction,
+                qty=matched,
+                entropy_px=entropy_px,
+                hedge_px=hedge_px,
+                fees_usd=fees,
+            )
+        self.campaign_store.save(self.campaign)
+        campaign_id = (
+            prior.campaign_id if prior is not None
+            else self.campaign.campaign_id)
+        event = (
+            "campaign_closed"
+            if prior is not None and self.campaign is None
+            else "campaign_changed")
+        self._record_dynamic_decision(
+            decision, now_wall=now_wall,
+            campaign_id=campaign_id, event=event,
+            filled_qty=matched,
+            entropy_fill_px=entropy_px,
+            hedge_fill_px=hedge_px,
+            realized_pnl_usd=final_pnl,
+            hold_seconds=hold_seconds,
+        )
+        self._dynamic_last_action_mono = time.monotonic()
+
+    @staticmethod
+    def _dynamic_execution_plan(decision: StrategyDecision, buy, sell) -> ArbPlan:
+        source = decision.plan
+        top_buy = buy.book.best_ask()
+        top_sell = sell.book.best_bid()
+        top_premium = (top_sell / top_buy - 1.0) * 1e4
+        return ArbPlan(
+            qty=source.qty,
+            buy_limit=source.buy_limit,
+            sell_limit=source.sell_limit,
+            buy_notional=source.buy_notional,
+            sell_notional=source.sell_notional,
+            q_max=getattr(source, "q_max", source.qty),
+            q_max_notional=(
+                getattr(source, "q_max", source.qty) * source.buy_limit),
+            top_premium_bps=top_premium,
+            marginal_premium_bps=(
+                source.sell_limit / source.buy_limit - 1.0) * 1e4,
+            buy_fee=buy.fee_bps / 1e4,
+            sell_fee=sell.fee_bps / 1e4,
         )
 
     def _dynamic_entry_persisted(
@@ -1451,13 +1571,29 @@ class Engine:
                 deferred, now_wall=now_wall)
             return
         self._clear_armed()
-        if not self.record_only:
-            raise RuntimeError(
-                "dynamic residual live execution is not initialized")
-        self._apply_shadow_decision(decision, now_wall=now_wall)
-        self._dynamic_last_action_mono = now_mono
+        if self.record_only:
+            self._apply_shadow_decision(decision, now_wall=now_wall)
+            self._dynamic_last_action_mono = now_mono
+            return
+        if decision.direction == "sell_entropy":
+            buy, sell = self.hedge, self.entropy
+        else:
+            buy, sell = self.entropy, self.hedge
+        await self._vlock(buy.key).acquire()
+        await self._vlock(sell.key).acquire()
+        execution_plan = self._dynamic_execution_plan(
+            decision, buy, sell)
+        task = asyncio.create_task(
+            self._execute_locked(
+                buy, sell, execution_plan, decision=decision),
+            name=f"dynamic-{decision.intent.lower()}")
+        self._exec_tasks.add(task)
+        task.add_done_callback(self._execution_done)
+        await asyncio.shield(task)
 
-    async def _execute_locked(self, buy, sell, plan: ArbPlan) -> None:
+    async def _execute_locked(
+            self, buy, sell, plan: ArbPlan, *,
+            decision: Optional[StrategyDecision] = None) -> None:
         """Run one execution while holding both venue locks (acquired by the
         caller), then release them and settle the aftermath: unresolved
         outcomes escalate to reconcile, everything else gets a net-delta
@@ -1465,7 +1601,11 @@ class Engine:
         unresolved = False
         audit_error = None
         try:
-            unresolved = await self._execute(buy, sell, plan)
+            if decision is None:
+                unresolved = await self._execute(buy, sell, plan)
+            else:
+                unresolved = await self._execute(
+                    buy, sell, plan, decision=decision)
         except _TradeAuditFailure as exc:
             audit_error = exc.error
             self._audit_repair_errors.add(audit_error)
@@ -1585,7 +1725,9 @@ class Engine:
 
     # ------------------------------------------------------------- execution
 
-    async def _execute(self, buy, sell, plan: ArbPlan) -> bool:
+    async def _execute(
+            self, buy, sell, plan: ArbPlan, *,
+            decision: Optional[StrategyDecision] = None) -> bool:
         """Send both legs and settle the fills. Both venue locks are held by
         the caller. Returns True when an outcome is unresolved and the caller
         must escalate to reconcile."""
@@ -1602,9 +1744,20 @@ class Engine:
                  direction, buy.name, plan.qty, plan.buy_limit, sell.name,
                  plan.sell_limit, plan.buy_notional, plan.q_max_notional,
                  plan.marginal_premium_bps, plan.exp_edge_usd)
-        slip = cfg.leg_slippage_bps / 1e4
-        buy_bound = buy.px_round(plan.buy_limit * (1 + slip), round_up=False)
-        sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
+        buy_slippage_bps = (
+            cfg.leg_slippage_bps if decision is None
+            else decision.buy_slippage_budget_bps)
+        sell_slippage_bps = (
+            cfg.leg_slippage_bps if decision is None
+            else decision.sell_slippage_budget_bps)
+        if buy_slippage_bps is None or sell_slippage_bps is None:
+            raise RuntimeError("execution is missing slippage protection")
+        buy_slip = buy_slippage_bps / 1e4
+        sell_slip = sell_slippage_bps / 1e4
+        buy_bound = buy.px_round(
+            plan.buy_limit * (1 + buy_slip), round_up=False)
+        sell_bound = sell.px_round(
+            plan.sell_limit * (1 - sell_slip), round_up=True)
         self._record_send(buy)
         self._record_send(sell)
         order_submitted_at = {}
@@ -1645,13 +1798,26 @@ class Engine:
                                   (sell, sinfo, "sell")):
             if info.err:
                 log.error("[%s] %s leg: %s", venue.name, side, info.err)
-        for venue, info, is_buy in (
-                (buy, binfo, True), (sell, sinfo, False)):
+        dynamic_pending = None
+        if decision is not None and (binfo.unresolved or sinfo.unresolved):
+            dynamic_pending = _PendingDynamicExecution(
+                decision=decision,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+            )
+        for venue, info, is_buy, dynamic_side in (
+                (buy, binfo, True, "buy"),
+                (sell, sinfo, False, "sell")):
             if not info.unresolved:
                 continue
             self._register_unresolved_order(
                 venue, info, is_buy=is_buy,
-                applied_fill=info.filled_base)
+                applied_fill=info.filled_base,
+                dynamic_execution=dynamic_pending,
+                dynamic_side=dynamic_side,
+            )
         bfill = binfo.filled_base
         sfill = sinfo.filled_base
         buy.position += bfill
@@ -1728,12 +1894,25 @@ class Engine:
             audit_failure = _TradeAuditFailure(exc)
         self.last_trade_ts = time.time()
         self.last_trade_mono = time.monotonic()
-        if cancellation is not None:
-            if audit_failure is not None:
-                self._remember_error("trade audit write", audit_failure.error)
+        if cancellation is not None and audit_failure is not None:
+            self._remember_error("trade audit write", audit_failure.error)
             raise cancellation
         if audit_failure is not None:
             raise audit_failure from audit_failure.error
+        if decision is not None and not unresolved:
+            self._apply_live_matched_fill(
+                decision,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+                matched=matched,
+                now_wall=time.time(),
+            )
+        elif dynamic_pending is not None:
+            dynamic_pending.audit_ok = True
+        if cancellation is not None:
+            raise cancellation
         return bool(unresolved)
 
     def _record_trade(self, direction: str, plan: ArbPlan, fill_edge,
@@ -2045,6 +2224,11 @@ class Engine:
         confirmations = list(self._pending_order_confirmations)
         pending = []
         resolved_residual = False
+        dynamic_executions = {
+            id(item.dynamic_execution): item.dynamic_execution
+            for item in confirmations
+            if item.dynamic_execution is not None
+        }
         for index, confirmation in enumerate(confirmations):
             # Keep the current and unprocessed references recoverable if this
             # iteration is cancelled or violates the adapter contract.
@@ -2097,6 +2281,15 @@ class Engine:
                 venue.volume_usd += additional_fill * px
             resolved_residual = (
                 resolved_residual or confirmation.is_residual_hedge)
+            dynamic = confirmation.dynamic_execution
+            if dynamic is not None:
+                if confirmation.dynamic_side == "buy":
+                    dynamic.buy_result = result
+                elif confirmation.dynamic_side == "sell":
+                    dynamic.sell_result = result
+                else:
+                    raise _OrderRecoveryInvariantError(
+                        "dynamic order confirmation has no valid side")
             log.warning(
                 "[%s] unresolved order %s reached terminal status %s "
                 "with fill %.6g",
@@ -2113,6 +2306,35 @@ class Engine:
                 "remaining — automatic repair disabled; manual recovery "
                 "required")
         self._pending_order_confirmations = pending
+        for dynamic in dynamic_executions.values():
+            if dynamic.applied:
+                continue
+            if (dynamic.buy_result.unresolved
+                    or dynamic.sell_result.unresolved):
+                continue
+            if not dynamic.audit_ok:
+                raise _OrderRecoveryInvariantError(
+                    "dynamic order results resolved before trade audit "
+                    "completed")
+            dynamic.applied = True
+            try:
+                self._apply_live_matched_fill(
+                    dynamic.decision,
+                    buy=dynamic.buy,
+                    sell=dynamic.sell,
+                    buy_result=dynamic.buy_result,
+                    sell_result=dynamic.sell_result,
+                    matched=min(
+                        dynamic.buy_result.filled_base,
+                        dynamic.sell_result.filled_base),
+                    now_wall=time.time(),
+                )
+            except BaseException as exc:
+                self._auto_repair_disabled = True
+                self._remember_error(
+                    "dynamic campaign state after order recovery", exc)
+                self.request_stop()
+                raise
         if pending:
             self._schedule_reconcile(1.0)
             return False

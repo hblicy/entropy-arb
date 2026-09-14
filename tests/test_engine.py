@@ -521,6 +521,40 @@ def make_dynamic_live_cfg(tmp_path):
     return cfg
 
 
+def make_live_dynamic_execution_engine(
+        tmp_path, *, buy_fill=1.0, sell_fill=1.0):
+    cfg = make_dynamic_live_cfg(tmp_path)
+    cfg.strategy_window_minutes = 10
+    cfg.strategy_min_samples = 4
+    cfg.strategy_regime_window_minutes = 2
+    cfg.strategy_regime_recovery_minutes = 1
+    cfg.premium_persist_sec = 0.0
+    cfg.cooldown_sec = 0.0
+    cfg.max_order_notional = 500.0
+    eng = Engine(cfg, record_only=False)
+    eng.entropy = PositionVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=sell_fill,
+                    avg_px=100.45 if sell_fill else None))
+    eng.hedge = PositionVenue(
+        "hedge", "RH",
+        OrderResult(status="filled", filled_base=buy_fill,
+                    avg_px=100.0 if buy_fill else None))
+    eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
+    eng._step, eng._min_base, eng._min_notional = 0.01, 0.01, 10.0
+    now = time.monotonic()
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=100.0), source="websocket",
+        received_mono=now)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=100.0), source="websocket",
+        received_mono=now)
+    eng._initialize_dynamic_strategy(now_wall=time.time())
+    seed_dynamic_model(eng)
+    set_dynamic_sell_market(eng, 45.0)
+    return eng
+
+
 def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
     async def go():
         cfg = make_dynamic_live_cfg(tmp_path)
@@ -592,6 +626,124 @@ def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
     async def wait_until(predicate):
         while not predicate():
             await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.campaign.mode == "live"
+            assert (eng.campaign_store.load().campaign_id
+                    == eng.campaign.campaign_id)
+            assert eng.entropy.send_calls == 1
+            assert eng.hedge.send_calls == 1
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_only_matched_live_fill_changes_campaign_before_residual_recovery(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(
+            tmp_path, buy_fill=1.0, sell_fill=0.7)
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign.qty == pytest.approx(0.7)
+            assert eng.campaign_store.load().qty == pytest.approx(0.7)
+            assert eng._recovery_required
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_campaign_state_write_failure_pauses_new_entries(tmp_path, caplog):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+
+        def fail_save(_campaign):
+            raise OSError("disk full")
+
+        eng.campaign_store.save = fail_save
+        try:
+            with pytest.raises(OSError, match="disk full"):
+                await eng._evaluate()
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert "execution processing failed" in caplog.text
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_resolved_unknown_dynamic_fill_updates_campaign_once_confirmed(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = ConfirmingVenue(
+            "hedge", "RH",
+            OrderResult.unknown(order_ref="hedge-open"))
+        pending.reference = eng.hedge.reference
+        pending.book = eng.hedge.book
+        eng.hedge = pending
+        eng.venues["hedge"] = pending
+        try:
+            await eng._evaluate()
+            assert eng.campaign is None
+            assert eng._recovery_required
+
+            pending.terminal_results["hedge-open"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            recovered = await eng._recover_positions(strict=True)
+
+            assert recovered
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.campaign_store.load().qty == pytest.approx(1.0)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_matched_close_clears_campaign_and_persists_flat_state(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            campaign_id = eng.campaign.campaign_id
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.campaign_store.load() is None
+            with open(eng.cfg.strategy_event_csv, newline="",
+                      encoding="utf-8") as handle:
+                events = list(csv.DictReader(handle))
+            closed = [row for row in events
+                      if row["event"] == "campaign_closed"]
+            assert len(closed) == 1
+            assert closed[0]["campaign_id"] == campaign_id
+            assert closed[0]["intent"] == "CLOSE"
+            assert closed[0]["realized_pnl_usd"]
+        finally:
+            eng._close_dynamic_strategy()
 
     asyncio.run(go())
 
