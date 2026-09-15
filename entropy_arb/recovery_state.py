@@ -5,7 +5,7 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +13,7 @@ from .campaign import PositionCampaign, _campaign_from_dict
 from .strategy import MarketIdentity, ModelSnapshot
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _LEG_FIELDS = {
     "venue_key", "is_buy", "order_ref", "status", "filled_base",
     "avg_px", "applied_fill", "unresolved",
@@ -23,7 +23,15 @@ _EXECUTION_FIELDS = {
     "qty", "decided_at", "frozen_model", "entry_boundary_bps",
     "exit_target_bps", "entropy_expected_px", "hedge_expected_px",
     "entropy_fee_bps", "hedge_fee_bps", "campaign_before", "buy", "sell",
-    "audit_ok", "campaign_applied",
+    "audit_ok", "campaign_applied", "audit", "settled_at",
+}
+_AUDIT_FIELDS = {
+    "reason", "signed_residual_bps", "reference_basis_bps",
+    "convergence_bps", "round_trip_fee_bps", "buy_slippage_budget_bps",
+    "sell_slippage_budget_bps", "projected_net_bps", "projected_net_usd",
+    "estimated_campaign_pnl_usd", "entropy_reference_age_ms",
+    "hedge_reference_age_ms", "reference_update_skew_ms",
+    "net_funding_bps_per_hour", "planned_notional_usd",
 }
 _IDENTITY_FIELDS = {
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue",
@@ -55,6 +63,74 @@ def _signed_finite(name: str, value) -> float:
             or not math.isfinite(value)):
         raise PendingExecutionStateError(f"{name} must be finite")
     return float(value)
+
+
+def _optional_finite(name: str, value, *, signed: bool) -> None:
+    if value is None:
+        return
+    if signed:
+        _signed_finite(name, value)
+    else:
+        _finite(name, value)
+
+
+@dataclass(frozen=True)
+class PendingAuditContext:
+    reason: str
+    signed_residual_bps: Optional[float]
+    reference_basis_bps: Optional[float]
+    convergence_bps: Optional[float]
+    round_trip_fee_bps: Optional[float]
+    buy_slippage_budget_bps: Optional[float]
+    sell_slippage_budget_bps: Optional[float]
+    projected_net_bps: Optional[float]
+    projected_net_usd: Optional[float]
+    estimated_campaign_pnl_usd: Optional[float]
+    entropy_reference_age_ms: Optional[float]
+    hedge_reference_age_ms: Optional[float]
+    reference_update_skew_ms: Optional[float]
+    net_funding_bps_per_hour: Optional[float]
+    planned_notional_usd: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise PendingExecutionStateError("audit.reason must not be empty")
+        for name in (
+                "signed_residual_bps", "reference_basis_bps",
+                "projected_net_bps", "projected_net_usd",
+                "estimated_campaign_pnl_usd", "net_funding_bps_per_hour"):
+            _optional_finite(
+                f"audit.{name}", getattr(self, name), signed=True)
+        for name in (
+                "convergence_bps", "round_trip_fee_bps",
+                "buy_slippage_budget_bps", "sell_slippage_budget_bps",
+                "entropy_reference_age_ms", "hedge_reference_age_ms",
+                "reference_update_skew_ms"):
+            _optional_finite(
+                f"audit.{name}", getattr(self, name), signed=False)
+        _finite(
+            "audit.planned_notional_usd", self.planned_notional_usd,
+            positive=True)
+
+
+def _default_audit_context() -> PendingAuditContext:
+    return PendingAuditContext(
+        reason="audit context pending engine integration",
+        signed_residual_bps=None,
+        reference_basis_bps=None,
+        convergence_bps=None,
+        round_trip_fee_bps=None,
+        buy_slippage_budget_bps=None,
+        sell_slippage_budget_bps=None,
+        projected_net_bps=None,
+        projected_net_usd=None,
+        estimated_campaign_pnl_usd=None,
+        entropy_reference_age_ms=None,
+        hedge_reference_age_ms=None,
+        reference_update_skew_ms=None,
+        net_funding_bps_per_hour=None,
+        planned_notional_usd=1.0,
+    )
 
 
 @dataclass(frozen=True)
@@ -115,6 +191,8 @@ class PendingExecutionState:
     sell: PendingLegState
     audit_ok: bool
     campaign_applied: bool
+    audit: PendingAuditContext = field(default_factory=_default_audit_context)
+    settled_at: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_id, str) or not self.execution_id:
@@ -170,12 +248,49 @@ class PendingExecutionState:
                      or self.campaign_before.identity != self.identity)):
             raise PendingExecutionStateError(
                 "campaign_before must match live market identity")
+        if self.intent == "ADD":
+            if self.direction != self.campaign_before.direction:
+                raise PendingExecutionStateError(
+                    "ADD direction must equal campaign_before.direction")
+        elif self.intent in {"CLOSE", "FORCED_CLOSE"}:
+            if self.direction == self.campaign_before.direction:
+                raise PendingExecutionStateError(
+                    f"{self.intent} direction must be opposite to "
+                    "campaign_before.direction")
         if not isinstance(self.buy, PendingLegState) or not self.buy.is_buy:
             raise PendingExecutionStateError("buy leg is invalid")
         if not isinstance(self.sell, PendingLegState) or self.sell.is_buy:
             raise PendingExecutionStateError("sell leg is invalid")
-        if self.buy.venue_key == self.sell.venue_key:
-            raise PendingExecutionStateError("pending legs must use two venues")
+        if {self.buy.venue_key, self.sell.venue_key} != {"entropy", "hedge"}:
+            raise PendingExecutionStateError(
+                "pending leg venue keys must equal {entropy, hedge}")
+        expected_buy = (
+            "entropy" if self.direction == "buy_entropy" else "hedge")
+        expected_sell = (
+            "hedge" if self.direction == "buy_entropy" else "entropy")
+        if (self.buy.venue_key != expected_buy
+                or self.sell.venue_key != expected_sell):
+            raise PendingExecutionStateError(
+                "pending leg venues are inconsistent with direction")
+        if (self.buy.filled_base > self.qty + 1e-12
+                or self.sell.filled_base > self.qty + 1e-12):
+            raise PendingExecutionStateError(
+                "pending leg filled_base must not exceed execution qty")
+        if not isinstance(self.audit, PendingAuditContext):
+            raise PendingExecutionStateError(
+                "audit must be PendingAuditContext")
+        if self.settled_at is not None:
+            settled_at = _finite("settled_at", self.settled_at)
+            if settled_at < self.decided_at:
+                raise PendingExecutionStateError(
+                    "settled_at must not be earlier than decided_at")
+        unresolved = self.buy.unresolved or self.sell.unresolved
+        if unresolved and self.settled_at is not None:
+            raise PendingExecutionStateError(
+                "settled_at must be null while a leg is unresolved")
+        if not unresolved and self.settled_at is None:
+            raise PendingExecutionStateError(
+                "settled_at is required when both legs are terminal")
         if not isinstance(self.audit_ok, bool):
             raise PendingExecutionStateError("audit_ok must be boolean")
         if not isinstance(self.campaign_applied, bool):
@@ -193,6 +308,13 @@ def _leg_from_dict(raw) -> PendingLegState:
     if not isinstance(raw, dict) or set(raw) != _LEG_FIELDS:
         raise PendingExecutionStateError("pending leg fields are incompatible")
     return PendingLegState(**raw)
+
+
+def _audit_from_dict(raw) -> PendingAuditContext:
+    if not isinstance(raw, dict) or set(raw) != _AUDIT_FIELDS:
+        raise PendingExecutionStateError(
+            "pending audit fields are incompatible")
+    return PendingAuditContext(**raw)
 
 
 def _execution_from_dict(raw) -> PendingExecutionState:
@@ -220,6 +342,7 @@ def _execution_from_dict(raw) -> PendingExecutionState:
             else _campaign_from_dict(raw["campaign_before"]))
         values["buy"] = _leg_from_dict(raw["buy"])
         values["sell"] = _leg_from_dict(raw["sell"])
+        values["audit"] = _audit_from_dict(raw["audit"])
         return PendingExecutionState(**values)
     except (TypeError, ValueError) as exc:
         raise PendingExecutionStateError(
@@ -248,8 +371,9 @@ class PendingExecutionStore:
                 "pending execution state envelope is incompatible")
         if raw["schema_version"] != SCHEMA_VERSION:
             raise PendingExecutionStateError(
-                "unsupported pending execution schema_version "
-                f"{raw['schema_version']!r}")
+                f"pending execution state {self.path} has unsupported "
+                f"schema_version {raw['schema_version']!r}; manual "
+                "verification required")
         pending = raw["pending_execution"]
         return None if pending is None else _execution_from_dict(pending)
 

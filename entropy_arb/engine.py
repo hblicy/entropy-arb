@@ -610,6 +610,9 @@ class Engine:
             self, pending: PendingExecutionState, *, buy, sell,
             buy_result: OrderResult, sell_result: OrderResult,
             audit_ok: bool, campaign_applied: bool) -> PendingExecutionState:
+        settled_at = None
+        if not buy_result.unresolved and not sell_result.unresolved:
+            settled_at = max(pending.decided_at, time.time())
         return replace(
             pending,
             buy=self._pending_leg_state(
@@ -620,6 +623,7 @@ class Engine:
                 applied_fill=sell_result.filled_base),
             audit_ok=audit_ok,
             campaign_applied=campaign_applied,
+            settled_at=settled_at,
         )
 
     def _load_matching_pending_execution(
@@ -803,8 +807,14 @@ class Engine:
                 raise _OrderRecoveryInvariantError(
                     "venue resolver returned an invalid order result")
             venue.last_traded_ts = time.monotonic()
+            terminal_leg = self._terminal_pending_leg(leg, result)
+            other_leg = getattr(
+                pending, "sell" if side == "buy" else "buy")
+            settled_at = None
+            if not terminal_leg.unresolved and not other_leg.unresolved:
+                settled_at = max(pending.decided_at, time.time())
             pending = replace(
-                pending, **{side: self._terminal_pending_leg(leg, result)})
+                pending, settled_at=settled_at, **{side: terminal_leg})
             self.pending_execution_store.save(pending)
             self._startup_pending_execution = pending
         if (abs(pending.buy.filled_base - pending.sell.filled_base)

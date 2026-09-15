@@ -1,9 +1,11 @@
 import json
+from dataclasses import replace
 
 import pytest
 
 from entropy_arb.campaign import PositionCampaign
 from entropy_arb.recovery_state import (
+    PendingAuditContext,
     PendingExecutionState,
     PendingExecutionStateError,
     PendingExecutionStore,
@@ -31,6 +33,26 @@ def campaign_state():
         realized_pnl_usd=-0.02)
 
 
+def audit_context():
+    return PendingAuditContext(
+        reason="exit target reached",
+        signed_residual_bps=-1.5,
+        reference_basis_bps=0.25,
+        convergence_bps=1.75,
+        round_trip_fee_bps=0.9,
+        buy_slippage_budget_bps=1.0,
+        sell_slippage_budget_bps=1.2,
+        projected_net_bps=0.85,
+        projected_net_usd=0.085,
+        estimated_campaign_pnl_usd=-0.01,
+        entropy_reference_age_ms=15.0,
+        hedge_reference_age_ms=20.0,
+        reference_update_skew_ms=5.0,
+        net_funding_bps_per_hour=-0.03,
+        planned_notional_usd=100.0,
+    )
+
+
 def pending_state():
     return PendingExecutionState(
         execution_id="exec-1",
@@ -56,6 +78,8 @@ def pending_state():
             venue_key="hedge", is_buy=False, order_ref="sell-1",
             status="filled", filled_base=1.0, avg_px=100.1,
             applied_fill=1.0, unresolved=False),
+        audit=audit_context(),
+        settled_at=None,
         audit_ok=True,
         campaign_applied=False,
     )
@@ -69,6 +93,7 @@ def test_pending_store_round_trips_without_secrets(tmp_path):
     store.save(expected)
 
     assert store.load() == expected
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 3
     payload = path.read_text(encoding="utf-8").lower()
     assert "private_key" not in payload
     assert "api_private_key" not in payload
@@ -89,14 +114,32 @@ def test_pending_open_requires_durable_campaign_identity():
         )
 
 
-def test_pending_store_rejects_incompatible_state(tmp_path):
+def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    original = json.dumps({
+        "schema_version": 2,
+        "pending_execution": None,
+    }, indent=2).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*2.*manual verification required"):
+        PendingExecutionStore(path).load()
+
+    assert path.read_bytes() == original
+
+
+def test_pending_store_rejects_unknown_schema_version_with_path(tmp_path):
     path = tmp_path / "campaign.pending.json"
     path.write_text(json.dumps({
         "schema_version": 999,
         "pending_execution": None,
     }), encoding="utf-8")
 
-    with pytest.raises(PendingExecutionStateError, match="schema_version"):
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*999.*manual verification required"):
         PendingExecutionStore(path).load()
 
 
@@ -134,3 +177,153 @@ def test_pending_path_is_derived_without_colliding_with_campaign_file(tmp_path):
 
     assert pending == tmp_path / "campaign-state.pending.json"
     assert pending != campaign
+
+
+def test_pending_rejects_unknown_venue():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="venue"):
+        replace(state, buy=replace(state.buy, venue_key="unknown"))
+
+
+def test_pending_terminal_legs_require_settled_at():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="settled_at"):
+        replace(
+            state,
+            buy=replace(state.buy, status="filled", filled_base=1.0,
+                        avg_px=100.0, applied_fill=1.0,
+                        unresolved=False),
+            settled_at=None,
+        )
+
+
+def test_pending_unresolved_leg_rejects_settled_at():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="settled_at"):
+        replace(state, settled_at=state.decided_at + 1.0)
+
+
+def test_pending_rejects_fill_above_planned_qty():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="qty"):
+        replace(
+            state,
+            buy=replace(state.buy, filled_base=state.qty + 2e-12,
+                        avg_px=100.0),
+        )
+
+
+def test_pending_rejects_leg_venues_inconsistent_with_direction():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="direction"):
+        replace(
+            state,
+            direction="sell_entropy",
+            buy=replace(state.buy, venue_key="entropy"),
+            sell=replace(state.sell, venue_key="hedge"),
+        )
+
+
+def test_pending_close_direction_must_reverse_campaign():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="opposite"):
+        replace(
+            state,
+            direction=state.campaign_before.direction,
+            buy=replace(state.buy, venue_key="hedge"),
+            sell=replace(state.sell, venue_key="entropy"),
+        )
+
+
+def test_pending_terminal_state_accepts_settled_at_after_decision():
+    state = pending_state()
+
+    terminal = replace(
+        state,
+        buy=replace(state.buy, status="filled", filled_base=1.0,
+                    avg_px=100.0, applied_fill=1.0, unresolved=False),
+        settled_at=state.decided_at + 1.0,
+    )
+
+    assert terminal.settled_at == state.decided_at + 1.0
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_pending_loader_requires_exact_audit_fields(tmp_path, mutation):
+    path = tmp_path / "campaign.pending.json"
+    store = PendingExecutionStore(path)
+    store.save(pending_state())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    audit = payload["pending_execution"]["audit"]
+    if mutation == "missing":
+        audit.pop("reason")
+    else:
+        audit["unexpected"] = None
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PendingExecutionStateError, match="audit fields"):
+        store.load()
+
+
+@pytest.mark.parametrize("field", [
+    "signed_residual_bps",
+    "reference_basis_bps",
+    "projected_net_bps",
+    "projected_net_usd",
+    "estimated_campaign_pnl_usd",
+    "net_funding_bps_per_hour",
+])
+def test_pending_audit_rejects_nonfinite_signed_values(field):
+    with pytest.raises(PendingExecutionStateError, match=field):
+        replace(audit_context(), **{field: float("inf")})
+
+
+@pytest.mark.parametrize("field", [
+    "convergence_bps",
+    "round_trip_fee_bps",
+    "buy_slippage_budget_bps",
+    "sell_slippage_budget_bps",
+    "entropy_reference_age_ms",
+    "hedge_reference_age_ms",
+    "reference_update_skew_ms",
+])
+def test_pending_audit_rejects_negative_nonnegative_values(field):
+    with pytest.raises(PendingExecutionStateError, match=field):
+        replace(audit_context(), **{field: -0.01})
+
+
+@pytest.mark.parametrize("changes", [
+    {"reason": " "},
+    {"planned_notional_usd": 0.0},
+    {"planned_notional_usd": float("nan")},
+])
+def test_pending_audit_rejects_invalid_required_values(changes):
+    with pytest.raises(PendingExecutionStateError):
+        replace(audit_context(), **changes)
+
+
+def test_pending_add_direction_must_match_campaign():
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="ADD direction"):
+        replace(state, intent="ADD")
+
+
+@pytest.mark.parametrize("settled_at", [-1.0, float("inf"), 1009.0])
+def test_pending_rejects_invalid_settled_at(settled_at):
+    state = pending_state()
+
+    with pytest.raises(PendingExecutionStateError, match="settled_at"):
+        replace(
+            state,
+            buy=replace(state.buy, status="filled", filled_base=1.0,
+                        avg_px=100.0, applied_fill=1.0,
+                        unresolved=False),
+            settled_at=settled_at,
+        )

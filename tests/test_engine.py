@@ -29,6 +29,7 @@ from entropy_arb.live_lock import (  # noqa: E402
     LiveProcessLockError,
 )
 from entropy_arb.models import OrderResult  # noqa: E402
+from entropy_arb.recovery_state import PendingAuditContext  # noqa: E402
 from entropy_arb.reference import (  # noqa: E402
     ReferenceAlertState,
     ReferenceState,
@@ -761,6 +762,26 @@ async def reconcile_dynamic_execution(eng):
     assert await eng._recover_positions(strict=True)
 
 
+def pending_audit_context(planned_notional_usd=100.0):
+    return PendingAuditContext(
+        reason="test fixture",
+        signed_residual_bps=None,
+        reference_basis_bps=None,
+        convergence_bps=None,
+        round_trip_fee_bps=None,
+        buy_slippage_budget_bps=None,
+        sell_slippage_budget_bps=None,
+        projected_net_bps=None,
+        projected_net_usd=None,
+        estimated_campaign_pnl_usd=None,
+        entropy_reference_age_ms=None,
+        hedge_reference_age_ms=None,
+        reference_update_skew_ms=None,
+        net_funding_bps_per_hour=None,
+        planned_notional_usd=planned_notional_usd,
+    )
+
+
 def restart_open_pending(eng, *, unresolved=True,
                          campaign_applied=False, audit_ok=True):
     model = eng.residual_model.snapshot(
@@ -795,6 +816,8 @@ def restart_open_pending(eng, *, unresolved=True,
             avg_px=None if unresolved else 100.45,
             applied_fill=0.0 if unresolved else 1.0,
             unresolved=unresolved),
+        audit=pending_audit_context(),
+        settled_at=None if unresolved else 1001.0,
         audit_ok=audit_ok,
         campaign_applied=campaign_applied,
     )
@@ -807,7 +830,8 @@ def restart_close_pending(eng, *, campaign_applied=False):
         execution_id="restart-close",
         identity=eng._market_identity(),
         intent="CLOSE",
-        direction=campaign.direction,
+        direction=("buy_entropy" if campaign.direction == "sell_entropy"
+                   else "sell_entropy"),
         campaign_id=campaign.campaign_id,
         qty=campaign.qty,
         decided_at=campaign.opened_at + 60.0,
@@ -827,6 +851,8 @@ def restart_close_pending(eng, *, campaign_applied=False):
             venue_key="hedge", is_buy=False, order_ref="close-sell",
             status="filled", filled_base=1.0, avg_px=100.0,
             applied_fill=1.0, unresolved=False),
+        audit=pending_audit_context(),
+        settled_at=campaign.opened_at + 61.0,
         audit_ok=True,
         campaign_applied=campaign_applied,
     )
@@ -969,6 +995,7 @@ def test_live_startup_pending_recovery_resumes_strategy_without_new_orders(
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
+            audit=pending_audit_context(), settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
         engine_module.PendingExecutionStore(paths.pending).save(pending)
@@ -1038,6 +1065,7 @@ def test_live_startup_unmatched_pending_exits_and_releases_lock(tmp_path):
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
+            audit=pending_audit_context(), settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
         engine_module.PendingExecutionStore(paths.pending).save(pending)
@@ -1296,6 +1324,8 @@ def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
                     venue_key="entropy", is_buy=False, order_ref=None,
                     status="sending", filled_base=0.0, avg_px=None,
                     applied_fill=0.0, unresolved=True),
+                audit=pending_audit_context(),
+                settled_at=None,
                 audit_ok=False,
                 campaign_applied=False,
             ))
@@ -1470,11 +1500,12 @@ def test_startup_applies_persisted_terminal_close_once(tmp_path):
         prior = dynamic_live_campaign()
         eng.campaign = prior
         eng.campaign_store.save(prior)
+        decided_at = time.time()
         pending = engine_module.PendingExecutionState(
             execution_id="restart-close", identity=prior.identity,
             intent="CLOSE", direction="buy_entropy",
             campaign_id=prior.campaign_id, qty=prior.qty,
-            decided_at=time.time(), frozen_model=prior.frozen_model,
+            decided_at=decided_at, frozen_model=prior.frozen_model,
             entry_boundary_bps=prior.entry_boundary_bps,
             exit_target_bps=prior.exit_target_bps,
             entropy_expected_px=100.1, hedge_expected_px=100.0,
@@ -1488,6 +1519,7 @@ def test_startup_applies_persisted_terminal_close_once(tmp_path):
                 venue_key="hedge", is_buy=False, order_ref="close-sell",
                 status="filled", filled_base=1.0, avg_px=100.0,
                 applied_fill=1.0, unresolved=False),
+            audit=pending_audit_context(), settled_at=decided_at,
             audit_ok=True, campaign_applied=False)
         eng.entropy.chain_position = 0.0
         eng.hedge.chain_position = 0.0
