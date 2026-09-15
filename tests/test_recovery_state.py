@@ -348,3 +348,11 @@ def test_pending_loader_wraps_integer_too_large_for_float(tmp_path):
     with pytest.raises(
             PendingExecutionStateError, match="signed_residual_bps"):
         store.load()
+
+
+def test_pending_execution_requires_explicit_audit_context():
+    values = dict(pending_state().__dict__)
+    values.pop("audit")
+
+    with pytest.raises(TypeError, match="audit"):
+        PendingExecutionState(**values)

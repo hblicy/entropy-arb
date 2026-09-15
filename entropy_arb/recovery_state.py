@@ -5,7 +5,7 @@ import json
 import math
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -120,26 +120,6 @@ class PendingAuditContext:
             positive=True)
 
 
-def _default_audit_context() -> PendingAuditContext:
-    return PendingAuditContext(
-        reason="audit context pending engine integration",
-        signed_residual_bps=None,
-        reference_basis_bps=None,
-        convergence_bps=None,
-        round_trip_fee_bps=None,
-        buy_slippage_budget_bps=None,
-        sell_slippage_budget_bps=None,
-        projected_net_bps=None,
-        projected_net_usd=None,
-        estimated_campaign_pnl_usd=None,
-        entropy_reference_age_ms=None,
-        hedge_reference_age_ms=None,
-        reference_update_skew_ms=None,
-        net_funding_bps_per_hour=None,
-        planned_notional_usd=1.0,
-    )
-
-
 @dataclass(frozen=True)
 class PendingLegState:
     venue_key: str
@@ -198,7 +178,7 @@ class PendingExecutionState:
     sell: PendingLegState
     audit_ok: bool
     campaign_applied: bool
-    audit: PendingAuditContext = field(default_factory=_default_audit_context)
+    audit: PendingAuditContext
     settled_at: Optional[float] = None
 
     def __post_init__(self) -> None:
