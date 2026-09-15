@@ -178,7 +178,7 @@ class ArbPlan:
 def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
              buy_fee_bps: float, sell_fee_bps: float, take_fraction: float,
              cap_notional: float, min_base: float, min_notional: float,
-             size_step: float):
+             size_step: float, max_base: Optional[float] = None):
     """Size a two-leg taker slice: buy on buy_book, sell on sell_book.
 
     A slice qualifies when the executable premium (sell bid over buy ask)
@@ -198,10 +198,13 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     q_max, q_max_notional = crossable_base(asks, bids, threshold, buy_fee, sell_fee)
     if q_max <= 0:
         return None, "no_edge"
+    base_cap = (math.inf if max_base is None
+                else _validate_plan_number("max_base", max_base))
     target = min(
         q_max * take_fraction,
         quantity_within_notional(asks, cap_notional),
         quantity_within_notional(bids, cap_notional),
+        base_cap,
     )
     target = floor_step(target, size_step)
     if target < min_base:

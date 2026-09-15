@@ -219,6 +219,10 @@ class PendingExecutionState:
                     or value < minimum):
                 raise PendingExecutionStateError(
                     f"frozen_model.{name} must be a valid integer")
+        if (self.frozen_model.samples > 0
+                and self.frozen_model.version == 0):
+            raise PendingExecutionStateError(
+                "frozen_model.version must be a valid integer")
         if (self.frozen_model.status in {READY, REGIME_UNSTABLE}
                 and self.frozen_model.samples == 0):
             raise PendingExecutionStateError(

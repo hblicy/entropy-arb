@@ -370,6 +370,33 @@ def test_fixed_headroom_values_sell_position_at_sell_price(sell_position):
     assert headroom == pytest.approx(sell_base_headroom * 100.0)
 
 
+def test_fixed_scan_rechecks_cap_after_sell_limit_changes():
+    eng = make_engine()
+    eng.hedge.cap_usd = 10_000.0
+    eng.entropy.cap_usd = 2_000.0
+    eng.entropy.position = -15.0
+    eng.hedge.book.apply_hl([
+        [{"px": "99", "sz": "50"}],
+        [{"px": "100", "sz": "50"}],
+    ])
+    eng.entropy.book.apply_hl([
+        [{"px": "110", "sz": "4.1"},
+         {"px": "105", "sz": "50"}],
+        [{"px": "111", "sz": "50"}],
+    ])
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    buy, sell, plan = result
+    assert buy is eng.hedge
+    assert sell is eng.entropy
+    assert (plan.qty - sell.position) * plan.sell_limit \
+        <= sell.cap_usd + 1e-9
+
+
 def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
                                       reference=True):
     cfg = make_cfg()
@@ -2563,13 +2590,14 @@ def test_eff_threshold_directions():
         approx(total, 7.0)
 
 
-def test_reference_state_does_not_change_trade_plan():
+def test_reference_state_does_not_change_trade_plan(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
     eng = make_engine()
     eng.entropy.set_book(100.20, 100.21)
     eng.hedge.set_book(99.99, 100.00)
 
     before = eng._plan(eng.hedge, eng.entropy, 500.0)
-    old = time.monotonic() - 3600.0
+    old = max(time.monotonic() - 3600.0, 0.0)
     eng.entropy.reference.apply(
         ReferenceUpdate(oracle_px=1000.0), source="rest",
         received_mono=old)

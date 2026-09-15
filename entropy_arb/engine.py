@@ -2003,7 +2003,8 @@ class Engine:
         sell_base = sell.cap_usd / sell_px + sell.position
         return min(buy_base, sell_base) * buy_px
 
-    def _plan(self, buy, sell, cap_notional: float):
+    def _plan(self, buy, sell, cap_notional: float, *,
+              max_base: Optional[float] = None):
         return plan_arb(
             buy.book, sell.book,
             threshold_bps=self._eff_threshold(buy, sell),
@@ -2013,6 +2014,7 @@ class Engine:
             min_base=self._min_base,
             min_notional=self._min_notional,
             size_step=self._step,
+            max_base=max_base,
         )
 
     # -------------------------------------------------------------- strategy
@@ -2338,18 +2340,31 @@ class Engine:
                 continue
             if plan is None:
                 continue
-            headroom = self._headroom(
-                buy, sell,
-                buy_px=plan.buy_limit,
-                sell_px=plan.sell_limit,
-            )
-            if headroom < plan.buy_notional:
-                plan, _ = self._plan(buy, sell,
-                                     min(cfg.max_order_notional, headroom))
+            while plan is not None:
+                headroom = self._headroom(
+                    buy, sell,
+                    buy_px=plan.buy_limit,
+                    sell_px=plan.sell_limit,
+                )
+                headroom_base = max(headroom / plan.buy_limit, 0.0)
+                if plan.qty <= headroom_base + 1e-12:
+                    break
+                prior_qty = plan.qty
+                plan, _ = self._plan(
+                    buy, sell, cfg.max_order_notional,
+                    max_base=headroom_base)
                 if plan is None:
                     self._skiplog("%s blocked by position caps (headroom $%.0f)",
                                   dkey, max(headroom, 0.0))
-                    continue
+                    break
+                if plan.qty >= prior_qty - 1e-12:
+                    self._skiplog(
+                        "%s blocked: position-cap replanning did not reduce "
+                        "quantity", dkey)
+                    plan = None
+                    break
+            if plan is None:
+                continue
             if best is None or plan.exp_edge_usd > best[2].exp_edge_usd:
                 best = (buy, sell, plan)
         return best

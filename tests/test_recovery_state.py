@@ -376,6 +376,20 @@ def test_pending_close_accepts_valid_nonready_decision_model(intent, model):
     assert state.frozen_model == model
 
 
+@pytest.mark.parametrize(
+    "status", ["READY", "REGIME_UNSTABLE", "MODEL_NOT_READY"])
+def test_pending_close_rejects_sampled_model_with_zero_version(status):
+    model = ModelSnapshot(
+        version=0, minute=101, samples=1, status=status,
+        median_bps=0.0, lower_bps=-5.0, q25_bps=-2.0,
+        q75_bps=2.0, upper_bps=5.0)
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match="frozen_model.version must be a valid integer"):
+        replace(pending_state(), frozen_model=model)
+
+
 @pytest.mark.parametrize("intent", ["OPEN", "ADD"])
 def test_pending_entry_still_rejects_nonready_decision_model(intent):
     state = pending_state()
