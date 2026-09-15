@@ -388,9 +388,10 @@ class PendingExecutionStore:
             raise PendingExecutionStateError(
                 f"cannot read pending execution state {self.path}: {exc}") \
                 from exc
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:
             raise PendingExecutionStateError(
-                f"pending execution state is not valid JSON: {exc}") from exc
+                f"pending execution state {self.path} is not valid JSON: "
+                f"{exc}") from exc
         if not isinstance(raw, dict) or set(raw) != {
                 "schema_version", "pending_execution"}:
             raise PendingExecutionStateError(

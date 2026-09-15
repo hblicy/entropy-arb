@@ -216,6 +216,24 @@ def test_pending_store_rejects_non_integer_schema_version(
     assert path.read_bytes() == original
 
 
+def test_pending_store_wraps_json_integer_digit_limit_without_modifying_file(
+        tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    original = (
+        b'{"schema_version":' + b"1" * 5000
+        + b',"pending_execution":null}'
+    )
+    path.write_bytes(original)
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*(?:not valid JSON|manual "
+                  r"verification required)"):
+        PendingExecutionStore(path).load()
+
+    assert path.read_bytes() == original
+
+
 def test_pending_store_rejects_unknown_schema_version_with_path(tmp_path):
     path = tmp_path / "campaign.pending.json"
     path.write_text(json.dumps({
