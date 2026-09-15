@@ -1,4 +1,5 @@
 import csv
+from dataclasses import replace
 import math
 
 import pytest
@@ -460,6 +461,31 @@ def test_ready_model_opens_buy_entropy_at_lower_quantile():
     assert result.direction == "buy_entropy"
     assert result.entry_boundary_bps == -20.0
     assert result.exit_target_bps == pytest.approx(2.5)
+
+
+def test_entry_decision_records_final_marginal_convergence():
+    market = decision_market(
+        entropy_bid=100.5,
+        entropy_ask=100.51,
+        hedge_bid=99.9,
+        hedge_ask=100.0,
+        entry_cap_notional=1000.0,
+    )
+    market = replace(
+        market,
+        entropy_book=decision_book(
+            bids=[(100.5, 1.0), (100.45, 10.0)],
+            asks=[(100.51, 20.0)],
+        ),
+    )
+
+    result = decide(market)
+
+    assert result.intent == "OPEN"
+    assert result.plan.qty == pytest.approx(5.5)
+    assert result.plan.convergence_bps == pytest.approx(27.5)
+    assert result.convergence_bps == pytest.approx(
+        result.plan.convergence_bps)
 
 
 @pytest.mark.parametrize(

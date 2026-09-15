@@ -422,6 +422,26 @@ def test_fixed_scan_values_sell_position_at_current_mid():
         <= sell.cap_usd + 1e-9
 
 
+def test_fixed_scan_values_buy_position_at_execution_bound():
+    eng = make_engine()
+    eng.cfg.leg_slippage_bps = 100.0
+    eng.hedge.cap_usd = 100.0
+    eng.entropy.cap_usd = 10_000.0
+    eng.hedge.set_book(99.0, 100.0)
+    eng.entropy.set_book(102.0, 103.0)
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    buy, _, plan = result
+    buy_bound = plan.buy_limit * (
+        1.0 + eng.cfg.leg_slippage_bps / 1e4)
+    assert (buy.position + plan.qty) * buy_bound \
+        <= buy.cap_usd + 1e-9
+
+
 def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
                                       reference=True):
     cfg = make_cfg()

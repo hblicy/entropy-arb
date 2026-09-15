@@ -2348,13 +2348,16 @@ class Engine:
                     break
                 # Limits protect execution prices, while position caps protect
                 # current exposure. Never value either leg below its mid.
+                buy_risk_px = max(
+                    plan.buy_limit * (1 + cfg.leg_slippage_bps / 1e4),
+                    buy_mid)
+                sell_risk_px = max(plan.sell_limit, sell_mid)
                 headroom = self._headroom(
                     buy, sell,
-                    buy_px=max(plan.buy_limit, buy_mid),
-                    sell_px=max(plan.sell_limit, sell_mid),
+                    buy_px=buy_risk_px,
+                    sell_px=sell_risk_px,
                 )
-                headroom_base = max(
-                    headroom / max(plan.buy_limit, buy_mid), 0.0)
+                headroom_base = max(headroom / buy_risk_px, 0.0)
                 if plan.qty <= headroom_base + 1e-12:
                     break
                 prior_qty = plan.qty

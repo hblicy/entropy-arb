@@ -623,7 +623,7 @@ class DynamicResidualStrategy:
             reference_basis_bps=basis,
             entry_boundary_bps=entry_boundary,
             exit_target_bps=exit_target,
-            convergence_bps=convergence,
+            convergence_bps=plan.convergence_bps,
             round_trip_fee_bps=fees,
             buy_slippage_budget_bps=buy_budget,
             sell_slippage_budget_bps=sell_budget,
