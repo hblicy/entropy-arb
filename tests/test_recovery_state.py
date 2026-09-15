@@ -115,6 +115,25 @@ def test_pending_open_requires_durable_campaign_identity():
         )
 
 
+@pytest.mark.parametrize("intent", ["OPEN", "ADD"])
+def test_pending_entry_requires_top_convergence(intent):
+    state = pending_state()
+    changes = {
+        "intent": intent,
+        "direction": "sell_entropy",
+        "buy": replace(state.buy, venue_key="hedge"),
+        "sell": replace(state.sell, venue_key="entropy"),
+        "audit": replace(state.audit, top_convergence_bps=None),
+    }
+    if intent == "OPEN":
+        changes["campaign_before"] = None
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"audit\.top_convergence_bps.*OPEN.*ADD"):
+        replace(state, **changes)
+
+
 def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
     path = tmp_path / "campaign.pending.json"
     original = json.dumps({

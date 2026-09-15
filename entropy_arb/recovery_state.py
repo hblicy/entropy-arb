@@ -301,6 +301,10 @@ class PendingExecutionState:
         if not isinstance(self.audit, PendingAuditContext):
             raise PendingExecutionStateError(
                 "audit must be PendingAuditContext")
+        if (self.intent in {"OPEN", "ADD"}
+                and self.audit.top_convergence_bps is None):
+            raise PendingExecutionStateError(
+                "audit.top_convergence_bps is required for OPEN and ADD")
         if self.settled_at is not None:
             settled_at = _finite("settled_at", self.settled_at)
             if settled_at < self.decided_at:
