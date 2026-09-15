@@ -393,8 +393,11 @@ def plan_convergence_trade(
             j += 1
         buy_slip = (ask_px / best_ask - 1.0) * 1e4
         sell_slip = (best_bid / bid_px - 1.0) * 1e4
-        projected = (convergence - fees - buy_slip - sell_slip
-                     - close_reserve)
+        marginal_residual = _directional_signed_residual(
+            direction, ask_px, bid_px, basis)
+        marginal_convergence = _convergence_space(
+            direction, marginal_residual, exit_residual)
+        projected = marginal_convergence - fees - close_reserve
         if (buy_slip > buy_budget + 1e-9
                 or sell_slip > sell_budget + 1e-9
                 or projected < min_profit):
@@ -430,7 +433,11 @@ def plan_convergence_trade(
         return None, "below_min_notional"
     buy_slip = (buy_limit / best_ask - 1.0) * 1e4
     sell_slip = (best_bid / sell_limit - 1.0) * 1e4
-    projected = convergence - fees - buy_slip - sell_slip - close_reserve
+    marginal_residual = _directional_signed_residual(
+        direction, buy_limit, sell_limit, basis)
+    marginal_convergence = _convergence_space(
+        direction, marginal_residual, exit_residual)
+    projected = marginal_convergence - fees - close_reserve
     return ConvergencePlan(
         qty=target,
         buy_limit=buy_limit,
@@ -441,7 +448,7 @@ def plan_convergence_trade(
         buy_depth_slippage_bps=buy_slip,
         sell_depth_slippage_bps=sell_slip,
         open_depth_slippage_bps=buy_slip + sell_slip,
-        convergence_bps=convergence,
+        convergence_bps=marginal_convergence,
         projected_net_bps=projected,
     ), "ok"
 

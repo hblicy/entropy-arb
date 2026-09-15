@@ -309,6 +309,70 @@ def test_convergence_plan_reports_each_leg_depth_slippage():
         plan.buy_depth_slippage_bps + plan.sell_depth_slippage_bps)
 
 
+def test_buy_entropy_convergence_recomputes_exact_marginal_ratio():
+    entropy_buy = make_book(
+        bids=[(99.0, 10)],
+        asks=[(100.0, 1), (100.05, 1)],
+    )
+    hedge_sell = make_book(
+        bids=[(100.0, 1), (99.95, 1)],
+        asks=[(101.0, 10)],
+    )
+
+    plan, reason = plan_convergence_trade(
+        entropy_buy,
+        hedge_sell,
+        **convergence_common(
+            direction="buy_entropy",
+            reference_basis_bps=0.0,
+            exit_residual_bps=12.003,
+            round_trip_fee_bps=0.0,
+            close_slippage_reserve_bps=0.0,
+            min_expected_profit_bps=2.0,
+            buy_slippage_budget_bps=6.0,
+            sell_slippage_budget_bps=6.0,
+            cap_notional=1000.0,
+            min_notional=1.0,
+        ),
+    )
+
+    assert reason == "ok"
+    assert plan.qty == 1.0
+    assert plan.projected_net_bps == pytest.approx(12.003)
+
+
+def test_sell_entropy_convergence_recomputes_exact_marginal_ratio():
+    hedge_buy = make_book(
+        bids=[(99.0, 10)],
+        asks=[(100.0, 1), (100.2, 1)],
+    )
+    entropy_sell = make_book(
+        bids=[(102.0, 1), (102.0 / 1.002, 1)],
+        asks=[(103.0, 10)],
+    )
+
+    plan, reason = plan_convergence_trade(
+        hedge_buy,
+        entropy_sell,
+        **convergence_common(
+            direction="sell_entropy",
+            reference_basis_bps=0.0,
+            exit_residual_bps=0.0,
+            round_trip_fee_bps=0.0,
+            close_slippage_reserve_bps=0.0,
+            min_expected_profit_bps=159.9,
+            buy_slippage_budget_bps=21.0,
+            sell_slippage_budget_bps=21.0,
+            cap_notional=1000.0,
+            min_notional=1.0,
+        ),
+    )
+
+    assert reason == "ok"
+    assert plan.qty == 1.0
+    assert plan.projected_net_bps == pytest.approx(200.0)
+
+
 def test_matched_close_only_uses_common_depth_inside_slippage_limit():
     buy = make_book(
         bids=[(99, 10)],
