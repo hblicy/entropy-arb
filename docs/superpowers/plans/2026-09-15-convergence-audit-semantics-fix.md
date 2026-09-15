@@ -4,7 +4,7 @@
 
 **Goal:** Persist the top-of-book convergence used for entry slippage budgets separately from the final marginal convergence returned by the depth planner.
 
-**Architecture:** Keep `convergence_bps` as the final marginal value and add `top_convergence_bps` through the decision, CSV event and pending audit data path. Advance pending state to v4 while deterministically loading v3 entry records from their existing residual, direction and exit target.
+**Architecture:** Keep `convergence_bps` as the final marginal value and add `top_convergence_bps` through the decision, CSV event and pending audit data path. Advance pending state to v4, allow only empty v3 journals to load, and fail closed on active v3 evidence whose convergence semantics cannot be identified.
 
 **Tech Stack:** Python 3, frozen dataclasses, JSON pending journal, CSV strategy recorder, pytest.
 
@@ -122,7 +122,7 @@ git add entropy_arb/engine.py entropy_arb/strategy_recorder.py tests/test_engine
 git commit -m "修复：记录顶层收敛审计值"
 ```
 
-### Task 3: Version and migrate pending audit state
+### Task 3: Version pending audit state and reject ambiguous v3 evidence
 
 **Files:**
 - Modify: `tests/test_engine.py:1545-1574,1628-1638`
@@ -130,12 +130,13 @@ git commit -m "修复：记录顶层收敛审计值"
 - Modify: `entropy_arb/engine.py:781-812,1171-1191`
 - Modify: `entropy_arb/recovery_state.py:22-41,90-126,332-397`
 
-- [ ] **Step 1: Write failing v4 round-trip and v3 migration tests**
+- [ ] **Step 1: Write failing v4 and fail-closed compatibility tests**
 
 Update the engine pending-audit fixture and expectations so both pending and
 settled events retain `top_convergence_bps`. Update `audit_context()` to pass
-`top_convergence_bps=2.0` and expect saved schema version 4. Add an entry-state
-v3 compatibility test:
+`top_convergence_bps=2.0` and expect saved schema version 4. Verify empty v3
+state remains readable, while an active v3 state is rejected without rewriting
+the source file:
 
 ```python
 state = replace(
@@ -153,10 +154,15 @@ payload["schema_version"] = 3
 del payload["pending_execution"]["audit"]["top_convergence_bps"]
 path.write_text(json.dumps(payload), encoding="utf-8")
 
-loaded = store.load()
-assert loaded.audit.top_convergence_bps == pytest.approx(32.5)
-assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 3
+with pytest.raises(
+        PendingExecutionStateError,
+        match=r"schema_version 3.*manual verification required"):
+    store.load()
+assert path.read_bytes() == original
 ```
+
+Parameterize malformed versions with `{}`, `[]`, `3.0` and `True`; all must
+raise `PendingExecutionStateError` through the manual-verification path.
 
 - [ ] **Step 2: Run recovery tests and verify RED**
 
@@ -164,38 +170,40 @@ assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 3
 python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py
 ```
 
-Expected: FAIL because schema v4 and `top_convergence_bps` are not implemented.
+Expected: FAIL because active v3 currently loads and an object schema version
+raises an uncontrolled `TypeError`.
 
-- [ ] **Step 3: Implement v4 and deterministic v3 loading**
+- [ ] **Step 3: Implement strict version validation and v3 fail-closed loading**
 
 Set `SCHEMA_VERSION = 4`, add the field to `_AUDIT_FIELDS` and
 `PendingAuditContext`, and validate it as an optional non-negative finite value.
-Retain `_AUDIT_FIELDS_V3 = _AUDIT_FIELDS - {"top_convergence_bps"}`.
 
 Pass `decision.top_convergence_bps` into `_pending_audit_context`; when a
 pending execution settles, pass `audit.top_convergence_bps` to its strategy
 event.
 
-When loading schema v3, copy the audit dictionary and reconstruct entry values:
+Validate the version before set membership:
 
 ```python
-if execution["intent"] in {"OPEN", "ADD"}:
-    residual = audit["signed_residual_bps"]
-    target = execution["exit_target_bps"]
-    if residual is None or target is None:
+if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+    raise PendingExecutionStateError(
+        f"pending execution state {self.path} has unsupported "
+        f"schema_version {schema_version!r}; manual verification required")
+if schema_version not in {3, SCHEMA_VERSION}:
+    raise PendingExecutionStateError(
+        f"pending execution state {self.path} has unsupported "
+        f"schema_version {schema_version!r}; manual verification required")
+if schema_version == 3:
+    if pending is not None:
         raise PendingExecutionStateError(
-            "v3 entry audit cannot reconstruct top convergence")
-    audit["top_convergence_bps"] = (
-        residual - target
-        if execution["direction"] == "sell_entropy"
-        else target - residual
-    )
-else:
-    audit["top_convergence_bps"] = None
+            f"pending execution state {self.path} has active schema_version "
+            "3 evidence; manual verification required")
+    return None
 ```
 
-Accept only versions 3 and 4; keep v2 and unknown versions on the existing
-manual-verification error path. Loading must not rewrite the source file.
+Only empty v3 and valid v4 are readable. Active v3, v2, malformed and unknown
+versions use the manual-verification error path. Loading never rewrites the
+source file.
 
 - [ ] **Step 4: Run recovery tests and verify GREEN**
 

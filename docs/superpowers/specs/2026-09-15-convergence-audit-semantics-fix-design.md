@@ -26,10 +26,12 @@ pre-planning convergence used to quote entry slippage budgets.
   are archived by the recorder's existing header-compatibility behavior.
 - `PendingAuditContext` persists both values so recovery and settled execution
   events retain the original decision evidence.
-- Pending state schema advances from v3 to v4. The loader accepts v3 because
-  its entry direction, signed residual and exit target are sufficient to
-  reconstruct `top_convergence_bps` deterministically. Non-entry v3 records
-  receive `None`. v2 and unknown versions remain fail-closed.
+- Pending state schema advances from v3 to v4. An empty v3 journal remains
+  readable because it contains no ambiguous execution evidence. An active v3
+  journal remains fail-closed: v3 existed both before and after
+  `convergence_bps` changed from the top value to the marginal value, so the
+  producer semantics cannot be recovered reliably. v2, malformed and unknown
+  versions also remain fail-closed.
 
 The alternative of changing `convergence_bps` back to the top-of-book value is
 rejected because it would again diverge from the planner's exact marginal
@@ -43,7 +45,7 @@ Tests must first demonstrate the missing distinction, then verify:
 1. multi-level entry decisions expose different top and marginal values;
 2. strategy events write both columns;
 3. pending v4 round-trips both values;
-4. v3 pending state is upgraded deterministically without modifying the source
-   file during load;
-5. malformed, v2 and unknown pending schemas still fail closed;
+4. empty v3 state remains readable without modifying the source file;
+5. active v3, malformed, v2 and unknown pending schemas fail closed through
+   `PendingExecutionStateError`;
 6. the full test suite, compile check and `git diff --check` pass.
