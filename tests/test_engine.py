@@ -4265,6 +4265,45 @@ def test_hedge_reduces_same_direction_positions_across_all_venues():
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("position", [0.5, -0.5])
+def test_residual_hedge_rounding_stays_inside_slippage_bound(position):
+    class CoarseTickVenue(RecordingPositionVenue):
+        def px_round(self, px, round_up):
+            math = __import__("math")
+            scaled = px * 10.0
+            rounded = math.ceil(scaled) if round_up else math.floor(scaled)
+            return rounded / 10.0
+
+    async def go():
+        eng = make_engine()
+        eng.cfg.hedge_slippage_bps = 20.0
+        result = OrderResult(
+            status="filled", filled_base=abs(position), avg_px=100.0)
+        active = CoarseTickVenue("entropy", "ENTROPY", result)
+        inactive = RecordingPositionVenue(
+            "hedge", "RH", OrderResult(status="filled", filled_base=0.0))
+        active.position = position
+        active.set_book(100.03, 100.04)
+        inactive.position = 0.0
+        inactive.set_book(99.99, 100.0)
+        eng.entropy, eng.hedge = active, inactive
+        eng.venues = {"entropy": active, "hedge": inactive}
+
+        await eng._hedge(position)
+
+        assert len(active.send_args) == 1
+        limit = active.send_args[0]["limit_px"]
+        if position > 0:
+            raw_bound = 100.03 * (1.0 - 20.0 / 1e4)
+            assert limit >= raw_bound
+        else:
+            raw_bound = 100.04 * (1.0 + 20.0 / 1e4)
+            assert limit <= raw_bound
+        assert active.send_args[0]["reduce_only"] is True
+
+    asyncio.run(go())
+
+
 def test_hedge_transport_error_requires_manual_recovery():
     async def go():
         eng = make_engine()

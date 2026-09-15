@@ -2726,8 +2726,8 @@ class Engine:
             ref = v.book.best_bid() if is_sell else v.book.best_ask()
             if ref is None:
                 continue
-            limit = v.px_round(ref * (1 - slip), False) if is_sell \
-                else v.px_round(ref * (1 + slip), True)
+            limit = v.px_round(ref * (1 - slip), True) if is_sell \
+                else v.px_round(ref * (1 + slip), False)
             if qty * limit < max(cfg.min_order_notional, v.min_quote):
                 continue
             await lk.acquire()  # verified free, no awaits since: fast path
