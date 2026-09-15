@@ -484,8 +484,10 @@ def test_entry_decision_records_final_marginal_convergence():
     assert result.intent == "OPEN"
     assert result.plan.qty == pytest.approx(5.5)
     assert result.plan.convergence_bps == pytest.approx(27.5)
+    assert result.top_convergence_bps == pytest.approx(32.5)
     assert result.convergence_bps == pytest.approx(
         result.plan.convergence_bps)
+    assert result.top_convergence_bps != result.convergence_bps
 
 
 @pytest.mark.parametrize(
