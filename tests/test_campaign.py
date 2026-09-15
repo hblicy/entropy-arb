@@ -193,6 +193,24 @@ def test_campaign_rejects_nonfinite_persisted_values(tmp_path):
         CampaignStore(str(path), shadow=False).load()
 
 
+def test_campaign_rejects_integer_too_large_for_float():
+    with pytest.raises(CampaignInvariantError, match="qty must be finite"):
+        campaign(qty=10 ** 400)
+
+
+def test_campaign_loader_wraps_integer_too_large_for_float(tmp_path):
+    path = tmp_path / "state.json"
+    store = CampaignStore(str(path), shadow=False)
+    store.save(campaign())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["campaign"]["qty"] = 10 ** 400
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+            CampaignStateError, match="invalid campaign state: qty must be finite"):
+        store.load()
+
+
 def test_reconcile_allows_flat_without_state():
     result = reconcile_campaign(
         None, entropy_position=0.0, hedge_position=0.0,
