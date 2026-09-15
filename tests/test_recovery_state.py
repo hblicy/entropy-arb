@@ -86,6 +86,27 @@ def pending_state():
     )
 
 
+def valid_entry_pending_state(intent="OPEN"):
+    state = pending_state()
+    audit = replace(
+        state.audit,
+        signed_residual_bps=10.0,
+        top_convergence_bps=10.0,
+        convergence_bps=8.0,
+        round_trip_fee_bps=1.8,
+        projected_net_usd=0.0085,
+    )
+    return replace(
+        state,
+        intent=intent,
+        direction="sell_entropy",
+        campaign_before=None if intent == "OPEN" else state.campaign_before,
+        buy=replace(state.buy, venue_key="hedge"),
+        sell=replace(state.sell, venue_key="entropy"),
+        audit=audit,
+    )
+
+
 def test_pending_store_round_trips_without_secrets(tmp_path):
     path = tmp_path / "campaign.pending.json"
     store = PendingExecutionStore(path)
@@ -148,6 +169,34 @@ def test_pending_entry_requires_complete_audit(intent, field):
         replace(state, **changes)
 
 
+@pytest.mark.parametrize("intent", ["OPEN", "ADD"])
+@pytest.mark.parametrize(("field", "value"), [
+    ("top_convergence_bps", 9.0),
+    ("convergence_bps", 11.0),
+    ("round_trip_fee_bps", 0.9),
+    ("projected_net_usd", 999.0),
+])
+def test_pending_entry_rejects_inconsistent_audit(intent, field, value):
+    state = valid_entry_pending_state(intent)
+
+    with pytest.raises(PendingExecutionStateError, match=field):
+        replace(state, audit=replace(state.audit, **{field: value}))
+
+
+@pytest.mark.parametrize("intent", ["OPEN", "ADD"])
+def test_pending_entry_accepts_floating_point_rounding(intent):
+    state = valid_entry_pending_state(intent)
+    audit = replace(
+        state.audit,
+        top_convergence_bps=10.0 + 5e-10,
+        convergence_bps=10.0 + 9e-10,
+        round_trip_fee_bps=1.8 + 5e-10,
+        projected_net_usd=0.0085 + 5e-10,
+    )
+
+    assert replace(state, audit=audit).audit == audit
+
+
 def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
     path = tmp_path / "campaign.pending.json"
     original = json.dumps({
@@ -180,6 +229,8 @@ def test_pending_store_rejects_active_v3_without_modifying_original_file(
             state.audit,
             signed_residual_bps=42.5,
             top_convergence_bps=32.5,
+            round_trip_fee_bps=1.8,
+            projected_net_usd=0.0085,
         ),
     )
     store.save(state)

@@ -397,3 +397,67 @@ git status --short
 
 Expected: all tests and checks PASS; only the intended source, tests and
 existing convergence design/plan documents are changed before commit.
+
+### Task 8: Validate entry audit cross-field consistency
+
+**Files:**
+- Modify: `tests/test_recovery_state.py`
+- Modify: `tests/test_engine.py:882-898,1024-1035`
+- Modify: `entropy_arb/recovery_state.py:301-325`
+
+- [x] **Step 1: Write four failing relationship tests**
+
+Build a valid OPEN state from `pending_state()` and independently corrupt each
+derived field. Assert that construction rejects the journal with the affected
+field name:
+
+```python
+@pytest.mark.parametrize(("field", "value"), [
+    ("top_convergence_bps", 9.0),
+    ("convergence_bps", 11.0),
+    ("round_trip_fee_bps", 0.9),
+    ("projected_net_usd", 999.0),
+])
+def test_pending_entry_rejects_inconsistent_audit(field, value):
+    state = valid_open_pending_state()
+    with pytest.raises(PendingExecutionStateError, match=field):
+        replace(state, audit=replace(state.audit, **{field: value}))
+```
+
+- [x] **Step 2: Run the test and verify RED**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py::test_pending_entry_rejects_inconsistent_audit
+```
+
+Expected: four failures because each inconsistent state is currently accepted.
+
+- [x] **Step 3: Implement the four minimal OPEN/ADD validations**
+
+For `sell_entropy`, require
+`top_convergence_bps == signed_residual_bps - exit_target_bps`; for
+`buy_entropy`, require
+`top_convergence_bps == exit_target_bps - signed_residual_bps`. Require
+`convergence_bps <= top_convergence_bps`,
+`round_trip_fee_bps == 2 * (entropy_fee_bps + hedge_fee_bps)`, and
+`projected_net_usd == planned_notional_usd * projected_net_bps / 1e4`.
+Use `math.isclose(rel_tol=1e-12, abs_tol=1e-9)` for equality and the same
+tolerance at the convergence boundary.
+
+- [x] **Step 4: Replace the impossible engine OPEN fixture**
+
+Use a reachable sell-entry residual of `45.0`, top convergence `20.0`, and
+marginal convergence `18.0` for the fixture whose exit target is `25.0` and
+entry boundary is `34.0`. Where a test customizes top/marginal values, customize
+the signed residual consistently.
+
+- [x] **Step 5: Verify focused and full suites**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py tests/test_engine.py
+python -m pytest -q -p no:cacheprovider
+python -m compileall -q entropy_arb main.py tools tests
+git diff --check
+```
+
+Expected: all tests and checks PASS.

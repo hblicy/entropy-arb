@@ -29,6 +29,13 @@ pre-planning convergence used to quote entry slippage budgets.
 - OPEN and ADD journals require the reference ages and reference update skew
   that passed the entry reference gate, so restored entry evidence remains
   self-contained and cannot silently lose its timing context.
+- OPEN and ADD journals also validate the four relationships that can be
+  derived entirely from their persisted decision evidence: top convergence
+  matches direction and exit target, marginal convergence does not exceed the
+  top value, round-trip fees match both venue fees, and projected USD matches
+  notional times projected basis points. Comparisons use a small floating-point
+  tolerance; no market-state-dependent entry rule is reconstructed at load
+  time.
 - Pending state schema advances from v3 to v4. An empty v3 journal remains
   readable because it contains no ambiguous execution evidence. An active v3
   journal remains fail-closed: v3 existed both before and after
@@ -52,3 +59,5 @@ Tests must first demonstrate the missing distinction, then verify:
 5. active v3, malformed, v2 and unknown pending schemas fail closed through
    `PendingExecutionStateError`;
 6. the full test suite, compile check and `git diff --check` pass.
+7. inconsistent OPEN/ADD cross-field evidence fails closed, while equivalent
+   values differing only by floating-point rounding remain readable.

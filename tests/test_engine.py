@@ -880,13 +880,14 @@ def pending_audit_context(planned_notional_usd=100.0,
 
 
 def pending_entry_audit_context(planned_notional_usd=100.0,
-                                top_convergence_bps=10.0):
+                                top_convergence_bps=20.0,
+                                signed_residual_bps=45.0):
     return replace(
         pending_audit_context(planned_notional_usd),
-        signed_residual_bps=10.0,
+        signed_residual_bps=signed_residual_bps,
         reference_basis_bps=0.0,
         top_convergence_bps=top_convergence_bps,
-        convergence_bps=8.0,
+        convergence_bps=18.0,
         round_trip_fee_bps=0.0,
         buy_slippage_budget_bps=1.0,
         sell_slippage_budget_bps=1.0,
@@ -1029,6 +1030,7 @@ def test_settled_pending_event_preserves_both_convergence_values(tmp_path):
             pending,
             audit=replace(
                 pending.audit,
+                signed_residual_bps=57.5,
                 top_convergence_bps=32.5,
                 convergence_bps=27.5,
             ),
@@ -1327,7 +1329,8 @@ def test_live_startup_pending_recovery_resumes_strategy_without_new_orders(
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
-            audit=pending_entry_audit_context(),
+            audit=pending_entry_audit_context(
+                signed_residual_bps=model.q75_bps + 20.0),
             settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
@@ -1398,7 +1401,8 @@ def test_live_startup_unmatched_pending_exits_and_releases_lock(tmp_path):
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
-            audit=pending_entry_audit_context(),
+            audit=pending_entry_audit_context(
+                signed_residual_bps=model.q75_bps + 20.0),
             settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
