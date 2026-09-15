@@ -197,6 +197,50 @@ def test_pending_entry_accepts_floating_point_rounding(intent):
     assert replace(state, audit=audit).audit == audit
 
 
+@pytest.mark.parametrize(
+    ("execution_changes", "audit_changes", "field"),
+    [
+        (
+            {"exit_target_bps": -(10 ** 308)},
+            {
+                "signed_residual_bps": 10 ** 308,
+                "top_convergence_bps": 10 ** 308,
+            },
+            "top_convergence_bps",
+        ),
+        (
+            {
+                "entropy_fee_bps": 10 ** 308,
+                "hedge_fee_bps": 10 ** 308,
+            },
+            {"round_trip_fee_bps": 1.0},
+            "round_trip_fee_bps",
+        ),
+        (
+            {},
+            {
+                "planned_notional_usd": 10 ** 308,
+                "projected_net_bps": 10 ** 308,
+                "projected_net_usd": 1.0,
+            },
+            "projected_net_usd",
+        ),
+    ],
+)
+def test_pending_loader_rejects_derived_overflow(
+        tmp_path, execution_changes, audit_changes, field):
+    path = tmp_path / "campaign.pending.json"
+    store = PendingExecutionStore(path)
+    store.save(valid_entry_pending_state())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["pending_execution"].update(execution_changes)
+    payload["pending_execution"]["audit"].update(audit_changes)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PendingExecutionStateError, match=field):
+        store.load()
+
+
 def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
     path = tmp_path / "campaign.pending.json"
     original = json.dumps({

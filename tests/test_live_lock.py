@@ -1,4 +1,7 @@
 from dataclasses import replace
+import os
+from pathlib import Path
+import tempfile
 
 import pytest
 
@@ -21,6 +24,28 @@ def lock_identity(*, account="account-1", symbol="ANTH"):
         entropy_account=account,
         hedge_account="466324:7",
     )
+
+
+def test_default_directory_does_not_follow_process_temp_root(tmp_path):
+    original = tempfile.tempdir
+    try:
+        tempfile.tempdir = str(tmp_path / "user-a")
+        first = LiveProcessLock(lock_identity())
+        tempfile.tempdir = str(tmp_path / "user-b")
+        second = LiveProcessLock(lock_identity())
+    finally:
+        tempfile.tempdir = original
+
+    if os.name == "nt":
+        assert first.paths == second.paths == ()
+        assert first._semaphore_names == second._semaphore_names
+        assert all(
+            name.startswith("Global\\entropy-arb-live-")
+            for name in first._semaphore_names)
+    else:
+        expected = Path("/tmp") / "entropy-arb-live-locks"
+        assert {path.parent for path in first.paths} == {expected}
+        assert first.paths == second.paths
 
 
 def test_second_live_lock_for_same_identity_is_rejected(tmp_path):

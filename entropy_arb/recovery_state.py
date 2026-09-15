@@ -251,12 +251,14 @@ class PendingExecutionState:
             raise PendingExecutionStateError(
                 "frozen_model quantiles must be ordered")
         _signed_finite("entry_boundary_bps", self.entry_boundary_bps)
-        _signed_finite("exit_target_bps", self.exit_target_bps)
+        exit_target_bps = _signed_finite(
+            "exit_target_bps", self.exit_target_bps)
         _finite("entropy_expected_px", self.entropy_expected_px,
                 positive=True)
         _finite("hedge_expected_px", self.hedge_expected_px, positive=True)
-        _finite("entropy_fee_bps", self.entropy_fee_bps)
-        _finite("hedge_fee_bps", self.hedge_fee_bps)
+        entropy_fee_bps = _finite(
+            "entropy_fee_bps", self.entropy_fee_bps)
+        hedge_fee_bps = _finite("hedge_fee_bps", self.hedge_fee_bps)
         if self.intent == "OPEN":
             if self.campaign_before is not None:
                 raise PendingExecutionStateError(
@@ -324,13 +326,34 @@ class PendingExecutionState:
                 f"{', '.join(missing_entry_audit)} are required for "
                 "OPEN and ADD")
         if self.intent in {"OPEN", "ADD"}:
+            signed_residual_bps = _signed_finite(
+                "audit.signed_residual_bps",
+                self.audit.signed_residual_bps)
+            top_convergence_bps = _finite(
+                "audit.top_convergence_bps",
+                self.audit.top_convergence_bps)
+            convergence_bps = _finite(
+                "audit.convergence_bps", self.audit.convergence_bps)
+            round_trip_fee_bps = _finite(
+                "audit.round_trip_fee_bps",
+                self.audit.round_trip_fee_bps)
+            planned_notional_usd = _finite(
+                "audit.planned_notional_usd",
+                self.audit.planned_notional_usd,
+                positive=True)
+            projected_net_bps = _signed_finite(
+                "audit.projected_net_bps",
+                self.audit.projected_net_bps)
+            projected_net_usd = _signed_finite(
+                "audit.projected_net_usd",
+                self.audit.projected_net_usd)
             expected_top_convergence = (
-                self.audit.signed_residual_bps - self.exit_target_bps
+                signed_residual_bps - exit_target_bps
                 if self.direction == "sell_entropy"
-                else self.exit_target_bps - self.audit.signed_residual_bps
+                else exit_target_bps - signed_residual_bps
             )
             if not math.isclose(
-                    self.audit.top_convergence_bps,
+                    top_convergence_bps,
                     expected_top_convergence,
                     rel_tol=1e-12,
                     abs_tol=1e-9):
@@ -338,20 +361,20 @@ class PendingExecutionState:
                     "audit.top_convergence_bps is inconsistent with "
                     "direction, audit.signed_residual_bps and "
                     "exit_target_bps")
-            if (self.audit.convergence_bps
-                    > self.audit.top_convergence_bps
+            if (convergence_bps
+                    > top_convergence_bps
                     and not math.isclose(
-                        self.audit.convergence_bps,
-                        self.audit.top_convergence_bps,
+                        convergence_bps,
+                        top_convergence_bps,
                         rel_tol=1e-12,
                         abs_tol=1e-9)):
                 raise PendingExecutionStateError(
                     "audit.convergence_bps must not exceed "
                     "audit.top_convergence_bps")
             expected_round_trip_fee = 2.0 * (
-                self.entropy_fee_bps + self.hedge_fee_bps)
+                entropy_fee_bps + hedge_fee_bps)
             if not math.isclose(
-                    self.audit.round_trip_fee_bps,
+                    round_trip_fee_bps,
                     expected_round_trip_fee,
                     rel_tol=1e-12,
                     abs_tol=1e-9):
@@ -359,10 +382,9 @@ class PendingExecutionState:
                     "audit.round_trip_fee_bps is inconsistent with venue "
                     "fees")
             expected_projected_net_usd = (
-                self.audit.planned_notional_usd
-                * self.audit.projected_net_bps / 1e4)
+                planned_notional_usd * projected_net_bps / 1e4)
             if not math.isclose(
-                    self.audit.projected_net_usd,
+                    projected_net_usd,
                     expected_projected_net_usd,
                     rel_tol=1e-12,
                     abs_tol=1e-9):

@@ -235,10 +235,13 @@ exactly once, and clears the journal only after both exchange positions have
 been refreshed and agree. Missing references, an incomplete trade audit, or
 contradictory state stays blocked for manual verification; the engine never
 guesses or resends the original order.
-New code auto-loads only pending schema v3. A schema v2 pending file is left
-unchanged: manually verify both venues' order histories and actual positions
-before handling it; do not delete it or edit its schema version directly. A
-record-only upgrade with no pending file is unaffected. In schema v3,
+New code writes and auto-loads active pending state only as schema v4. An empty
+schema v3 journal is accepted as having no pending execution, but an active v3
+journal is left unchanged and blocks startup for manual verification. Schema
+v2, unknown, and malformed journals also fail closed: manually verify both
+venues' order histories and actual positions before handling them; do not
+delete a journal or edit its schema version directly. A record-only upgrade
+with no pending file is unaffected. In schema v4,
 `settled_at` is when the engine first confirms that both legs are terminal;
 the recovered event timestamp and hold duration use that time. Completing an
 upgrade, tests, or replay is not authorization to set `live_enabled: true`;
