@@ -311,6 +311,9 @@ class PendingExecutionState:
             "sell_slippage_budget_bps",
             "projected_net_bps",
             "projected_net_usd",
+            "entropy_reference_age_ms",
+            "hedge_reference_age_ms",
+            "reference_update_skew_ms",
         )
         missing_entry_audit = [
             f"audit.{name}" for name in entry_audit_fields

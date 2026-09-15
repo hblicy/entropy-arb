@@ -26,6 +26,9 @@ pre-planning convergence used to quote entry slippage budgets.
   are archived by the recorder's existing header-compatibility behavior.
 - `PendingAuditContext` persists both values so recovery and settled execution
   events retain the original decision evidence.
+- OPEN and ADD journals require the reference ages and reference update skew
+  that passed the entry reference gate, so restored entry evidence remains
+  self-contained and cannot silently lose its timing context.
 - Pending state schema advances from v3 to v4. An empty v3 journal remains
   readable because it contains no ambiguous execution evidence. An active v3
   journal remains fail-closed: v3 existed both before and after

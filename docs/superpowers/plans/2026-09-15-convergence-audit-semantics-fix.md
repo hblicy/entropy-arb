@@ -338,3 +338,62 @@ runtime failures.
 Run the command from Step 2. Expected: PASS.
 
 - [x] **Step 5: Repeat Task 4 final verification against the current HEAD**
+
+### Task 7: Require entry reference timing evidence
+
+**Files:**
+- Modify: `tests/test_recovery_state.py:118-145`
+- Modify: `tests/test_engine.py:882-895`
+- Modify: `entropy_arb/recovery_state.py:304-318`
+
+- [x] **Step 1: Extend the failing parameterized test**
+
+Add the three values guaranteed by the entry reference gate:
+
+```python
+"entropy_reference_age_ms",
+"hedge_reference_age_ms",
+"reference_update_skew_ms",
+```
+
+- [x] **Step 2: Run the focused test and verify RED**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py::test_pending_entry_requires_complete_audit
+```
+
+Expected: the six new OPEN/ADD combinations fail because they do not raise
+`PendingExecutionStateError`.
+
+- [x] **Step 3: Complete the entry fixture and required set**
+
+Give `pending_entry_audit_context()` finite timing values:
+
+```python
+entropy_reference_age_ms=15.0,
+hedge_reference_age_ms=20.0,
+reference_update_skew_ms=5.0,
+```
+
+Add the same three field names to `entry_audit_fields` so OPEN/ADD journals
+with missing timing evidence fail closed. Keep CLOSE/FORCED_CLOSE optional.
+
+- [x] **Step 4: Verify GREEN and all directly affected tests**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py tests/test_engine.py
+```
+
+Expected: all tests PASS.
+
+- [x] **Step 5: Run the full suite and repository checks**
+
+```bash
+python -m pytest -q -p no:cacheprovider
+python -m compileall -q entropy_arb main.py tools tests
+git diff --check
+git status --short
+```
+
+Expected: all tests and checks PASS; only the intended source, tests and
+existing convergence design/plan documents are changed before commit.

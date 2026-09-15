@@ -892,6 +892,9 @@ def pending_entry_audit_context(planned_notional_usd=100.0,
         sell_slippage_budget_bps=1.0,
         projected_net_bps=6.0,
         projected_net_usd=planned_notional_usd * 6.0 / 1e4,
+        entropy_reference_age_ms=15.0,
+        hedge_reference_age_ms=20.0,
+        reference_update_skew_ms=5.0,
     )
 
 

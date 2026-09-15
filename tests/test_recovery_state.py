@@ -125,6 +125,9 @@ def test_pending_open_requires_durable_campaign_identity():
     "sell_slippage_budget_bps",
     "projected_net_bps",
     "projected_net_usd",
+    "entropy_reference_age_ms",
+    "hedge_reference_age_ms",
+    "reference_update_skew_ms",
 ])
 @pytest.mark.parametrize("intent", ["OPEN", "ADD"])
 def test_pending_entry_requires_complete_audit(intent, field):
