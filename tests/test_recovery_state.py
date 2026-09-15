@@ -356,3 +356,44 @@ def test_pending_execution_requires_explicit_audit_context():
 
     with pytest.raises(TypeError, match="audit"):
         PendingExecutionState(**values)
+
+
+@pytest.mark.parametrize("intent", ["CLOSE", "FORCED_CLOSE"])
+@pytest.mark.parametrize("model", [
+    ModelSnapshot(
+        version=2, minute=101, samples=50, status="REGIME_UNSTABLE",
+        median_bps=0.0, lower_bps=-5.0, q25_bps=-2.0,
+        q75_bps=2.0, upper_bps=5.0),
+    ModelSnapshot(
+        version=0, minute=101, samples=0, status="MODEL_NOT_READY",
+        median_bps=None, lower_bps=None, q25_bps=None,
+        q75_bps=None, upper_bps=None),
+])
+def test_pending_close_accepts_valid_nonready_decision_model(intent, model):
+    state = replace(pending_state(), intent=intent, frozen_model=model)
+
+    assert state.intent == intent
+    assert state.frozen_model == model
+
+
+@pytest.mark.parametrize("intent", ["OPEN", "ADD"])
+def test_pending_entry_still_rejects_nonready_decision_model(intent):
+    state = pending_state()
+    changes = {
+        "intent": intent,
+        "frozen_model": ModelSnapshot(
+            version=0, minute=101, samples=0, status="MODEL_NOT_READY",
+            median_bps=None, lower_bps=None, q25_bps=None,
+            q75_bps=None, upper_bps=None),
+    }
+    if intent == "OPEN":
+        changes.update(campaign_id="new-campaign", campaign_before=None)
+    else:
+        changes.update(
+            direction="sell_entropy",
+            buy=replace(state.buy, venue_key="hedge"),
+            sell=replace(state.sell, venue_key="entropy"),
+        )
+
+    with pytest.raises(PendingExecutionStateError, match="ready"):
+        replace(state, **changes)

@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Optional
 
 from .campaign import PositionCampaign, _campaign_from_dict
-from .strategy import MarketIdentity, ModelSnapshot
+from .strategy import (
+    MODEL_NOT_READY,
+    READY,
+    REGIME_UNSTABLE,
+    MarketIdentity,
+    ModelSnapshot,
+)
 
 
 SCHEMA_VERSION = 3
@@ -195,24 +201,46 @@ class PendingExecutionState:
                 "campaign_id must be a non-empty string")
         _finite("qty", self.qty, positive=True)
         _finite("decided_at", self.decided_at)
-        if (not isinstance(self.frozen_model, ModelSnapshot)
-                or not self.frozen_model.ready):
+        if not isinstance(self.frozen_model, ModelSnapshot):
+            raise PendingExecutionStateError(
+                "frozen_model must be a ModelSnapshot")
+        if self.frozen_model.status not in {
+                MODEL_NOT_READY, READY, REGIME_UNSTABLE}:
+            raise PendingExecutionStateError(
+                "frozen_model status is invalid")
+        if (self.intent in {"OPEN", "ADD"}
+                and not self.frozen_model.ready):
             raise PendingExecutionStateError(
                 "frozen_model must be a ready ModelSnapshot")
         for name in ("version", "minute", "samples"):
             value = getattr(self.frozen_model, name)
-            minimum = 1 if name in {"version", "samples"} else 0
+            minimum = 0
             if (isinstance(value, bool) or not isinstance(value, int)
                     or value < minimum):
                 raise PendingExecutionStateError(
                     f"frozen_model.{name} must be a valid integer")
-        quantiles = [
-            _signed_finite(
-                f"frozen_model.{name}", getattr(self.frozen_model, name))
-            for name in ("lower_bps", "q25_bps", "median_bps",
-                         "q75_bps", "upper_bps")
-        ]
-        if quantiles != sorted(quantiles):
+        if (self.frozen_model.status in {READY, REGIME_UNSTABLE}
+                and self.frozen_model.samples == 0):
+            raise PendingExecutionStateError(
+                "ready or unstable frozen_model must contain samples")
+        quantile_names = (
+            "lower_bps", "q25_bps", "median_bps", "q75_bps", "upper_bps")
+        raw_quantiles = [
+            getattr(self.frozen_model, name) for name in quantile_names]
+        if self.frozen_model.samples == 0:
+            if any(value is not None for value in raw_quantiles):
+                raise PendingExecutionStateError(
+                    "empty frozen_model quantiles must be null")
+            quantiles = []
+        else:
+            if any(value is None for value in raw_quantiles):
+                raise PendingExecutionStateError(
+                    "sampled frozen_model quantiles must be finite")
+            quantiles = [
+                _signed_finite(f"frozen_model.{name}", value)
+                for name, value in zip(quantile_names, raw_quantiles)
+            ]
+        if quantiles and quantiles != sorted(quantiles):
             raise PendingExecutionStateError(
                 "frozen_model quantiles must be ordered")
         _signed_finite("entry_boundary_bps", self.entry_boundary_bps)

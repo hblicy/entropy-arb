@@ -2289,6 +2289,44 @@ def test_live_dynamic_forced_close_sends_both_legs_reduce_only(tmp_path):
     asyncio.run(go())
 
 
+def test_live_dynamic_forced_close_submits_with_nonready_model(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await reconcile_dynamic_execution(eng)
+            eng.campaign = __import__("dataclasses").replace(
+                eng.campaign,
+                opened_at=(
+                    time.time()
+                    - eng.cfg.strategy_hard_hold_minutes * 60.0
+                    - 1.0),
+            )
+            eng.campaign_store.save(eng.campaign)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+            nonready = ModelSnapshot(
+                version=0, minute=int(time.time() // 60), samples=0,
+                status="MODEL_NOT_READY", median_bps=None, lower_bps=None,
+                q25_bps=None, q75_bps=None, upper_bps=None)
+            eng.residual_model.snapshot = (
+                lambda *, now_minute: __import__("dataclasses").replace(
+                    nonready, minute=now_minute))
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_args[-1]["reduce_only"] is True
+            assert eng.hedge.send_args[-1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
 def test_dynamic_protection_price_uses_one_total_slippage_budget(tmp_path):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
