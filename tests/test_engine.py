@@ -4,6 +4,7 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_engine.py)
 """
 import asyncio
 import csv
+from dataclasses import replace
 import logging
 import os
 from pathlib import Path
@@ -868,6 +869,155 @@ def read_strategy_events(eng):
         return list(csv.DictReader(handle))
 
 
+EXECUTION_BUSINESS_FIELDS = [
+    "ts_ms", "event", "intent", "reason", "decision_id", "campaign_id",
+    "direction", "model_version", "model_samples", "model_status",
+    "model_median_bps", "model_lower_bps", "model_upper_bps",
+    "model_iqr_bps", "signed_residual_bps", "reference_basis_bps",
+    "entry_boundary_bps", "exit_target_bps", "convergence_bps",
+    "round_trip_fee_bps", "buy_slippage_budget_bps",
+    "sell_slippage_budget_bps", "projected_net_bps",
+    "projected_net_usd", "estimated_campaign_pnl_usd", "qty",
+    "planned_notional_usd", "entropy_reference_age_ms",
+    "hedge_reference_age_ms", "reference_update_skew_ms",
+    "net_funding_bps_per_hour", "entropy_fill_px", "hedge_fill_px",
+    "hold_seconds", "realized_pnl_usd",
+]
+
+
+def execution_event(eng, event="campaign_changed"):
+    return next(row for row in read_strategy_events(eng)
+                if row["event"] == event)
+
+
+def test_pending_results_use_supplied_wall_clock_for_terminal_settlement(
+        tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    pending = restart_open_pending(eng)
+    buy_result = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.0,
+        order_ref="buy-restart")
+    sell_result = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.45,
+        order_ref="sell-restart")
+    try:
+        one_unknown = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result,
+            sell_result=OrderResult.unknown(
+                "timeout", order_ref="sell-restart"),
+            audit_ok=False, campaign_applied=False, now_wall=1002.0)
+        terminal = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result, sell_result=sell_result,
+            audit_ok=True, campaign_applied=False, now_wall=1002.0)
+        already_settled = eng._pending_execution_with_results(
+            terminal, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result, sell_result=sell_result,
+            audit_ok=True, campaign_applied=False, now_wall=1060.0)
+
+        assert one_unknown.settled_at is None
+        assert terminal.settled_at == 1002.0
+        assert already_settled.settled_at == 1002.0
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_immediate_and_startup_execution_events_use_durable_audit_fields(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    normal = make_live_dynamic_execution_engine(tmp_path / "normal")
+    original_buy = normal.hedge.send_taker
+    original_sell = normal.entropy.send_taker
+
+    async def buy_at_settlement(**kwargs):
+        result = await original_buy(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    async def sell_at_settlement(**kwargs):
+        result = await original_sell(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    normal.hedge.send_taker = buy_at_settlement
+    normal.entropy.send_taker = sell_at_settlement
+
+    async def go():
+        restarted = None
+        try:
+            await normal._evaluate()
+            pending = normal.pending_execution_store.load()
+            normal_event = execution_event(normal)
+
+            assert pending.decided_at == 1000.0
+            assert pending.settled_at == 1002.0
+            assert normal_event["ts_ms"] == "1002000"
+
+            restarted = make_live_dynamic_execution_engine(
+                tmp_path / "restarted")
+            restarted._decision_reference_audit_values = lambda _direction: (
+                (_ for _ in ()).throw(
+                    AssertionError("pending events must not read live reference")))
+            restart_pending = replace(pending, campaign_applied=False)
+            restarted.pending_execution_store.save(restart_pending)
+            restarted._startup_pending_execution = restart_pending
+
+            assert await restarted._resolve_startup_pending_execution()
+            restarted_event = execution_event(restarted)
+            assert {
+                key: restarted_event[key] for key in EXECUTION_BUSINESS_FIELDS
+            } == {
+                key: normal_event[key] for key in EXECUTION_BUSINESS_FIELDS
+            }
+            assert restarted_event["campaign_status"] == "OPEN"
+        finally:
+            normal._shutdown_reconcile_required = False
+            normal._close_dynamic_strategy()
+            if restarted is not None:
+                restarted._shutdown_reconcile_required = False
+                restarted._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_in_process_unknown_uses_terminal_confirmation_wall_clock(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    hedge = ConfirmingVenue(
+        "hedge", "RH",
+        OrderResult.unknown("timeout", order_ref="buy-delayed"))
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    eng.hedge = hedge
+    eng.venues = {"entropy": eng.entropy, "hedge": hedge}
+
+    async def go():
+        try:
+            await eng._evaluate()
+            assert eng.pending_execution_store.load().settled_at is None
+
+            wall[0] = 1060.0
+            hedge.terminal_results["buy-delayed"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-delayed")
+            assert await eng._resolve_pending_orders()
+
+            pending = eng.pending_execution_store.load()
+            event = execution_event(eng)
+            assert pending.settled_at == 1060.0
+            assert event["ts_ms"] == "1060000"
+            assert event["decision_id"] == (
+                f"execution-{pending.execution_id}")
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
 def test_live_matched_fill_uses_pending_execution_id_for_event(tmp_path):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
@@ -933,7 +1083,7 @@ def test_startup_pending_recovery_records_close_analytics(tmp_path):
             assert float(event["qty"]) == pytest.approx(1.0)
             assert float(event["entropy_fill_px"]) == pytest.approx(100.1)
             assert float(event["hedge_fill_px"]) == pytest.approx(100.0)
-            assert float(event["hold_seconds"]) == pytest.approx(60.0)
+            assert float(event["hold_seconds"]) == pytest.approx(61.0)
             assert float(event["realized_pnl_usd"]) == pytest.approx(0.1)
         finally:
             eng._shutdown_reconcile_required = False
@@ -1474,7 +1624,8 @@ def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
         eng._close_dynamic_strategy()
 
 
-def test_startup_resolves_persisted_unknown_exactly_once(tmp_path):
+def test_startup_resolves_persisted_unknown_exactly_once(
+        tmp_path, monkeypatch):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
         entropy = ConfirmingVenue(
@@ -1495,6 +1646,16 @@ def test_startup_resolves_persisted_unknown_exactly_once(tmp_path):
         eng.venues = {"entropy": entropy, "hedge": hedge}
         eng.RECONCILE_GRACE_SEC = 0.0
         eng.pending_execution_store.save(restart_open_pending(eng))
+        saved = []
+        original_save = eng.pending_execution_store.save
+
+        def capture_save(pending):
+            if pending is not None:
+                saved.append(pending)
+            original_save(pending)
+
+        eng.pending_execution_store.save = capture_save
+        monkeypatch.setattr(engine_module.time, "time", lambda: 1060.0)
         try:
             eng._load_pending_execution_state()
             assert eng._recovery_required
@@ -1505,9 +1666,155 @@ def test_startup_resolves_persisted_unknown_exactly_once(tmp_path):
             assert recovered.campaign_id == "restart-campaign"
             assert recovered.qty == pytest.approx(1.0)
             assert eng.pending_execution_store.load() is None
+            terminal = next(
+                pending for pending in saved
+                if pending.settled_at is not None)
+            assert not terminal.buy.unresolved
+            assert not terminal.sell.unresolved
+            assert terminal.settled_at == 1060.0
+            event = execution_event(eng)
+            assert event["ts_ms"] == "1060000"
+            assert event["decision_id"] == "execution-restart-open"
 
             assert await eng._recover_positions(strict=True)
             assert eng.campaign == recovered
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_immediate_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    original_buy = eng.hedge.send_taker
+    original_sell = eng.entropy.send_taker
+    original_save = eng.pending_execution_store.save
+    failed_states = []
+
+    async def settle_buy(**kwargs):
+        result = await original_buy(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    async def settle_sell(**kwargs):
+        result = await original_sell(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    def fail_terminal_save(pending):
+        if pending is not None and pending.settled_at is not None:
+            failed_states.append(pending)
+            raise OSError("terminal pending disk unavailable")
+        original_save(pending)
+
+    eng.hedge.send_taker = settle_buy
+    eng.entropy.send_taker = settle_sell
+    eng.pending_execution_store.save = fail_terminal_save
+
+    async def go():
+        try:
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._evaluate()
+
+            assert len(failed_states) == 1
+            assert not failed_states[0].buy.unresolved
+            assert not failed_states[0].sell.unresolved
+            assert failed_states[0].settled_at == 1002.0
+            assert eng.campaign is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_unknown_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    hedge = ConfirmingVenue(
+        "hedge", "RH",
+        OrderResult.unknown("timeout", order_ref="buy-delayed"))
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    eng.hedge = hedge
+    eng.venues = {"entropy": eng.entropy, "hedge": hedge}
+
+    async def go():
+        try:
+            await eng._evaluate()
+            original_save = eng.pending_execution_store.save
+
+            def fail_terminal_save(pending):
+                if pending is not None and pending.settled_at is not None:
+                    raise OSError("terminal pending disk unavailable")
+                original_save(pending)
+
+            eng.pending_execution_store.save = fail_terminal_save
+            wall[0] = 1060.0
+            hedge.terminal_results["buy-delayed"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-delayed")
+
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._resolve_pending_orders()
+            assert eng.campaign is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    entropy = ConfirmingVenue(
+        "entropy", "ENTROPY", OrderResult.unknown("unused"))
+    hedge = ConfirmingVenue(
+        "hedge", "RH", OrderResult.unknown("unused"))
+    entropy.reference, entropy.book = eng.entropy.reference, eng.entropy.book
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    entropy.terminal_results["sell-restart"] = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.45,
+        order_ref="sell-restart")
+    hedge.terminal_results["buy-restart"] = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.0,
+        order_ref="buy-restart")
+    eng.entropy, eng.hedge = entropy, hedge
+    eng.venues = {"entropy": entropy, "hedge": hedge}
+    pending = restart_open_pending(eng)
+    eng.pending_execution_store.save(pending)
+    eng._startup_pending_execution = pending
+    original_save = eng.pending_execution_store.save
+
+    def fail_terminal_save(saved):
+        if saved is not None and saved.settled_at is not None:
+            raise OSError("terminal pending disk unavailable")
+        original_save(saved)
+
+    eng.pending_execution_store.save = fail_terminal_save
+    monkeypatch.setattr(engine_module.time, "time", lambda: 1060.0)
+
+    async def go():
+        try:
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._resolve_startup_pending_execution()
+            assert eng.campaign is None
+            assert eng.campaign_store.load() is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
         finally:
             eng._shutdown_reconcile_required = False
             eng._close_dynamic_strategy()

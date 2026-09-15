@@ -610,10 +610,12 @@ class Engine:
     def _pending_execution_with_results(
             self, pending: PendingExecutionState, *, buy, sell,
             buy_result: OrderResult, sell_result: OrderResult,
-            audit_ok: bool, campaign_applied: bool) -> PendingExecutionState:
+            audit_ok: bool, campaign_applied: bool,
+            now_wall: float) -> PendingExecutionState:
         settled_at = None
         if not buy_result.unresolved and not sell_result.unresolved:
-            settled_at = max(pending.decided_at, time.time())
+            settled_at = pending.settled_at or max(
+                now_wall, pending.decided_at)
         return replace(
             pending,
             buy=self._pending_leg_state(
@@ -728,62 +730,98 @@ class Engine:
         )
 
     def _record_pending_campaign_event(
-            self, pending: PendingExecutionState, *,
-            decision: Optional[StrategyDecision] = None) -> None:
+            self, pending: PendingExecutionState) -> None:
+        if pending.settled_at is None:
+            raise _OrderRecoveryInvariantError(
+                "terminal pending execution has no settlement time")
         matched = min(pending.buy.filled_base, pending.sell.filled_base)
-        if decision is None:
-            decision = StrategyDecision(
-                intent=pending.intent,
-                direction=pending.direction,
-                reason="EXECUTION_RECOVERED",
-                model=pending.frozen_model,
-                entry_boundary_bps=pending.entry_boundary_bps,
-                exit_target_bps=pending.exit_target_bps,
-            )
-        decision_id = f"execution-{pending.execution_id}"
-        if matched <= 0:
-            self._record_dynamic_decision(
-                decision, now_wall=pending.decided_at,
-                event="execution_settled", filled_qty=0.0,
-                decision_id=decision_id)
-            return
-        if pending.buy.avg_px is None or pending.sell.avg_px is None:
+        if (matched > 0
+                and (pending.buy.avg_px is None
+                     or pending.sell.avg_px is None)):
             raise _OrderRecoveryInvariantError(
                 "persisted matched fill has no average price")
-        entropy_px = (pending.buy.avg_px
-                      if pending.buy.venue_key == "entropy"
-                      else pending.sell.avg_px)
-        hedge_px = (pending.buy.avg_px
-                    if pending.buy.venue_key == "hedge"
-                    else pending.sell.avg_px)
+        entropy_px = None
+        hedge_px = None
+        if matched > 0:
+            entropy_px = (pending.buy.avg_px
+                          if pending.buy.venue_key == "entropy"
+                          else pending.sell.avg_px)
+            hedge_px = (pending.buy.avg_px
+                        if pending.buy.venue_key == "hedge"
+                        else pending.sell.avg_px)
         prior = pending.campaign_before
-        expected = self._campaign_after_pending(pending)
+        campaign_after = self._campaign_after_pending(pending)
         final_pnl = None
         hold_seconds = None
-        if prior is not None and pending.intent in {"CLOSE", "FORCED_CLOSE"}:
+        if (matched > 0 and prior is not None
+                and pending.intent in {"CLOSE", "FORCED_CLOSE"}):
             fees = matched * (
                 entropy_px * pending.entropy_fee_bps
                 + hedge_px * pending.hedge_fee_bps) / 1e4
             final_pnl = self._close_fill_pnl(
                 prior, qty=matched, entropy_px=entropy_px,
                 hedge_px=hedge_px, fees_usd=fees)
-            hold_seconds = max(pending.decided_at - prior.opened_at, 0.0)
-        event = (
-            "campaign_closed"
-            if prior is not None and expected is None
-            else "campaign_changed")
-        self._record_dynamic_decision(
-            decision,
-            now_wall=pending.decided_at,
-            campaign_id=pending.campaign_id,
+            hold_seconds = max(
+                pending.settled_at - prior.opened_at, 0.0)
+        event = "execution_settled"
+        if matched > 0:
+            event = (
+                "campaign_closed"
+                if prior is not None and campaign_after is None
+                else "campaign_changed")
+        campaign_status = ""
+        if campaign_after is not None:
+            campaign_status = campaign_after.status_at(
+                pending.settled_at,
+                soft_sec=self.cfg.strategy_soft_hold_minutes * 60.0,
+                hard_sec=self.cfg.strategy_hard_hold_minutes * 60.0,
+            )
+        audit = pending.audit
+        model = pending.frozen_model
+        identity = pending.identity
+        self.strategy_events.record(StrategyEvent(
+            ts=pending.settled_at,
+            mode="live",
             event=event,
-            filled_qty=matched,
+            intent=pending.intent,
+            reason=audit.reason,
+            decision_id=f"execution-{pending.execution_id}",
+            campaign_id=pending.campaign_id,
+            entropy_symbol=identity.entropy_symbol,
+            entropy_dex=identity.entropy_dex,
+            hedge_symbol=identity.hedge_symbol,
+            hedge_venue=identity.hedge_venue,
+            direction=pending.direction,
+            campaign_status=campaign_status,
+            model_version=str(model.version),
+            model_samples=model.samples,
+            model_status=model.status,
+            model_median_bps=model.median_bps,
+            model_lower_bps=model.lower_bps,
+            model_upper_bps=model.upper_bps,
+            model_iqr_bps=model.iqr_bps,
+            signed_residual_bps=audit.signed_residual_bps,
+            reference_basis_bps=audit.reference_basis_bps,
+            entry_boundary_bps=pending.entry_boundary_bps,
+            exit_target_bps=pending.exit_target_bps,
+            convergence_bps=audit.convergence_bps,
+            round_trip_fee_bps=audit.round_trip_fee_bps,
+            buy_slippage_budget_bps=audit.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=audit.sell_slippage_budget_bps,
+            projected_net_bps=audit.projected_net_bps,
+            projected_net_usd=audit.projected_net_usd,
+            estimated_campaign_pnl_usd=audit.estimated_campaign_pnl_usd,
+            qty=matched,
+            planned_notional_usd=audit.planned_notional_usd,
+            entropy_reference_age_ms=audit.entropy_reference_age_ms,
+            hedge_reference_age_ms=audit.hedge_reference_age_ms,
+            reference_update_skew_ms=audit.reference_update_skew_ms,
+            net_funding_bps_per_hour=audit.net_funding_bps_per_hour,
             entropy_fill_px=entropy_px,
             hedge_fill_px=hedge_px,
-            realized_pnl_usd=final_pnl,
             hold_seconds=hold_seconds,
-            decision_id=decision_id,
-        )
+            realized_pnl_usd=final_pnl,
+        ))
 
     async def _resolve_startup_pending_execution(self) -> bool:
         pending = self._startup_pending_execution
@@ -813,7 +851,8 @@ class Engine:
                 pending, "sell" if side == "buy" else "buy")
             settled_at = None
             if not terminal_leg.unresolved and not other_leg.unresolved:
-                settled_at = max(pending.decided_at, time.time())
+                settled_at = pending.settled_at or max(
+                    pending.decided_at, time.time())
             pending = replace(
                 pending, settled_at=settled_at, **{side: terminal_leg})
             self.pending_execution_store.save(pending)
@@ -1266,11 +1305,10 @@ class Engine:
             sell_result=sell_result,
         )
         if matched <= 0:
-            self._record_dynamic_decision(
-                decision, now_wall=now_wall,
-                event="execution_settled", filled_qty=0.0,
-                decision_id=("" if pending is None else
-                             f"execution-{pending.execution_id}"))
+            if pending is None:
+                self._record_dynamic_decision(
+                    decision, now_wall=now_wall,
+                    event="execution_settled", filled_qty=0.0)
             return
         if buy_result.avg_px is None or sell_result.avg_px is None:
             raise RuntimeError(
@@ -1349,8 +1387,6 @@ class Engine:
                 realized_pnl_usd=final_pnl,
                 hold_seconds=hold_seconds,
             )
-        else:
-            self._record_pending_campaign_event(pending, decision=decision)
         self._dynamic_last_action_mono = time.monotonic()
 
     def _record_live_slippage(
@@ -2431,6 +2467,7 @@ class Engine:
                 if cancellation is None:
                     cancellation = exc
         settled_at = time.monotonic()
+        settled_wall = time.time()
         buy.last_traded_ts = sell.last_traded_ts = settled_at
         results = []
         for result in raw_results:
@@ -2489,6 +2526,7 @@ class Engine:
                 sell_result=sinfo,
                 audit_ok=False,
                 campaign_applied=False,
+                now_wall=settled_wall,
             )
             self.pending_execution_store.save(pending_state)
 
@@ -2571,12 +2609,13 @@ class Engine:
                 buy_result=binfo,
                 sell_result=sinfo,
                 matched=matched,
-                now_wall=time.time(),
+                now_wall=pending_state.settled_at,
                 pending=pending_state,
             )
             pending_state = replace(
                 pending_state, campaign_applied=True)
             self.pending_execution_store.save(pending_state)
+            self._record_pending_campaign_event(pending_state)
             self._pending_snapshot_venues.update((buy.key, sell.key))
             self._shutdown_reconcile_required = True
             self._pause_for_recovery(
@@ -3017,6 +3056,7 @@ class Engine:
             try:
                 pending_execution = self._load_matching_pending_execution(
                     dynamic.execution_id)
+                settled_wall = time.time()
                 pending_execution = self._pending_execution_with_results(
                     pending_execution,
                     buy=dynamic.buy,
@@ -3025,6 +3065,7 @@ class Engine:
                     sell_result=dynamic.sell_result,
                     audit_ok=True,
                     campaign_applied=False,
+                    now_wall=settled_wall,
                 )
                 self.pending_execution_store.save(pending_execution)
                 self._apply_live_matched_fill(
@@ -3036,12 +3077,13 @@ class Engine:
                     matched=min(
                         dynamic.buy_result.filled_base,
                         dynamic.sell_result.filled_base),
-                    now_wall=time.time(),
+                    now_wall=pending_execution.settled_at,
                     pending=pending_execution,
                 )
                 pending_execution = replace(
                     pending_execution, campaign_applied=True)
                 self.pending_execution_store.save(pending_execution)
+                self._record_pending_campaign_event(pending_execution)
                 self._pending_snapshot_venues.update(
                     (dynamic.buy.key, dynamic.sell.key))
                 self._shutdown_reconcile_required = True
