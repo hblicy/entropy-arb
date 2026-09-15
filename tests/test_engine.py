@@ -353,6 +353,23 @@ def make_engine(record_only=False, **thr):
     return eng
 
 
+@pytest.mark.parametrize("sell_position", [-4.9, 4.9])
+def test_fixed_headroom_values_sell_position_at_sell_price(sell_position):
+    eng = make_engine()
+    eng.entropy.cap_usd = 1000.0
+    eng.hedge.cap_usd = 1000.0
+    eng.hedge.position = 0.0
+    eng.entropy.position = sell_position
+    eng.hedge.set_book(99.0, 100.0)
+    eng.entropy.set_book(200.0, 201.0)
+
+    headroom = eng._headroom(
+        eng.hedge, eng.entropy, buy_px=100.0, sell_px=200.0)
+
+    sell_base_headroom = 1000.0 / 200.0 + sell_position
+    assert headroom == pytest.approx(sell_base_headroom * 100.0)
+
+
 def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
                                       reference=True):
     cfg = make_cfg()

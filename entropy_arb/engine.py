@@ -1997,10 +1997,11 @@ class Engine:
             base = self.cfg.lower_bps - self.cfg.midline_bps
         return base + self._inv_add_bps(buy, sell)
 
-    def _headroom(self, buy, sell, ref_px: float) -> float:
-        hb = buy.cap_usd - buy.position * ref_px
-        hs = sell.cap_usd + sell.position * ref_px
-        return min(hb, hs)
+    def _headroom(self, buy, sell, *, buy_px: float,
+                  sell_px: float) -> float:
+        buy_base = buy.cap_usd / buy_px - buy.position
+        sell_base = sell.cap_usd / sell_px + sell.position
+        return min(buy_base, sell_base) * buy_px
 
     def _plan(self, buy, sell, cap_notional: float):
         return plan_arb(
@@ -2337,7 +2338,11 @@ class Engine:
                 continue
             if plan is None:
                 continue
-            headroom = self._headroom(buy, sell, plan.buy_limit)
+            headroom = self._headroom(
+                buy, sell,
+                buy_px=plan.buy_limit,
+                sell_px=plan.sell_limit,
+            )
             if headroom < plan.buy_notional:
                 plan, _ = self._plan(buy, sell,
                                      min(cfg.max_order_notional, headroom))
