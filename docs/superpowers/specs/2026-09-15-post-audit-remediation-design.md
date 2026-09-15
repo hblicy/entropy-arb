@@ -8,20 +8,24 @@ configuration.
 
 ## Stable signer lock namespace
 
-The default live-account lock directory must be stable for every process on
-one host and must not depend on TMPDIR, TEMP, the current user profile, or the
-repository checkout.
+The default live-account lock namespace must be stable for every process in
+one supported OS namespace and must not depend on TMPDIR, TEMP, the current
+user profile, or the repository checkout.
 
-- POSIX uses file locks under /tmp/entropy-arb-live-locks.
-- Windows uses `Global\\entropy-arb-live-<account-digest>` named semaphores,
-  avoiding shared-directory creation privileges while spanning user sessions.
+- Linux uses abstract Unix-domain sockets with account-derived names.
+- Windows uses `Global\\entropy-arb-live-<account-digest>` named mutexes.
 - Tests may continue injecting directory= to exercise isolated file locks.
-- If a shared lock cannot be created or acquired, live startup fails closed;
-  it must not fall back to a per-user directory.
+- If a kernel lock object cannot be created or acquired, live startup fails
+  closed; it must not fall back to a per-user directory.
 
 Both backends retain account-derived, non-secret lock identifiers and acquire
-overlapping account sets in sorted order. Cross-host exclusion remains out of
-scope and still requires different signer accounts.
+overlapping account sets in sorted order. Cross-host and cross-Linux-network-
+namespace exclusion remain out of scope and require different signer accounts.
+
+The follow-up design in
+`2026-09-15-live-lock-kernel-hardening-design.md` supersedes the original
+filesystem/semaphore implementation details after the post-implementation
+security review.
 
 ## Derived audit overflow normalization
 

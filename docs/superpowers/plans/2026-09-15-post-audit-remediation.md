@@ -4,38 +4,39 @@
 
 **Goal:** Close the stable-lock, overflow-normalization, and schema-documentation findings confirmed after the final audit.
 
-**Architecture:** Keep account-scoped locks and the pending v4 model. Use a fixed POSIX file-lock root and Windows machine-wide named semaphores, perform audit arithmetic on validated floats, and update both operator READMEs.
+**Architecture:** Keep account-scoped locks and the pending v4 model. Use Linux abstract Unix-domain sockets and Windows machine-wide named mutexes, perform audit arithmetic on validated floats, and update both operator READMEs.
 
-**Tech Stack:** Python 3, OS file locks, Windows kernel semaphores, frozen dataclasses, JSON pending journal, pytest, Markdown.
+**Tech Stack:** Python 3, Linux `AF_UNIX`, Windows kernel mutexes, frozen dataclasses, JSON pending journal, pytest, Markdown.
 
 ---
 
-### Task 1: Make the default account-lock directory host-stable
+### Task 1: Make the default account-lock namespace host-stable
 
 **Files:**
 - Modify: tests/test_live_lock.py
 - Modify: entropy_arb/live_lock.py
 
-- [x] **Step 1: Add a failing default-directory test**
+- [x] **Step 1: Add a failing default-namespace test**
 
 Create two default LiveProcessLock instances for the same identity while
-tempfile.tempdir points at two different directories. Assert their paths are
-identical and under the POSIX machine root or the Windows global namespace.
+tempfile.tempdir points at two different directories. Assert their kernel
+object names are identical and independent of both temporary roots.
 
 - [x] **Step 2: Verify RED**
 
 Run:
 
 ~~~bash
-python -m pytest -q -p no:cacheprovider tests/test_live_lock.py::test_default_directory_does_not_follow_process_temp_root
+python -m pytest -q -p no:cacheprovider tests/test_live_lock.py::test_default_lock_namespace_does_not_follow_process_temp_root
 ~~~
 
 Expected: FAIL because the two instances currently use different roots.
 
 - [x] **Step 3: Add the minimal platform-specific default**
 
-Use /tmp/entropy-arb-live-locks on POSIX and account-derived named semaphores in
-the Windows `Global\\` namespace. Preserve explicit directory= behavior.
+Use account-derived abstract Unix socket names on Linux and initially owned
+named mutexes in the Windows `Global\\` namespace. Preserve explicit
+directory= behavior for isolated file-lock tests.
 
 - [x] **Step 4: Verify GREEN**
 

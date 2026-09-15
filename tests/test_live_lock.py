@@ -1,6 +1,7 @@
 from dataclasses import replace
+import hashlib
 import os
-from pathlib import Path
+import sys
 import tempfile
 
 import pytest
@@ -26,7 +27,7 @@ def lock_identity(*, account="account-1", symbol="ANTH"):
     )
 
 
-def test_default_directory_does_not_follow_process_temp_root(tmp_path):
+def test_default_lock_namespace_does_not_follow_process_temp_root(tmp_path):
     original = tempfile.tempdir
     try:
         tempfile.tempdir = str(tmp_path / "user-a")
@@ -36,16 +37,67 @@ def test_default_directory_does_not_follow_process_temp_root(tmp_path):
     finally:
         tempfile.tempdir = original
 
+    assert first.paths == second.paths == ()
     if os.name == "nt":
-        assert first.paths == second.paths == ()
-        assert first._semaphore_names == second._semaphore_names
+        assert first._mutex_names == second._mutex_names
         assert all(
             name.startswith("Global\\entropy-arb-live-")
-            for name in first._semaphore_names)
-    else:
-        expected = Path("/tmp") / "entropy-arb-live-locks"
-        assert {path.parent for path in first.paths} == {expected}
-        assert first.paths == second.paths
+            for name in first._mutex_names)
+    elif sys.platform.startswith("linux"):
+        assert first._socket_names == second._socket_names
+        assert all(
+            name.startswith(b"\0entropy-arb-live-")
+            for name in first._socket_names)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows kernel object behavior")
+def test_default_lock_rejects_precreated_count_two_semaphores(tmp_path):
+    import ctypes
+    from ctypes import wintypes
+
+    identity = replace(
+        lock_identity(account=f"entropy-{tmp_path}"),
+        hedge_account=f"hedge-{tmp_path}",
+    )
+    names = [
+        "Global\\entropy-arb-live-" + hashlib.sha256(
+            account.encode("utf-8")).hexdigest()
+        for account in sorted(
+            {identity.entropy_account, identity.hedge_account})
+    ]
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateSemaphoreW.argtypes = (
+        wintypes.LPVOID, wintypes.LONG, wintypes.LONG, wintypes.LPCWSTR)
+    kernel32.CreateSemaphoreW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    seeded = [
+        kernel32.CreateSemaphoreW(None, 2, 2, name) for name in names]
+    assert all(seeded)
+    lock = LiveProcessLock(identity)
+    try:
+        with pytest.raises(LiveProcessLockError, match="lock|running"):
+            lock.acquire()
+    finally:
+        lock.release()
+        for handle in seeded:
+            assert kernel32.CloseHandle(handle)
+
+
+def test_second_default_lock_for_same_identity_is_rejected(tmp_path):
+    identity = replace(
+        lock_identity(account=f"entropy-{tmp_path}"),
+        hedge_account=f"hedge-{tmp_path}",
+    )
+    first = LiveProcessLock(identity)
+    second = LiveProcessLock(identity)
+    first.acquire()
+    try:
+        with pytest.raises(LiveProcessLockError, match="already running"):
+            second.acquire()
+    finally:
+        second.release()
+        first.release()
 
 
 def test_second_live_lock_for_same_identity_is_rejected(tmp_path):

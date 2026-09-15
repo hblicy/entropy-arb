@@ -264,13 +264,21 @@ as soon as both feeds are fresh and its band is crossed. The dynamic strategy
 also requires its independent live gate, ready model, persistence checks,
 reference checks, and campaign-state reconciliation.
 
-Live mode also holds an operating-system lock for each signing account. On the
-same host, a second live process exits before feeds or strategy tasks start if
-any signing account is already in use, including across markets. The lock is
-released automatically when the process exits; do not delete or bypass its
-file while another process may still be running. Hosts cannot share this lock,
-so processes on different hosts must use different API wallets/signing
-accounts. `--record-only` does not take this lock.
+Live mode also holds an operating-system lock object for each signing account:
+an abstract Unix-domain socket on Linux or a `Global\\` named mutex on Windows.
+Within the same Linux network namespace or Windows global object namespace, a
+second live process exits before feeds or strategy tasks start if any signing
+account is already in use, including across markets. The operating system
+releases the object when the process exits; do not bypass this guard. Separate
+hosts or Linux network namespaces (including ordinary isolated containers)
+cannot share it and must use different API wallets/signing accounts.
+`--record-only` does not take a lock.
+
+Before upgrading from a version that used lock files, stop every old live
+engine and confirm that no old `main.py` process remains. Rolling upgrades
+between the file-lock and kernel-lock versions are not supported; starting the
+new version while an old live process is still running can bypass mutual
+exclusion. Record-only processes do not affect this requirement.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
@@ -386,9 +394,10 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 - **Crash evidence and single instance**: dynamic live writes a non-secret
   pending-execution journal before submission and fails closed when it finds
   unfinished evidence at restart. An OS lock rejects a second live process for
-  any signing account already used by another local live process, including
-  across markets; record-only processes remain unaffected. Processes on
-  different hosts must use different API wallets/signing accounts.
+  any signing account already used in the same Linux network namespace or
+  Windows global object namespace, including across markets; record-only
+  processes remain unaffected. Processes on different hosts or Linux network
+  namespaces must use different API wallets/signing accounts.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as

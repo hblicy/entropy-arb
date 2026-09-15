@@ -2,9 +2,9 @@
 
 ## Scope
 
-Close the remaining same-host live-account lock bypass and filesystem safety
-findings without changing account identity, strategy behavior, order flow,
-configuration, or pending execution state.
+Close the remaining same-namespace live-account lock bypass and filesystem
+safety findings without changing account identity, strategy behavior, order
+flow, configuration, or pending execution state.
 
 ## Alternatives considered
 
@@ -23,7 +23,8 @@ per signing account, acquired in sorted order:
 
 - Linux binds an abstract `AF_UNIX` socket name. Abstract names have no
   filesystem entry, so symlinks, FIFOs, directory modes, truncation, and
-  cross-user file ownership are absent. A duplicate bind fails closed.
+  cross-user file ownership are absent. A duplicate bind in the same network
+  namespace fails closed.
 - Windows creates an initially owned `Global\\` named mutex. Any existing
   object is treated as contention without waiting, so a pre-created semaphore,
   unlocked mutex, or recursively opened mutex cannot allow a second engine.
@@ -36,6 +37,11 @@ order. Normal cleanup releases all objects, while process termination lets the
 operating system close their handles automatically. Object names contain only
 SHA-256 account digests.
 
+Linux abstract names are scoped to one network namespace. Processes in
+different containers or other isolated network namespaces must use different
+signing accounts; host-wide container coordination is outside this project's
+direct-VPS deployment scope.
+
 ## Errors and compatibility
 
 Contention raises `LiveProcessLockError` with the existing "already running"
@@ -45,6 +51,11 @@ startup. Record-only behavior is unchanged and takes no lock.
 The operator documentation calls this an operating-system lock object and
 describes Linux abstract sockets and Windows global mutexes. No migration of
 strategy or recovery files is required.
+
+The prior file-lock version and this kernel-lock version do not share a Linux
+lock namespace. Operators must stop and verify termination of every old live
+engine before upgrading. Mixed-version rolling upgrades are explicitly
+unsupported; record-only processes do not acquire either lock.
 
 ## Tests
 
