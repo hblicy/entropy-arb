@@ -35,6 +35,8 @@ from entropy_arb.strategy import (  # noqa: E402
 LEGACY_APPROXIMATION = (
     "threshold-censored legacy top-of-book approximation")
 SNAPSHOT_APPROXIMATION = "continuous top-of-book snapshot approximation"
+MIXED_APPROXIMATION = (
+    "censored-prefix continuous top-of-book snapshot approximation")
 IDENTITY_FIELDS = (
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue")
 MINUTE_FIELDS = {
@@ -59,7 +61,9 @@ class ReplayResult:
     minute_rows: int
     signal_rows: int
     requested_end_ts: float
+    coverage_start_ts: Optional[float]
     coverage_end_ts: Optional[float]
+    censored_prefix: bool
     timeline_complete: bool
     actions: int
     timestamps_monotonic: bool
@@ -435,15 +439,23 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         and row["timestamp_ms"] / 1000.0 <= end
     ]
     has_snapshots = bool(snapshot_times)
+    censored_prefix = False
     if has_snapshots:
         coverage_start = snapshot_times[0]
+        censored_prefix = any(
+            (row.get("event") or "").strip() != "snapshot"
+            and row["timestamp_ms"] / 1000.0 < coverage_start
+            for row in available_signals
+        )
         signals = [
             row for row in available_signals
             if (coverage_start
                 <= row["timestamp_ms"] / 1000.0
                 <= end)
         ]
-        approximation = SNAPSHOT_APPROXIMATION
+        approximation = (
+            MIXED_APPROXIMATION
+            if censored_prefix else SNAPSHOT_APPROXIMATION)
     else:
         signals = [
             row for row in available_signals
@@ -597,6 +609,8 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
 
     total = len(signals)
     timestamps = [row["timestamp_ms"] for row in signals]
+    coverage_start = (
+        None if not signals else signals[0]["timestamp_ms"] / 1000.0)
     lifecycle_rows = [
         row for row in signals
         if (row.get("event") or "").strip() != "snapshot"
@@ -623,6 +637,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
     )
     timeline_complete = bool(
         has_snapshots
+        and not censored_prefix
         and coverage_end is not None
         and coverage_end >= end
         and timeline_gaps_ok
@@ -632,7 +647,9 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         minute_rows=len(minutes),
         signal_rows=total,
         requested_end_ts=end,
+        coverage_start_ts=coverage_start,
         coverage_end_ts=coverage_end,
+        censored_prefix=censored_prefix,
         timeline_complete=timeline_complete,
         actions=actions,
         timestamps_monotonic=all(
@@ -691,11 +708,15 @@ def main() -> None:
     )
     print(f"\n=== dynamic residual replay ({result.approximation}) ===")
     print(f"minutes: {result.minute_rows}  signals: {result.signal_rows}")
-    coverage = (
+    coverage_start = (
+        "n/a" if result.coverage_start_ts is None
+        else f"{result.coverage_start_ts:.3f}")
+    coverage_end = (
         "n/a" if result.coverage_end_ts is None
         else f"{result.coverage_end_ts:.3f}")
     print(f"requested end: {result.requested_end_ts:.3f}  "
-          f"coverage end: {coverage}")
+          f"coverage start: {coverage_start}  coverage end: {coverage_end}")
+    print(f"censored prefix: {'yes' if result.censored_prefix else 'no'}")
     if not result.timeline_complete:
         print("WARNING: replay timeline is incomplete; campaign and hold "
               "metrics apply only to the recorded coverage window.")

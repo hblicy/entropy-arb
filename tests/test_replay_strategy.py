@@ -148,8 +148,10 @@ def test_replay_marks_legacy_signal_timeline_as_censored(tmp_path):
     )
 
     assert result.timeline_complete is False
+    assert result.coverage_start_ts == pytest.approx(300)
     assert result.coverage_end_ts == pytest.approx(300)
     assert result.requested_end_ts == pytest.approx(400)
+    assert result.censored_prefix is False
     assert "threshold-censored legacy" in result.approximation
 
 
@@ -167,8 +169,10 @@ def test_replay_uses_snapshot_coverage_end_instead_of_now_ts(tmp_path):
     )
 
     assert result.timeline_complete is False
+    assert result.coverage_start_ts == pytest.approx(360)
     assert result.coverage_end_ts == pytest.approx(360)
     assert result.requested_end_ts == pytest.approx(600)
+    assert result.censored_prefix is False
     assert result.raw_buy_coverage == 0
     assert result.raw_sell_coverage == 0
 
@@ -195,7 +199,36 @@ def test_replay_snapshot_timeline_is_complete_through_requested_end(tmp_path):
     )
 
     assert result.timeline_complete is True
+    assert result.coverage_start_ts == pytest.approx(360)
+    assert result.censored_prefix is False
     assert result.approximation == "continuous top-of-book snapshot approximation"
+
+
+def test_replay_marks_lifecycle_prefix_before_snapshots_as_censored(tmp_path):
+    minutes = write_minutes(tmp_path / "minutes.csv", [-20, 0, 20, 40])
+    lifecycle = signal_row(300_000, "sell_entropy", 45, "legacy-start")
+    snapshots = []
+    for timestamp in (360_000, 361_000):
+        row = signal_row(
+            timestamp, "sell_entropy", 45, f"snapshot-{timestamp}")
+        row.update(event="snapshot", direction="")
+        snapshots.append(row)
+    signals = write_signals(
+        tmp_path / "signals.csv", [lifecycle, *snapshots])
+
+    result = replay_files(
+        minutes_path=str(minutes),
+        signal_paths=[str(signals)],
+        config=replay_config(),
+        now_ts=361,
+    )
+
+    assert result.coverage_start_ts == pytest.approx(360)
+    assert result.coverage_end_ts == pytest.approx(361)
+    assert result.censored_prefix is True
+    assert result.timeline_complete is False
+    assert "censored-prefix" in result.approximation
+    assert result.signal_rows == 2
 
 
 def test_replay_uses_rows_after_requested_end_to_prove_coverage(tmp_path):
@@ -341,3 +374,6 @@ def test_replay_cli_labels_top_of_book_approximation(tmp_path):
     )
 
     assert "top-of-book approximation" in completed.stdout
+    assert "coverage start: 300.000" in completed.stdout
+    assert "coverage end: 300.000" in completed.stdout
+    assert "censored prefix: no" in completed.stdout
