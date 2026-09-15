@@ -198,8 +198,11 @@ class HLVenue:
             other.include_core_equity = False
 
     def account_lock_id(self) -> str:
-        address = self._query_address()
-        if not address:
+        if self.account is None:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        address = getattr(getattr(self.account, "wallet", None), "address", None)
+        if not isinstance(address, str) or not address:
             raise RuntimeError(
                 f"[{self.name}] signer account identity is unavailable")
         return f"hl:{address.lower()}"

@@ -381,7 +381,9 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 - **Crash evidence and single instance**: dynamic live writes a non-secret
   pending-execution journal before submission and fails closed when it finds
   unfinished evidence at restart. An OS lock rejects a second live process for
-  the same accounts and market; record-only processes remain unaffected.
+  any signing account already used by another local live process, including
+  across markets; record-only processes remain unaffected. Processes on
+  different hosts must use different API wallets/signing accounts.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as
