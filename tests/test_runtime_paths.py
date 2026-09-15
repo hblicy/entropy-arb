@@ -41,6 +41,26 @@ def test_strategy_paths_are_market_and_mode_scoped(tmp_path):
     assert "ANTHROPIC" in live.campaign.name
 
 
+def test_strategy_paths_preserve_market_tag_for_extensionless_files(tmp_path):
+    market = identity()
+    campaign = tmp_path / "state"
+    events = tmp_path / "events"
+    scoped_campaign = market_scoped_path(campaign, market)
+    scoped_events = market_scoped_path(events, market)
+    market_tag = scoped_campaign.name.removeprefix("state.")
+
+    live = strategy_paths(campaign, events, market, shadow=False)
+    shadow = strategy_paths(campaign, events, market, shadow=True)
+
+    assert live.campaign.name == f"state.{market_tag}"
+    assert live.pending.name == f"state.{market_tag}.pending.json"
+    assert shadow.campaign.name == f"state.{market_tag}.shadow"
+    assert live.events.name == f"events.{market_tag}"
+    assert shadow.events.name == f"events.{market_tag}.shadow"
+    assert len({live.campaign, live.pending, shadow.campaign}) == 3
+    assert live.events != shadow.events
+
+
 def test_market_scoped_path_is_deterministic_and_identity_specific(tmp_path):
     configured = tmp_path / "campaign.json"
     first = market_scoped_path(configured, identity())

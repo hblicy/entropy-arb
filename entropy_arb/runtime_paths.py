@@ -27,9 +27,12 @@ def _safe_piece(value: str) -> str:
     return (cleaned or "market")[:24]
 
 
-def _with_marker(path: Path, marker: str, *, default_suffix: str = "") -> Path:
-    suffix = path.suffix or default_suffix
-    return path.with_name(f"{path.stem}.{marker}{suffix}")
+def _with_marker(path: Path, marker: str, *, original_suffix: str,
+                 default_suffix: str = "") -> Path:
+    if original_suffix:
+        base_name = path.name[:-len(original_suffix)]
+        return path.with_name(f"{base_name}.{marker}{original_suffix}")
+    return path.with_name(f"{path.name}.{marker}{default_suffix}")
 
 
 def market_scoped_path(path: PathLike, identity: MarketIdentity) -> Path:
@@ -56,22 +59,33 @@ def market_scoped_path(path: PathLike, identity: MarketIdentity) -> Path:
 def strategy_paths(campaign_path: PathLike, event_path: PathLike,
                    identity: MarketIdentity, *, shadow: bool) -> StrategyPaths:
     configured_campaign = Path(campaign_path)
+    configured_events = Path(event_path)
     scoped_campaign = market_scoped_path(configured_campaign, identity)
-    scoped_events = market_scoped_path(event_path, identity)
+    scoped_events = market_scoped_path(configured_events, identity)
     if shadow:
         return StrategyPaths(
-            campaign=_with_marker(scoped_campaign, "shadow"),
+            campaign=_with_marker(
+                scoped_campaign, "shadow",
+                original_suffix=configured_campaign.suffix),
             pending=None,
-            events=_with_marker(scoped_events, "shadow"),
-            legacy_campaign=_with_marker(configured_campaign, "shadow"),
+            events=_with_marker(
+                scoped_events, "shadow",
+                original_suffix=configured_events.suffix),
+            legacy_campaign=_with_marker(
+                configured_campaign, "shadow",
+                original_suffix=configured_campaign.suffix),
             legacy_pending=None,
         )
     return StrategyPaths(
         campaign=scoped_campaign,
         pending=_with_marker(
-            scoped_campaign, "pending", default_suffix=".json"),
+            scoped_campaign, "pending",
+            original_suffix=configured_campaign.suffix,
+            default_suffix=".json"),
         events=scoped_events,
         legacy_campaign=configured_campaign,
         legacy_pending=_with_marker(
-            configured_campaign, "pending", default_suffix=".json"),
+            configured_campaign, "pending",
+            original_suffix=configured_campaign.suffix,
+            default_suffix=".json"),
     )
