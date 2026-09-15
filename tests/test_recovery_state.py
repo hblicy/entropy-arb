@@ -131,7 +131,7 @@ def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
     assert path.read_bytes() == original
 
 
-def test_pending_store_loads_v3_entry_with_reconstructed_top_convergence(
+def test_pending_store_rejects_active_v3_without_modifying_original_file(
         tmp_path):
     path = tmp_path / "campaign.pending.json"
     store = PendingExecutionStore(path)
@@ -156,9 +156,44 @@ def test_pending_store_loads_v3_entry_with_reconstructed_top_convergence(
     path.write_text(json.dumps(payload), encoding="utf-8")
     original = path.read_bytes()
 
-    loaded = store.load()
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*schema_version 3.*manual "
+                  r"verification required"):
+        store.load()
 
-    assert loaded.audit.top_convergence_bps == pytest.approx(32.5)
+    assert path.read_bytes() == original
+
+
+def test_pending_store_loads_empty_v3_without_modifying_original_file(
+        tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    original = json.dumps({
+        "schema_version": 3,
+        "pending_execution": None,
+    }, indent=2).encode()
+    path.write_bytes(original)
+
+    assert PendingExecutionStore(path).load() is None
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("schema_version", [{}, [], 3.0, True])
+def test_pending_store_rejects_non_integer_schema_version(
+        tmp_path, schema_version):
+    path = tmp_path / "campaign.pending.json"
+    original = json.dumps({
+        "schema_version": schema_version,
+        "pending_execution": None,
+    }, indent=2).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*schema_version.*manual "
+                  r"verification required"):
+        PendingExecutionStore(path).load()
+
     assert path.read_bytes() == original
 
 

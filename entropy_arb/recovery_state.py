@@ -40,7 +40,6 @@ _AUDIT_FIELDS = {
     "reference_update_skew_ms", "net_funding_bps_per_hour",
     "planned_notional_usd",
 }
-_AUDIT_FIELDS_V3 = _AUDIT_FIELDS - {"top_convergence_bps"}
 _IDENTITY_FIELDS = {
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue",
 }
@@ -333,34 +332,14 @@ def _leg_from_dict(raw) -> PendingLegState:
     return PendingLegState(**raw)
 
 
-def _audit_from_dict(raw, *, schema_version: int,
-                     execution: dict) -> PendingAuditContext:
-    expected_fields = (
-        _AUDIT_FIELDS_V3 if schema_version == 3 else _AUDIT_FIELDS)
-    if not isinstance(raw, dict) or set(raw) != expected_fields:
+def _audit_from_dict(raw) -> PendingAuditContext:
+    if not isinstance(raw, dict) or set(raw) != _AUDIT_FIELDS:
         raise PendingExecutionStateError(
             "pending audit fields are incompatible")
-    values = dict(raw)
-    if schema_version == 3:
-        if execution["intent"] in {"OPEN", "ADD"}:
-            residual = _signed_finite(
-                "audit.signed_residual_bps", raw["signed_residual_bps"])
-            target = _signed_finite(
-                "exit_target_bps", execution["exit_target_bps"])
-            if execution["direction"] == "sell_entropy":
-                top_convergence = residual - target
-            elif execution["direction"] == "buy_entropy":
-                top_convergence = target - residual
-            else:
-                raise PendingExecutionStateError(
-                    "pending direction is invalid")
-            values["top_convergence_bps"] = top_convergence
-        else:
-            values["top_convergence_bps"] = None
-    return PendingAuditContext(**values)
+    return PendingAuditContext(**raw)
 
 
-def _execution_from_dict(raw, *, schema_version: int) -> PendingExecutionState:
+def _execution_from_dict(raw) -> PendingExecutionState:
     if not isinstance(raw, dict) or set(raw) != _EXECUTION_FIELDS:
         raise PendingExecutionStateError(
             "pending execution fields are incompatible")
@@ -385,8 +364,7 @@ def _execution_from_dict(raw, *, schema_version: int) -> PendingExecutionState:
             else _campaign_from_dict(raw["campaign_before"]))
         values["buy"] = _leg_from_dict(raw["buy"])
         values["sell"] = _leg_from_dict(raw["sell"])
-        values["audit"] = _audit_from_dict(
-            raw["audit"], schema_version=schema_version, execution=raw)
+        values["audit"] = _audit_from_dict(raw["audit"])
         return PendingExecutionState(**values)
     except (TypeError, ValueError) as exc:
         raise PendingExecutionStateError(
@@ -414,14 +392,21 @@ class PendingExecutionStore:
             raise PendingExecutionStateError(
                 "pending execution state envelope is incompatible")
         schema_version = raw["schema_version"]
-        if schema_version not in {3, SCHEMA_VERSION}:
+        if (isinstance(schema_version, bool)
+                or not isinstance(schema_version, int)
+                or schema_version not in {3, SCHEMA_VERSION}):
             raise PendingExecutionStateError(
                 f"pending execution state {self.path} has unsupported "
                 f"schema_version {schema_version!r}; manual "
                 "verification required")
         pending = raw["pending_execution"]
-        return (None if pending is None else _execution_from_dict(
-            pending, schema_version=schema_version))
+        if schema_version == 3:
+            if pending is not None:
+                raise PendingExecutionStateError(
+                    f"pending execution state {self.path} has active "
+                    "schema_version 3 evidence; manual verification required")
+            return None
+        return None if pending is None else _execution_from_dict(pending)
 
     def save(self, pending: Optional[PendingExecutionState]) -> None:
         if pending is not None and not isinstance(
