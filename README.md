@@ -181,6 +181,10 @@ assumed fills as actual PnL. Files produced by current versions contain
 continuous `snapshot` coverage. Legacy files containing only threshold-triggered
 lifecycles remain readable, but the result is explicitly marked
 `threshold-censored legacy` and must not be treated as a complete timeline.
+For mixed signal files, `coverage start` is the first `snapshot` actually used
+for continuous replay. `censored prefix: yes` means older lifecycle rows precede
+that snapshot, statistics start at the snapshot, and the earlier timeline is
+incomplete. Pure legacy input reports `coverage start: n/a`.
 The replay also reports its requested and actual coverage end; an incomplete
 timeline is flagged instead of extending the last quote to the requested end:
 
@@ -231,7 +235,14 @@ exactly once, and clears the journal only after both exchange positions have
 been refreshed and agree. Missing references, an incomplete trade audit, or
 contradictory state stays blocked for manual verification; the engine never
 guesses or resends the original order.
-Completing tests or replay is not authorization to set `live_enabled: true`.
+New code auto-loads only pending schema v3. A schema v2 pending file is left
+unchanged: manually verify both venues' order histories and actual positions
+before handling it; do not delete it or edit its schema version directly. A
+record-only upgrade with no pending file is unaffected. In schema v3,
+`settled_at` is when the engine first confirms that both legs are terminal;
+the recovered event timestamp and hold duration use that time. Completing an
+upgrade, tests, or replay is not authorization to set `live_enabled: true`;
+live enablement still requires a separate manual check.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
