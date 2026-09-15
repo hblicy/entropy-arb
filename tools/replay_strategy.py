@@ -439,6 +439,7 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
         and row["timestamp_ms"] / 1000.0 <= end
     ]
     has_snapshots = bool(snapshot_times)
+    coverage_start = None
     censored_prefix = False
     if has_snapshots:
         coverage_start = snapshot_times[0]
@@ -609,8 +610,6 @@ def replay_files(*, minutes_path: str, signal_paths: Sequence[str],
 
     total = len(signals)
     timestamps = [row["timestamp_ms"] for row in signals]
-    coverage_start = (
-        None if not signals else signals[0]["timestamp_ms"] / 1000.0)
     lifecycle_rows = [
         row for row in signals
         if (row.get("event") or "").strip() != "snapshot"

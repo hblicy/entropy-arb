@@ -148,7 +148,7 @@ def test_replay_marks_legacy_signal_timeline_as_censored(tmp_path):
     )
 
     assert result.timeline_complete is False
-    assert result.coverage_start_ts == pytest.approx(300)
+    assert result.coverage_start_ts is None
     assert result.coverage_end_ts == pytest.approx(300)
     assert result.requested_end_ts == pytest.approx(400)
     assert result.censored_prefix is False
@@ -374,6 +374,6 @@ def test_replay_cli_labels_top_of_book_approximation(tmp_path):
     )
 
     assert "top-of-book approximation" in completed.stdout
-    assert "coverage start: 300.000" in completed.stdout
+    assert "coverage start: n/a" in completed.stdout
     assert "coverage end: 300.000" in completed.stdout
     assert "censored prefix: no" in completed.stdout
