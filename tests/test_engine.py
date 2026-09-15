@@ -923,6 +923,29 @@ def test_pending_results_use_supplied_wall_clock_for_terminal_settlement(
         eng._close_dynamic_strategy()
 
 
+def test_pending_terminal_retry_preserves_zero_settlement_time(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    pending = replace(
+        restart_open_pending(eng, unresolved=False),
+        decided_at=0.0,
+        settled_at=0.0,
+    )
+    try:
+        retried = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-restart"),
+            sell_result=OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.45,
+                order_ref="sell-restart"),
+            audit_ok=True, campaign_applied=False, now_wall=1060.0)
+
+        assert retried.settled_at == 0.0
+    finally:
+        eng._close_dynamic_strategy()
+
+
 def test_immediate_and_startup_execution_events_use_durable_audit_fields(
         tmp_path, monkeypatch):
     wall = [1000.0]

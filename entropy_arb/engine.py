@@ -614,8 +614,10 @@ class Engine:
             now_wall: float) -> PendingExecutionState:
         settled_at = None
         if not buy_result.unresolved and not sell_result.unresolved:
-            settled_at = pending.settled_at or max(
-                now_wall, pending.decided_at)
+            settled_at = (
+                pending.settled_at
+                if pending.settled_at is not None
+                else max(now_wall, pending.decided_at))
         return replace(
             pending,
             buy=self._pending_leg_state(
@@ -851,8 +853,10 @@ class Engine:
                 pending, "sell" if side == "buy" else "buy")
             settled_at = None
             if not terminal_leg.unresolved and not other_leg.unresolved:
-                settled_at = pending.settled_at or max(
-                    pending.decided_at, time.time())
+                settled_at = (
+                    pending.settled_at
+                    if pending.settled_at is not None
+                    else max(pending.decided_at, time.time()))
             pending = replace(
                 pending, settled_at=settled_at, **{side: terminal_leg})
             self.pending_execution_store.save(pending)
