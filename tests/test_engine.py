@@ -17,7 +17,12 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import entropy_arb.engine as engine_module  # noqa: E402
-from entropy_arb.book import ArbPlan, MatchedClosePlan, OrderBook  # noqa: E402
+from entropy_arb.book import (  # noqa: E402
+    ArbPlan,
+    ConvergencePlan,
+    MatchedClosePlan,
+    OrderBook,
+)
 from entropy_arb.campaign import (  # noqa: E402
     CampaignStore,
     PositionCampaign,
@@ -1258,12 +1263,83 @@ def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
     asyncio.run(go())
 
 
+def test_pending_audit_context_captures_fixed_decision_and_buy_funding_sign(
+        monkeypatch):
+    eng = make_engine()
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: 105.0)
+    eng.entropy.reference.apply(
+        ReferenceUpdate(funding_current_bps_per_hour=0.7),
+        source="websocket", received_mono=100.25)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(funding_current_bps_per_hour=-0.2),
+        source="websocket", received_mono=101.75)
+    plan = ConvergencePlan(
+        qty=1.0,
+        buy_limit=98.0,
+        sell_limit=100.0,
+        buy_notional=98.0,
+        sell_notional=100.0,
+        q_max=1.0,
+        buy_depth_slippage_bps=1.0,
+        sell_depth_slippage_bps=2.0,
+        open_depth_slippage_bps=3.0,
+        convergence_bps=20.0,
+        projected_net_bps=12.5,
+    )
+    decision = engine_module.StrategyDecision(
+        intent="OPEN",
+        direction="buy_entropy",
+        reason="EXPECTED_NET_PROFIT",
+        plan=plan,
+        signed_residual_bps=-31.0,
+        reference_basis_bps=4.0,
+        convergence_bps=20.0,
+        round_trip_fee_bps=3.0,
+        buy_slippage_budget_bps=1.5,
+        sell_slippage_budget_bps=2.5,
+        estimated_campaign_pnl_usd=0.125,
+    )
+
+    audit = eng._pending_audit_context(decision)
+
+    expected = PendingAuditContext(
+        reason="EXPECTED_NET_PROFIT",
+        signed_residual_bps=-31.0,
+        reference_basis_bps=4.0,
+        convergence_bps=20.0,
+        round_trip_fee_bps=3.0,
+        buy_slippage_budget_bps=1.5,
+        sell_slippage_budget_bps=2.5,
+        projected_net_bps=12.5,
+        projected_net_usd=0.125,
+        estimated_campaign_pnl_usd=0.125,
+        entropy_reference_age_ms=4750.0,
+        hedge_reference_age_ms=3250.0,
+        reference_update_skew_ms=1500.0,
+        net_funding_bps_per_hour=-0.9,
+        planned_notional_usd=100.0,
+    )
+    assert audit.reason == expected.reason
+    for name in expected.__dataclass_fields__:
+        if name != "reason":
+            assert getattr(audit, name) == pytest.approx(
+                getattr(expected, name))
+
+
 def test_dynamic_execution_journal_clears_only_after_position_refresh(
         tmp_path):
     async def go():
         eng = make_live_dynamic_execution_engine(tmp_path)
+        decisions = []
+        original_decide = eng._decide_dynamic
         original_buy = eng.hedge.send_taker
         original_sell = eng.entropy.send_taker
+
+        def capture_decision(**kwargs):
+            decision = original_decide(**kwargs)
+            if decision.plan is not None:
+                decisions.append(decision)
+            return decision
 
         async def checked_buy(**kwargs):
             pending = eng.pending_execution_store.load()
@@ -1275,13 +1351,39 @@ def test_dynamic_execution_journal_clears_only_after_position_refresh(
             assert eng.pending_execution_store.load() is not None
             return await original_sell(**kwargs)
 
+        eng._decide_dynamic = capture_decision
         eng.hedge.send_taker = checked_buy
         eng.entropy.send_taker = checked_sell
         try:
             await eng._evaluate()
 
             assert eng.campaign is not None
-            assert eng.pending_execution_store.load() is not None
+            pending = eng.pending_execution_store.load()
+            decision = decisions[-1]
+            assert pending is not None
+            assert pending.audit.reason == decision.reason
+            assert pending.audit.signed_residual_bps == pytest.approx(
+                decision.signed_residual_bps)
+            assert pending.audit.reference_basis_bps == pytest.approx(
+                decision.reference_basis_bps)
+            assert pending.audit.convergence_bps == pytest.approx(
+                decision.convergence_bps)
+            assert pending.audit.round_trip_fee_bps == pytest.approx(
+                decision.round_trip_fee_bps)
+            assert pending.audit.buy_slippage_budget_bps == pytest.approx(
+                decision.buy_slippage_budget_bps)
+            assert pending.audit.sell_slippage_budget_bps == pytest.approx(
+                decision.sell_slippage_budget_bps)
+            assert pending.audit.projected_net_bps == pytest.approx(
+                decision.plan.projected_net_bps)
+            assert pending.audit.planned_notional_usd == pytest.approx(max(
+                decision.plan.buy_notional, decision.plan.sell_notional))
+            assert pending.audit.projected_net_usd == pytest.approx(
+                pending.audit.planned_notional_usd
+                * decision.plan.projected_net_bps / 1e4)
+            assert pending.audit.entropy_reference_age_ms is not None
+            assert pending.audit.hedge_reference_age_ms is not None
+            assert pending.settled_at is not None
             assert eng._recovery_required
             eng.entropy.chain_position = eng.entropy.position
             eng.hedge.chain_position = eng.hedge.position
@@ -1290,6 +1392,35 @@ def test_dynamic_execution_journal_clears_only_after_position_refresh(
             assert await eng._recover_positions(strict=True)
             assert eng.pending_execution_store.load() is None
         finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_pending_save_failure_has_initial_audit_and_sends_no_orders(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        captured = []
+
+        def fail_save(pending):
+            captured.append(pending)
+            raise OSError("pending disk unavailable")
+
+        eng.pending_execution_store.save = fail_save
+        try:
+            with pytest.raises(OSError, match="pending disk unavailable"):
+                await eng._evaluate()
+
+            assert len(captured) == 1
+            pending = captured[0]
+            assert pending.audit.reason != (
+                "audit context pending engine integration")
+            assert pending.audit.planned_notional_usd > 0.0
+            assert pending.settled_at is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
             eng._close_dynamic_strategy()
 
     asyncio.run(go())

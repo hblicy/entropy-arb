@@ -51,6 +51,7 @@ from .recorder import (
     next_archive_path,
 )
 from .recovery_state import (
+    PendingAuditContext,
     PendingExecutionState,
     PendingExecutionStateError,
     PendingExecutionStore,
@@ -1047,22 +1048,10 @@ class Engine:
             if projected_net_bps is not None:
                 projected_net_usd = (
                     planned_notional * projected_net_bps / 1e4)
-        entropy_age = self.entropy.reference.age_ms()
-        hedge_age = self.hedge.reference.age_ms()
-        entropy_ref = self.entropy.reference.snapshot
-        hedge_ref = self.hedge.reference.snapshot
-        reference_skew_ms = None
-        if entropy_ref.source and hedge_ref.source:
-            reference_skew_ms = abs(
-                entropy_ref.received_mono
-                - hedge_ref.received_mono) * 1000.0
-        funding = None
-        if (entropy_ref.funding_current_bps_per_hour is not None
-                and hedge_ref.funding_current_bps_per_hour is not None):
-            funding = (entropy_ref.funding_current_bps_per_hour
-                       - hedge_ref.funding_current_bps_per_hour)
-            if decision.direction == "buy_entropy":
-                funding = -funding
+        (entropy_age, hedge_age, reference_skew_ms,
+         funding) = self._decision_reference_audit_values(
+             decision.direction)
+
         active = self.campaign
         self.strategy_events.record(StrategyEvent(
             ts=now_wall,
@@ -1112,6 +1101,59 @@ class Engine:
             hold_seconds=hold_seconds,
             realized_pnl_usd=realized_pnl_usd,
         ))
+
+    def _decision_reference_audit_values(
+            self, direction: str,
+            ) -> tuple[Optional[float], Optional[float],
+                       Optional[float], Optional[float]]:
+        now_mono = time.monotonic()
+        entropy_age = self.entropy.reference.age_ms(now_mono)
+        hedge_age = self.hedge.reference.age_ms(now_mono)
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        reference_skew_ms = None
+        if entropy_ref.source and hedge_ref.source:
+            reference_skew_ms = abs(
+                entropy_ref.received_mono
+                - hedge_ref.received_mono) * 1000.0
+        funding = None
+        if (entropy_ref.funding_current_bps_per_hour is not None
+                and hedge_ref.funding_current_bps_per_hour is not None):
+            funding = (entropy_ref.funding_current_bps_per_hour
+                       - hedge_ref.funding_current_bps_per_hour)
+            if direction == "buy_entropy":
+                funding = -funding
+        return entropy_age, hedge_age, reference_skew_ms, funding
+
+    def _pending_audit_context(
+            self, decision: StrategyDecision) -> PendingAuditContext:
+        plan = decision.plan
+        planned_notional = max(plan.buy_notional, plan.sell_notional)
+        projected_net_bps = getattr(plan, "projected_net_bps", None)
+        projected_net_usd = None
+        if projected_net_bps is not None:
+            projected_net_usd = planned_notional * projected_net_bps / 1e4
+        (entropy_age, hedge_age, reference_skew_ms,
+         funding) = self._decision_reference_audit_values(
+             decision.direction)
+        return PendingAuditContext(
+            reason=decision.reason,
+            signed_residual_bps=decision.signed_residual_bps,
+            reference_basis_bps=decision.reference_basis_bps,
+            convergence_bps=decision.convergence_bps,
+            round_trip_fee_bps=decision.round_trip_fee_bps,
+            buy_slippage_budget_bps=decision.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=decision.sell_slippage_budget_bps,
+            projected_net_bps=projected_net_bps,
+            projected_net_usd=projected_net_usd,
+            estimated_campaign_pnl_usd=(
+                decision.estimated_campaign_pnl_usd),
+            entropy_reference_age_ms=entropy_age,
+            hedge_reference_age_ms=hedge_age,
+            reference_update_skew_ms=reference_skew_ms,
+            net_funding_bps_per_hour=funding,
+            planned_notional_usd=planned_notional,
+        )
 
     @staticmethod
     def _shadow_fill_prices(
@@ -2355,6 +2397,8 @@ class Engine:
                 campaign_before=self.campaign,
                 buy=self._pending_leg_state(buy, is_buy=True),
                 sell=self._pending_leg_state(sell, is_buy=False),
+                audit=self._pending_audit_context(decision),
+                settled_at=None,
                 audit_ok=False,
                 campaign_applied=False,
             )
