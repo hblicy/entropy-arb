@@ -301,10 +301,25 @@ class PendingExecutionState:
         if not isinstance(self.audit, PendingAuditContext):
             raise PendingExecutionStateError(
                 "audit must be PendingAuditContext")
-        if (self.intent in {"OPEN", "ADD"}
-                and self.audit.top_convergence_bps is None):
+        entry_audit_fields = (
+            "signed_residual_bps",
+            "reference_basis_bps",
+            "top_convergence_bps",
+            "convergence_bps",
+            "round_trip_fee_bps",
+            "buy_slippage_budget_bps",
+            "sell_slippage_budget_bps",
+            "projected_net_bps",
+            "projected_net_usd",
+        )
+        missing_entry_audit = [
+            f"audit.{name}" for name in entry_audit_fields
+            if getattr(self.audit, name) is None
+        ]
+        if self.intent in {"OPEN", "ADD"} and missing_entry_audit:
             raise PendingExecutionStateError(
-                "audit.top_convergence_bps is required for OPEN and ADD")
+                f"{', '.join(missing_entry_audit)} are required for "
+                "OPEN and ADD")
         if self.settled_at is not None:
             settled_at = _finite("settled_at", self.settled_at)
             if settled_at < self.decided_at:
@@ -388,7 +403,7 @@ class PendingExecutionStore:
             raise PendingExecutionStateError(
                 f"cannot read pending execution state {self.path}: {exc}") \
                 from exc
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise PendingExecutionStateError(
                 f"pending execution state {self.path} is not valid JSON: "
                 f"{exc}") from exc

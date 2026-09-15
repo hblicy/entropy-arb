@@ -252,3 +252,89 @@ Expected: compile and diff checks exit 0; status is clean after final commits.
 Confirm the diff changes only audit naming, persistence compatibility, tests
 and their two design/plan documents. Verify no trading formula or order path
 was changed.
+
+### Task 5: Require complete entry audit evidence
+
+**Files:**
+- Modify: `tests/test_recovery_state.py`
+- Modify: `entropy_arb/recovery_state.py:301-307`
+
+- [x] **Step 1: Write a failing entry-audit test**
+
+Parameterize every value that the production OPEN/ADD path always records:
+
+```python
+@pytest.mark.parametrize("field", [
+    "signed_residual_bps", "reference_basis_bps",
+    "top_convergence_bps", "convergence_bps", "round_trip_fee_bps",
+    "buy_slippage_budget_bps", "sell_slippage_budget_bps",
+    "projected_net_bps", "projected_net_usd",
+])
+@pytest.mark.parametrize("intent", ["OPEN", "ADD"])
+def test_pending_entry_requires_complete_audit(intent, field):
+    state = pending_state()
+    changes = {
+        "intent": intent,
+        "direction": "sell_entropy",
+        "buy": replace(state.buy, venue_key="hedge"),
+        "sell": replace(state.sell, venue_key="entropy"),
+        "audit": replace(state.audit, **{field: None}),
+    }
+    if intent == "OPEN":
+        changes["campaign_before"] = None
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=rf"audit\.{field}.*OPEN.*ADD"):
+        replace(state, **changes)
+```
+
+- [x] **Step 2: Run the test and verify RED**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py::test_pending_entry_requires_complete_audit
+```
+
+Expected: all cases except `top_convergence_bps` fail because the incomplete
+state is currently accepted.
+
+- [x] **Step 3: Implement the minimal intent-aware validation**
+
+For OPEN/ADD, collect the required audit field names whose values are `None`
+and raise `PendingExecutionStateError` naming those fields. Leave CLOSE and
+FORCED_CLOSE compatibility unchanged.
+
+- [x] **Step 4: Run the focused test and verify GREEN**
+
+Run the command from Step 2. Expected: all parameterized cases PASS.
+
+### Task 6: Normalize JSON recursion failures
+
+**Files:**
+- Modify: `tests/test_recovery_state.py`
+- Modify: `entropy_arb/recovery_state.py:385-394`
+
+- [x] **Step 1: Write a failing malformed-JSON test**
+
+Write a pending state file containing 5,000 nested arrays and assert that
+`PendingExecutionStore.load()` raises `PendingExecutionStateError` containing
+the file path and `not valid JSON`.
+
+- [x] **Step 2: Run the test and verify RED**
+
+```bash
+python -m pytest -q -p no:cacheprovider tests/test_recovery_state.py::test_pending_loader_wraps_excessive_json_nesting
+```
+
+Expected: ERROR with an unwrapped `RecursionError`.
+
+- [x] **Step 3: Implement the minimal exception normalization**
+
+Catch `RecursionError` alongside JSON `ValueError` and wrap it in the existing
+`PendingExecutionStateError` message. Do not catch `MemoryError` or unrelated
+runtime failures.
+
+- [x] **Step 4: Run the focused test and verify GREEN**
+
+Run the command from Step 2. Expected: PASS.
+
+- [x] **Step 5: Repeat Task 4 final verification against the current HEAD**

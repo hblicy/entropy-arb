@@ -879,8 +879,24 @@ def pending_audit_context(planned_notional_usd=100.0,
     )
 
 
+def pending_entry_audit_context(planned_notional_usd=100.0,
+                                top_convergence_bps=10.0):
+    return replace(
+        pending_audit_context(planned_notional_usd),
+        signed_residual_bps=10.0,
+        reference_basis_bps=0.0,
+        top_convergence_bps=top_convergence_bps,
+        convergence_bps=8.0,
+        round_trip_fee_bps=0.0,
+        buy_slippage_budget_bps=1.0,
+        sell_slippage_budget_bps=1.0,
+        projected_net_bps=6.0,
+        projected_net_usd=planned_notional_usd * 6.0 / 1e4,
+    )
+
+
 def restart_open_pending(eng, *, unresolved=True,
-                         campaign_applied=False, audit_ok=True):
+                          campaign_applied=False, audit_ok=True):
     model = eng.residual_model.snapshot(
         now_minute=int(time.time() // 60))
     return engine_module.PendingExecutionState(
@@ -913,7 +929,7 @@ def restart_open_pending(eng, *, unresolved=True,
             avg_px=None if unresolved else 100.45,
             applied_fill=0.0 if unresolved else 1.0,
             unresolved=unresolved),
-        audit=pending_audit_context(top_convergence_bps=1.0),
+        audit=pending_entry_audit_context(),
         settled_at=None if unresolved else 1001.0,
         audit_ok=audit_ok,
         campaign_applied=campaign_applied,
@@ -1308,7 +1324,7 @@ def test_live_startup_pending_recovery_resumes_strategy_without_new_orders(
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
-            audit=pending_audit_context(top_convergence_bps=1.0),
+            audit=pending_entry_audit_context(),
             settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
@@ -1379,7 +1395,7 @@ def test_live_startup_unmatched_pending_exits_and_releases_lock(tmp_path):
                 order_ref="startup-sell", status="timeout",
                 filled_base=0.0, avg_px=None, applied_fill=0.0,
                 unresolved=True),
-            audit=pending_audit_context(top_convergence_bps=1.0),
+            audit=pending_entry_audit_context(),
             settled_at=None,
             audit_ok=True, campaign_applied=False)
         paths = configured_strategy_paths(cfg, shadow=False)
@@ -1769,7 +1785,7 @@ def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
                     venue_key="entropy", is_buy=False, order_ref=None,
                     status="sending", filled_base=0.0, avg_px=None,
                     applied_fill=0.0, unresolved=True),
-                audit=pending_audit_context(top_convergence_bps=1.0),
+                audit=pending_entry_audit_context(),
                 settled_at=None,
                 audit_ok=False,
                 campaign_applied=False,

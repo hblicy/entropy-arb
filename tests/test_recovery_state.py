@@ -115,22 +115,33 @@ def test_pending_open_requires_durable_campaign_identity():
         )
 
 
+@pytest.mark.parametrize("field", [
+    "signed_residual_bps",
+    "reference_basis_bps",
+    "top_convergence_bps",
+    "convergence_bps",
+    "round_trip_fee_bps",
+    "buy_slippage_budget_bps",
+    "sell_slippage_budget_bps",
+    "projected_net_bps",
+    "projected_net_usd",
+])
 @pytest.mark.parametrize("intent", ["OPEN", "ADD"])
-def test_pending_entry_requires_top_convergence(intent):
+def test_pending_entry_requires_complete_audit(intent, field):
     state = pending_state()
     changes = {
         "intent": intent,
         "direction": "sell_entropy",
         "buy": replace(state.buy, venue_key="hedge"),
         "sell": replace(state.sell, venue_key="entropy"),
-        "audit": replace(state.audit, top_convergence_bps=None),
+        "audit": replace(state.audit, **{field: None}),
     }
     if intent == "OPEN":
         changes["campaign_before"] = None
 
     with pytest.raises(
             PendingExecutionStateError,
-            match=r"audit\.top_convergence_bps.*OPEN.*ADD"):
+            match=rf"audit\.{field}.*OPEN.*ADD"):
         replace(state, **changes)
 
 
@@ -229,6 +240,19 @@ def test_pending_store_wraps_json_integer_digit_limit_without_modifying_file(
             PendingExecutionStateError,
             match=r"campaign\.pending\.json.*(?:not valid JSON|manual "
                   r"verification required)"):
+        PendingExecutionStore(path).load()
+
+    assert path.read_bytes() == original
+
+
+def test_pending_loader_wraps_excessive_json_nesting(tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    original = ("[" * 5000 + "0" + "]" * 5000).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(
+            PendingExecutionStateError,
+            match=r"campaign\.pending\.json.*not valid JSON"):
         PendingExecutionStore(path).load()
 
     assert path.read_bytes() == original
