@@ -397,6 +397,31 @@ def test_fixed_scan_rechecks_cap_after_sell_limit_changes():
         <= sell.cap_usd + 1e-9
 
 
+def test_fixed_scan_values_sell_position_at_current_mid():
+    eng = make_engine()
+    eng.hedge.cap_usd = 10_000.0
+    eng.entropy.cap_usd = 2_000.0
+    eng.entropy.position = -15.0
+    eng.hedge.book.apply_hl([
+        [{"px": "99", "sz": "50"}],
+        [{"px": "100", "sz": "50"}],
+    ])
+    eng.entropy.book.apply_hl([
+        [{"px": "120", "sz": "1"},
+         {"px": "110", "sz": "50"}],
+        [{"px": "121", "sz": "50"}],
+    ])
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    _, sell, plan = result
+    assert (plan.qty - sell.position) * sell.book.mid() \
+        <= sell.cap_usd + 1e-9
+
+
 def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
                                       reference=True):
     cfg = make_cfg()

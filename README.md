@@ -261,11 +261,13 @@ as soon as both feeds are fresh and its band is crossed. The dynamic strategy
 also requires its independent live gate, ready model, persistence checks,
 reference checks, and campaign-state reconciliation.
 
-Live mode also holds an operating-system lock for the configured market and
-two account identities. A second process for that same combination exits
-before feeds or strategy tasks start. The lock is released automatically when
-the process exits; do not delete or bypass its file while another process may
-still be running. `--record-only` does not take this lock.
+Live mode also holds an operating-system lock for each signing account. On the
+same host, a second live process exits before feeds or strategy tasks start if
+any signing account is already in use, including across markets. The lock is
+released automatically when the process exits; do not delete or bypass its
+file while another process may still be running. Hosts cannot share this lock,
+so processes on different hosts must use different API wallets/signing
+accounts. `--record-only` does not take this lock.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
@@ -414,7 +416,7 @@ entropy_arb/recorder.py  1-minute bars + record-only signal lifecycles
 entropy_arb/strategy.py  rolling residual model and pure decisions
 entropy_arb/campaign.py  durable one-campaign state and reconciliation
 entropy_arb/recovery_state.py  durable pending-execution journal
-entropy_arb/live_lock.py cross-process live account/market lock
+entropy_arb/live_lock.py cross-process live signing-account locks
 tools/analyze.py         minute thresholds + optional campaign summary
 tools/replay_strategy.py read-only top-of-book strategy replay
 tests/                   python3 -m pytest tests/

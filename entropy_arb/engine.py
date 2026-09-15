@@ -2341,12 +2341,20 @@ class Engine:
             if plan is None:
                 continue
             while plan is not None:
+                buy_mid = buy.book.mid()
+                sell_mid = sell.book.mid()
+                if buy_mid is None or sell_mid is None:
+                    plan = None
+                    break
+                # Limits protect execution prices, while position caps protect
+                # current exposure. Never value either leg below its mid.
                 headroom = self._headroom(
                     buy, sell,
-                    buy_px=plan.buy_limit,
-                    sell_px=plan.sell_limit,
+                    buy_px=max(plan.buy_limit, buy_mid),
+                    sell_px=max(plan.sell_limit, sell_mid),
                 )
-                headroom_base = max(headroom / plan.buy_limit, 0.0)
+                headroom_base = max(
+                    headroom / max(plan.buy_limit, buy_mid), 0.0)
                 if plan.qty <= headroom_base + 1e-12:
                     break
                 prior_qty = plan.qty
