@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import csv
-import io
+import logging
 import math
 import os
 from dataclasses import asdict, dataclass
@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Optional
 
 from .recorder import next_archive_path
+
+
+log = logging.getLogger("strategy_recorder")
 
 
 STRATEGY_EVENT_HEADER = [
@@ -93,6 +96,8 @@ class StrategyEventRecorder:
             if not valid:
                 archive = next_archive_path(str(self.path))
                 os.replace(self.path, archive)
+                log.warning("invalid strategy event file %s archived to %s",
+                            self.path, archive)
                 exists = False
             else:
                 self._decision_ids = decision_ids
@@ -105,33 +110,38 @@ class StrategyEventRecorder:
             self._handle.flush()
 
     def _inspect_existing(self) -> tuple[bool, set[str]]:
-        try:
-            content = self.path.read_bytes()
-            if not content.endswith((b"\n", b"\r")):
+        with self.path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
                 return False, set()
-            rows = list(csv.reader(
-                io.StringIO(content.decode("utf-8"), newline=""),
-                strict=True,
-            ))
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) not in (b"\n", b"\r"):
+                return False, set()
+
+        try:
+            with self.path.open(
+                    "r", encoding="utf-8", newline="") as handle:
+                rows = csv.reader(handle, strict=True)
+                if next(rows, None) != STRATEGY_EVENT_HEADER:
+                    return False, set()
+                timestamp_index = STRATEGY_EVENT_HEADER.index("ts_ms")
+                event_index = STRATEGY_EVENT_HEADER.index("event")
+                decision_index = STRATEGY_EVENT_HEADER.index("decision_id")
+                decision_ids = set()
+                for row in rows:
+                    if (len(row) != len(STRATEGY_EVENT_HEADER)
+                            or not row[event_index]):
+                        return False, set()
+                    try:
+                        timestamp = float(row[timestamp_index])
+                    except ValueError:
+                        return False, set()
+                    if not math.isfinite(timestamp) or timestamp < 0:
+                        return False, set()
+                    if row[decision_index]:
+                        decision_ids.add(row[decision_index])
         except (UnicodeError, csv.Error):
             return False, set()
-        if not rows or rows[0] != STRATEGY_EVENT_HEADER:
-            return False, set()
-        timestamp_index = STRATEGY_EVENT_HEADER.index("ts_ms")
-        event_index = STRATEGY_EVENT_HEADER.index("event")
-        decision_index = STRATEGY_EVENT_HEADER.index("decision_id")
-        decision_ids = set()
-        for row in rows[1:]:
-            if len(row) != len(STRATEGY_EVENT_HEADER) or not row[event_index]:
-                return False, set()
-            try:
-                timestamp = float(row[timestamp_index])
-            except ValueError:
-                return False, set()
-            if not math.isfinite(timestamp) or timestamp < 0:
-                return False, set()
-            if row[decision_index]:
-                decision_ids.add(row[decision_index])
         return True, decision_ids
 
     def record(self, event: StrategyEvent) -> bool:

@@ -1,6 +1,8 @@
 import csv
+import logging
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -84,7 +86,8 @@ def test_existing_incompatible_header_is_archived(tmp_path):
     assert read_rows(path) == []
 
 
-def test_incomplete_tail_is_archived_without_modifying_original_bytes(tmp_path):
+def test_incomplete_tail_is_archived_without_modifying_original_bytes(
+        tmp_path, caplog):
     path = tmp_path / "events.csv"
     recorder = StrategyEventRecorder(path)
     recorder.record(event(intent="OPEN", decision_id="execution-first"))
@@ -92,10 +95,14 @@ def test_incomplete_tail_is_archived_without_modifying_original_bytes(tmp_path):
     damaged = path.read_bytes() + b"123,partial"
     path.write_bytes(damaged)
 
-    restarted = StrategyEventRecorder(path)
-    restarted.close()
+    with caplog.at_level(logging.WARNING):
+        restarted = StrategyEventRecorder(path)
+        restarted.close()
 
-    assert (tmp_path / "events.csv.old").read_bytes() == damaged
+    archive = tmp_path / "events.csv.old"
+    assert archive.read_bytes() == damaged
+    assert str(path) in caplog.text
+    assert str(archive) in caplog.text
     assert read_rows(path) == []
 
 
@@ -118,6 +125,28 @@ def test_decision_id_is_deduplicated_across_restart(tmp_path):
 
     assert [row["decision_id"] for row in read_rows(path)] == [
         "execution-abc"]
+
+
+def test_restart_deduplicates_without_path_read_bytes(tmp_path, monkeypatch):
+    path = tmp_path / "events.csv"
+    first = StrategyEventRecorder(path)
+    assert first.record(event(
+        intent="OPEN",
+        decision_id="execution-streamed",
+    ))
+    first.close()
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"Path.read_bytes must not be called: {self}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    second = StrategyEventRecorder(path)
+    assert not second.record(event(
+        ts=61.0,
+        intent="OPEN",
+        decision_id="execution-streamed",
+    ))
+    second.close()
 
 
 def test_close_is_idempotent_and_record_after_close_fails(tmp_path):
