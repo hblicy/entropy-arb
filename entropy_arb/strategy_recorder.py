@@ -23,7 +23,8 @@ STRATEGY_EVENT_HEADER = [
     "model_version", "model_samples", "model_status", "model_median_bps",
     "model_lower_bps", "model_upper_bps", "model_iqr_bps",
     "signed_residual_bps", "reference_basis_bps", "entry_boundary_bps",
-    "exit_target_bps", "convergence_bps", "round_trip_fee_bps",
+    "exit_target_bps", "top_convergence_bps", "convergence_bps",
+    "round_trip_fee_bps",
     "buy_slippage_budget_bps", "sell_slippage_budget_bps",
     "projected_net_bps", "projected_net_usd",
     "estimated_campaign_pnl_usd", "qty", "planned_notional_usd",
@@ -62,6 +63,7 @@ class StrategyEvent:
     reference_basis_bps: Optional[float] = None
     entry_boundary_bps: Optional[float] = None
     exit_target_bps: Optional[float] = None
+    top_convergence_bps: Optional[float] = None
     convergence_bps: Optional[float] = None
     round_trip_fee_bps: Optional[float] = None
     buy_slippage_budget_bps: Optional[float] = None

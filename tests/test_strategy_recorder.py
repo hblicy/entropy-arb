@@ -39,6 +39,25 @@ def read_rows(path):
         return list(csv.DictReader(handle))
 
 
+def test_event_records_top_and_marginal_convergence_separately(tmp_path):
+    path = tmp_path / "events.csv"
+    recorder = StrategyEventRecorder(path)
+
+    recorder.record(StrategyEvent(
+        ts=60.1,
+        mode="shadow",
+        event="decision",
+        intent="OPEN",
+        top_convergence_bps=32.5,
+        convergence_bps=27.5,
+    ))
+    recorder.close()
+
+    row = read_rows(path)[0]
+    assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
+    assert float(row["convergence_bps"]) == pytest.approx(27.5)
+
+
 def test_repeated_skip_is_written_once_per_reason_per_minute(tmp_path):
     path = tmp_path / "strategy-events.csv"
     recorder = StrategyEventRecorder(path)

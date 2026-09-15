@@ -1125,6 +1125,7 @@ class Engine:
             reference_basis_bps=decision.reference_basis_bps,
             entry_boundary_bps=decision.entry_boundary_bps,
             exit_target_bps=decision.exit_target_bps,
+            top_convergence_bps=decision.top_convergence_bps,
             convergence_bps=decision.convergence_bps,
             round_trip_fee_bps=decision.round_trip_fee_bps,
             buy_slippage_budget_bps=decision.buy_slippage_budget_bps,

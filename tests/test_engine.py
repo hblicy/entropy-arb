@@ -963,7 +963,8 @@ EXECUTION_BUSINESS_FIELDS = [
     "direction", "model_version", "model_samples", "model_status",
     "model_median_bps", "model_lower_bps", "model_upper_bps",
     "model_iqr_bps", "signed_residual_bps", "reference_basis_bps",
-    "entry_boundary_bps", "exit_target_bps", "convergence_bps",
+    "entry_boundary_bps", "exit_target_bps", "top_convergence_bps",
+    "convergence_bps",
     "round_trip_fee_bps", "buy_slippage_budget_bps",
     "sell_slippage_budget_bps", "projected_net_bps",
     "projected_net_usd", "estimated_campaign_pnl_usd", "qty",
@@ -977,6 +978,26 @@ EXECUTION_BUSINESS_FIELDS = [
 def execution_event(eng, event="campaign_changed"):
     return next(row for row in read_strategy_events(eng)
                 if row["event"] == event)
+
+
+def test_dynamic_decision_event_preserves_both_convergence_values(tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        decision = engine_module.StrategyDecision(
+            intent="OPEN",
+            direction="sell_entropy",
+            reason="ENTRY_SIGNAL",
+            top_convergence_bps=32.5,
+            convergence_bps=27.5,
+        )
+
+        eng._record_dynamic_decision(decision, now_wall=1000.0)
+
+        row = read_strategy_events(eng)[-1]
+        assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
+        assert float(row["convergence_bps"]) == pytest.approx(27.5)
+    finally:
+        eng._close_dynamic_strategy()
 
 
 def test_pending_results_use_supplied_wall_clock_for_terminal_settlement(
