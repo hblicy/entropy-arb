@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import entropy_arb.strategy_recorder as strategy_recorder_module  # noqa: E402
 from entropy_arb.strategy_recorder import (  # noqa: E402
     STRATEGY_EVENT_HEADER,
     StrategyEvent,
@@ -147,6 +148,97 @@ def test_restart_deduplicates_without_path_read_bytes(tmp_path, monkeypatch):
         decision_id="execution-streamed",
     ))
     second.close()
+
+
+def test_restart_inspects_and_appends_through_one_open_handle(
+        tmp_path, monkeypatch):
+    path = tmp_path / "events.csv"
+    original = StrategyEventRecorder(path)
+    assert original.record(event(
+        intent="OPEN",
+        decision_id="execution-original",
+    ))
+    original.close()
+
+    replacement = tmp_path / "replacement.csv"
+    other = StrategyEventRecorder(replacement)
+    assert other.record(event(
+        intent="OPEN",
+        decision_id="execution-replacement",
+    ))
+    other.close()
+    replacement.write_bytes(replacement.read_bytes().rstrip(b"\r\n"))
+
+    real_open = Path.open
+    target_open_count = 0
+
+    def swap_before_reopen(self, *args, **kwargs):
+        nonlocal target_open_count
+        if self == path:
+            target_open_count += 1
+            if target_open_count == 2:
+                os.replace(replacement, path)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", swap_before_reopen)
+    restarted = StrategyEventRecorder(path)
+    try:
+        assert not restarted.record(event(
+            ts=61.0,
+            intent="OPEN",
+            decision_id="execution-original",
+        ))
+    finally:
+        restarted.close()
+
+    assert target_open_count == 1
+
+
+def test_restart_streams_reader_without_materializing_rows(
+        tmp_path, monkeypatch):
+    path = tmp_path / "events.csv"
+    first = StrategyEventRecorder(path)
+    for index in range(512):
+        assert first.record(event(
+            ts=60.1 + index,
+            intent="OPEN",
+            decision_id=f"execution-{index}",
+        ))
+    first.close()
+
+    real_reader = strategy_recorder_module.csv.reader
+
+    class StreamingReader:
+        def __init__(self, delegate):
+            self._delegate = delegate
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._delegate)
+
+        def __length_hint__(self):
+            raise AssertionError("CSV rows must not be materialized")
+
+    def streaming_reader(*args, **kwargs):
+        return StreamingReader(real_reader(*args, **kwargs))
+
+    def fail_read_bytes(self):
+        raise AssertionError(f"Path.read_bytes must not be called: {self}")
+
+    monkeypatch.setattr(strategy_recorder_module.csv, "reader",
+                        streaming_reader)
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    second = StrategyEventRecorder(path)
+    try:
+        assert not second.record(event(
+            ts=1000.0,
+            intent="OPEN",
+            decision_id="execution-511",
+        ))
+    finally:
+        second.close()
 
 
 def test_close_is_idempotent_and_record_after_close_fails(tmp_path):

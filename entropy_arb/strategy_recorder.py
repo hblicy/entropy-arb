@@ -8,7 +8,7 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TextIO
 
 from .recorder import next_archive_path
 
@@ -90,58 +90,69 @@ class StrategyEventRecorder:
         self._closed = False
         self._last_skip_key: Optional[tuple] = None
         self._decision_ids = set()
-        exists = self.path.exists()
-        if exists and self.path.stat().st_size:
-            valid, decision_ids = self._inspect_existing()
+        # Inspect and append through one descriptor so startup validates the
+        # same file object that this recorder retains for writes.
+        handle = self.path.open("a+", newline="", encoding="utf-8")
+        try:
+            has_content = handle.seek(0, os.SEEK_END) != 0
+            valid, decision_ids = (
+                self._inspect_existing(handle)
+                if has_content else (True, set())
+            )
+        except BaseException:
+            handle.close()
+            raise
+        if has_content:
             if not valid:
+                handle.close()
                 archive = next_archive_path(str(self.path))
                 os.replace(self.path, archive)
                 log.warning("invalid strategy event file %s archived to %s",
                             self.path, archive)
-                exists = False
+                handle = self.path.open(
+                    "a+", newline="", encoding="utf-8")
+                has_content = False
             else:
                 self._decision_ids = decision_ids
-        self._handle = self.path.open("a", newline="", encoding="utf-8")
+        self._handle = handle
         self._writer = csv.DictWriter(
             self._handle, fieldnames=STRATEGY_EVENT_HEADER,
             extrasaction="raise")
-        if not exists or self.path.stat().st_size == 0:
+        if not has_content:
             self._writer.writeheader()
             self._handle.flush()
 
-    def _inspect_existing(self) -> tuple[bool, set[str]]:
-        with self.path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                return False, set()
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) not in (b"\n", b"\r"):
-                return False, set()
+    def _inspect_existing(self, handle: TextIO) -> tuple[bool, set[str]]:
+        binary_handle = handle.buffer
+        binary_handle.seek(0, os.SEEK_END)
+        binary_handle.seek(-1, os.SEEK_END)
+        if binary_handle.read(1) not in (b"\n", b"\r"):
+            return False, set()
 
         try:
-            with self.path.open(
-                    "r", encoding="utf-8", newline="") as handle:
-                rows = csv.reader(handle, strict=True)
-                if next(rows, None) != STRATEGY_EVENT_HEADER:
+            handle.seek(0)
+            rows = csv.reader(handle, strict=True)
+            if next(rows, None) != STRATEGY_EVENT_HEADER:
+                return False, set()
+            timestamp_index = STRATEGY_EVENT_HEADER.index("ts_ms")
+            event_index = STRATEGY_EVENT_HEADER.index("event")
+            decision_index = STRATEGY_EVENT_HEADER.index("decision_id")
+            decision_ids = set()
+            for row in rows:
+                if (len(row) != len(STRATEGY_EVENT_HEADER)
+                        or not row[event_index]):
                     return False, set()
-                timestamp_index = STRATEGY_EVENT_HEADER.index("ts_ms")
-                event_index = STRATEGY_EVENT_HEADER.index("event")
-                decision_index = STRATEGY_EVENT_HEADER.index("decision_id")
-                decision_ids = set()
-                for row in rows:
-                    if (len(row) != len(STRATEGY_EVENT_HEADER)
-                            or not row[event_index]):
-                        return False, set()
-                    try:
-                        timestamp = float(row[timestamp_index])
-                    except ValueError:
-                        return False, set()
-                    if not math.isfinite(timestamp) or timestamp < 0:
-                        return False, set()
-                    if row[decision_index]:
-                        decision_ids.add(row[decision_index])
+                try:
+                    timestamp = float(row[timestamp_index])
+                except ValueError:
+                    return False, set()
+                if not math.isfinite(timestamp) or timestamp < 0:
+                    return False, set()
+                if row[decision_index]:
+                    decision_ids.add(row[decision_index])
         except (UnicodeError, csv.Error):
             return False, set()
+        handle.seek(0, os.SEEK_END)
         return True, decision_ids
 
     def record(self, event: StrategyEvent) -> bool:
