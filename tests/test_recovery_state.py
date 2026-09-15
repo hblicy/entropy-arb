@@ -38,6 +38,7 @@ def audit_context():
         reason="exit target reached",
         signed_residual_bps=-1.5,
         reference_basis_bps=0.25,
+        top_convergence_bps=2.0,
         convergence_bps=1.75,
         round_trip_fee_bps=0.9,
         buy_slippage_budget_bps=1.0,
@@ -93,7 +94,7 @@ def test_pending_store_round_trips_without_secrets(tmp_path):
     store.save(expected)
 
     assert store.load() == expected
-    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 3
+    assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == 4
     payload = path.read_text(encoding="utf-8").lower()
     assert "private_key" not in payload
     assert "api_private_key" not in payload
@@ -127,6 +128,37 @@ def test_pending_store_rejects_v2_without_modifying_original_file(tmp_path):
             match=r"campaign\.pending\.json.*2.*manual verification required"):
         PendingExecutionStore(path).load()
 
+    assert path.read_bytes() == original
+
+
+def test_pending_store_loads_v3_entry_with_reconstructed_top_convergence(
+        tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    store = PendingExecutionStore(path)
+    state = pending_state()
+    state = replace(
+        state,
+        intent="ADD",
+        direction="sell_entropy",
+        buy=replace(state.buy, venue_key="hedge"),
+        sell=replace(state.sell, venue_key="entropy"),
+        exit_target_bps=10.0,
+        audit=replace(
+            state.audit,
+            signed_residual_bps=42.5,
+            top_convergence_bps=32.5,
+        ),
+    )
+    store.save(state)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 3
+    del payload["pending_execution"]["audit"]["top_convergence_bps"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    original = path.read_bytes()
+
+    loaded = store.load()
+
+    assert loaded.audit.top_convergence_bps == pytest.approx(32.5)
     assert path.read_bytes() == original
 
 

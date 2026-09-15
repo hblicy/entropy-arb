@@ -857,11 +857,13 @@ async def reconcile_dynamic_execution(eng):
     assert await eng._recover_positions(strict=True)
 
 
-def pending_audit_context(planned_notional_usd=100.0):
+def pending_audit_context(planned_notional_usd=100.0,
+                          top_convergence_bps=None):
     return PendingAuditContext(
         reason="test fixture",
         signed_residual_bps=None,
         reference_basis_bps=None,
+        top_convergence_bps=top_convergence_bps,
         convergence_bps=None,
         round_trip_fee_bps=None,
         buy_slippage_budget_bps=None,
@@ -997,6 +999,29 @@ def test_dynamic_decision_event_preserves_both_convergence_values(tmp_path):
         assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
         assert float(row["convergence_bps"]) == pytest.approx(27.5)
     finally:
+        eng._close_dynamic_strategy()
+
+
+def test_settled_pending_event_preserves_both_convergence_values(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        pending = restart_open_pending(eng, unresolved=False)
+        pending = replace(
+            pending,
+            audit=replace(
+                pending.audit,
+                top_convergence_bps=32.5,
+                convergence_bps=27.5,
+            ),
+        )
+
+        eng._record_pending_campaign_event(pending)
+
+        row = execution_event(eng)
+        assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
+        assert float(row["convergence_bps"]) == pytest.approx(27.5)
+    finally:
+        eng._shutdown_reconcile_required = False
         eng._close_dynamic_strategy()
 
 
@@ -1576,6 +1601,7 @@ def test_pending_audit_context_captures_fixed_decision_and_buy_funding_sign(
         plan=plan,
         signed_residual_bps=-31.0,
         reference_basis_bps=4.0,
+        top_convergence_bps=23.0,
         convergence_bps=20.0,
         round_trip_fee_bps=3.0,
         buy_slippage_budget_bps=1.5,
@@ -1589,6 +1615,7 @@ def test_pending_audit_context_captures_fixed_decision_and_buy_funding_sign(
         reason="EXPECTED_NET_PROFIT",
         signed_residual_bps=-31.0,
         reference_basis_bps=4.0,
+        top_convergence_bps=23.0,
         convergence_bps=20.0,
         round_trip_fee_bps=3.0,
         buy_slippage_budget_bps=1.5,
@@ -1649,6 +1676,8 @@ def test_dynamic_execution_journal_clears_only_after_position_refresh(
                 decision.signed_residual_bps)
             assert pending.audit.reference_basis_bps == pytest.approx(
                 decision.reference_basis_bps)
+            assert pending.audit.top_convergence_bps == pytest.approx(
+                decision.top_convergence_bps)
             assert pending.audit.convergence_bps == pytest.approx(
                 decision.convergence_bps)
             assert pending.audit.round_trip_fee_bps == pytest.approx(

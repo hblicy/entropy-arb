@@ -19,7 +19,7 @@ from .strategy import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _LEG_FIELDS = {
     "venue_key", "is_buy", "order_ref", "status", "filled_base",
     "avg_px", "applied_fill", "unresolved",
@@ -33,12 +33,14 @@ _EXECUTION_FIELDS = {
 }
 _AUDIT_FIELDS = {
     "reason", "signed_residual_bps", "reference_basis_bps",
-    "convergence_bps", "round_trip_fee_bps", "buy_slippage_budget_bps",
-    "sell_slippage_budget_bps", "projected_net_bps", "projected_net_usd",
-    "estimated_campaign_pnl_usd", "entropy_reference_age_ms",
-    "hedge_reference_age_ms", "reference_update_skew_ms",
-    "net_funding_bps_per_hour", "planned_notional_usd",
+    "top_convergence_bps", "convergence_bps", "round_trip_fee_bps",
+    "buy_slippage_budget_bps", "sell_slippage_budget_bps",
+    "projected_net_bps", "projected_net_usd", "estimated_campaign_pnl_usd",
+    "entropy_reference_age_ms", "hedge_reference_age_ms",
+    "reference_update_skew_ms", "net_funding_bps_per_hour",
+    "planned_notional_usd",
 }
+_AUDIT_FIELDS_V3 = _AUDIT_FIELDS - {"top_convergence_bps"}
 _IDENTITY_FIELDS = {
     "entropy_symbol", "entropy_dex", "hedge_symbol", "hedge_venue",
 }
@@ -92,6 +94,7 @@ class PendingAuditContext:
     reason: str
     signed_residual_bps: Optional[float]
     reference_basis_bps: Optional[float]
+    top_convergence_bps: Optional[float]
     convergence_bps: Optional[float]
     round_trip_fee_bps: Optional[float]
     buy_slippage_budget_bps: Optional[float]
@@ -115,7 +118,8 @@ class PendingAuditContext:
             _optional_finite(
                 f"audit.{name}", getattr(self, name), signed=True)
         for name in (
-                "convergence_bps", "round_trip_fee_bps",
+                "top_convergence_bps", "convergence_bps",
+                "round_trip_fee_bps",
                 "buy_slippage_budget_bps", "sell_slippage_budget_bps",
                 "entropy_reference_age_ms", "hedge_reference_age_ms",
                 "reference_update_skew_ms"):
@@ -329,14 +333,34 @@ def _leg_from_dict(raw) -> PendingLegState:
     return PendingLegState(**raw)
 
 
-def _audit_from_dict(raw) -> PendingAuditContext:
-    if not isinstance(raw, dict) or set(raw) != _AUDIT_FIELDS:
+def _audit_from_dict(raw, *, schema_version: int,
+                     execution: dict) -> PendingAuditContext:
+    expected_fields = (
+        _AUDIT_FIELDS_V3 if schema_version == 3 else _AUDIT_FIELDS)
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise PendingExecutionStateError(
             "pending audit fields are incompatible")
-    return PendingAuditContext(**raw)
+    values = dict(raw)
+    if schema_version == 3:
+        if execution["intent"] in {"OPEN", "ADD"}:
+            residual = _signed_finite(
+                "audit.signed_residual_bps", raw["signed_residual_bps"])
+            target = _signed_finite(
+                "exit_target_bps", execution["exit_target_bps"])
+            if execution["direction"] == "sell_entropy":
+                top_convergence = residual - target
+            elif execution["direction"] == "buy_entropy":
+                top_convergence = target - residual
+            else:
+                raise PendingExecutionStateError(
+                    "pending direction is invalid")
+            values["top_convergence_bps"] = top_convergence
+        else:
+            values["top_convergence_bps"] = None
+    return PendingAuditContext(**values)
 
 
-def _execution_from_dict(raw) -> PendingExecutionState:
+def _execution_from_dict(raw, *, schema_version: int) -> PendingExecutionState:
     if not isinstance(raw, dict) or set(raw) != _EXECUTION_FIELDS:
         raise PendingExecutionStateError(
             "pending execution fields are incompatible")
@@ -361,7 +385,8 @@ def _execution_from_dict(raw) -> PendingExecutionState:
             else _campaign_from_dict(raw["campaign_before"]))
         values["buy"] = _leg_from_dict(raw["buy"])
         values["sell"] = _leg_from_dict(raw["sell"])
-        values["audit"] = _audit_from_dict(raw["audit"])
+        values["audit"] = _audit_from_dict(
+            raw["audit"], schema_version=schema_version, execution=raw)
         return PendingExecutionState(**values)
     except (TypeError, ValueError) as exc:
         raise PendingExecutionStateError(
@@ -388,13 +413,15 @@ class PendingExecutionStore:
                 "schema_version", "pending_execution"}:
             raise PendingExecutionStateError(
                 "pending execution state envelope is incompatible")
-        if raw["schema_version"] != SCHEMA_VERSION:
+        schema_version = raw["schema_version"]
+        if schema_version not in {3, SCHEMA_VERSION}:
             raise PendingExecutionStateError(
                 f"pending execution state {self.path} has unsupported "
-                f"schema_version {raw['schema_version']!r}; manual "
+                f"schema_version {schema_version!r}; manual "
                 "verification required")
         pending = raw["pending_execution"]
-        return None if pending is None else _execution_from_dict(pending)
+        return (None if pending is None else _execution_from_dict(
+            pending, schema_version=schema_version))
 
     def save(self, pending: Optional[PendingExecutionState]) -> None:
         if pending is not None and not isinstance(
