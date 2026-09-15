@@ -46,11 +46,21 @@ class PendingExecutionStateError(ValueError):
     pass
 
 
-def _finite(name: str, value, *, positive: bool = False) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value)):
+def _coerce_finite(name: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PendingExecutionStateError(f"{name} must be finite")
-    result = float(value)
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise PendingExecutionStateError(
+            f"{name} must be finite") from exc
+    if not math.isfinite(result):
+        raise PendingExecutionStateError(f"{name} must be finite")
+    return result
+
+
+def _finite(name: str, value, *, positive: bool = False) -> float:
+    result = _coerce_finite(name, value)
     if positive and result <= 0:
         raise PendingExecutionStateError(f"{name} must be positive")
     if not positive and result < 0:
@@ -59,10 +69,7 @@ def _finite(name: str, value, *, positive: bool = False) -> float:
 
 
 def _signed_finite(name: str, value) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float))
-            or not math.isfinite(value)):
-        raise PendingExecutionStateError(f"{name} must be finite")
-    return float(value)
+    return _coerce_finite(name, value)
 
 
 def _optional_finite(name: str, value, *, signed: bool) -> None:

@@ -327,3 +327,24 @@ def test_pending_rejects_invalid_settled_at(settled_at):
                         unresolved=False),
             settled_at=settled_at,
         )
+
+
+@pytest.mark.parametrize(
+    "field", ["planned_notional_usd", "signed_residual_bps"])
+def test_pending_audit_rejects_integer_too_large_for_float(field):
+    with pytest.raises(PendingExecutionStateError, match=field):
+        replace(audit_context(), **{field: 10 ** 400})
+
+
+def test_pending_loader_wraps_integer_too_large_for_float(tmp_path):
+    path = tmp_path / "campaign.pending.json"
+    store = PendingExecutionStore(path)
+    store.save(pending_state())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["pending_execution"]["audit"][
+        "signed_residual_bps"] = 10 ** 400
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+            PendingExecutionStateError, match="signed_residual_bps"):
+        store.load()
