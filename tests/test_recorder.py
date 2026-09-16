@@ -4,11 +4,13 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_recorder.py)
 """
 import csv
 import asyncio
+import gzip
 import io
 import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -23,6 +25,7 @@ from entropy_arb.recorder import (  # noqa: E402
     SignalRecorder,
     csv_header_matches,
 )
+from entropy_arb.reference import ReferenceState, ReferenceUpdate  # noqa: E402
 
 
 def set_book(book, bid, ask):
@@ -35,6 +38,24 @@ class SignalVenue:
         self.name = name
         self.book = OrderBook()
         self.fee_bps = fee_bps
+        self.reference = ReferenceState()
+
+
+def set_reference(venue, *, received_mono, oracle_px=None, index_px=None,
+                  mark_px=None, current_funding=None, last_funding=None,
+                  last_funding_ts_ms=None):
+    venue.reference.apply(
+        ReferenceUpdate(
+            oracle_px=oracle_px,
+            index_px=index_px,
+            mark_px=mark_px,
+            funding_current_bps_per_hour=current_funding,
+            funding_last_bps_per_hour=last_funding,
+            funding_last_ts_ms=last_funding_ts_ms,
+        ),
+        source="websocket",
+        received_mono=received_mono,
+    )
 
 
 def set_signal_book(venue, *, bid, ask, ts):
@@ -57,7 +78,7 @@ def set_signal_levels(venue, *, bids, asks, ts):
 
 def make_signal_recorder(path, sample_sec=1.0, *, entropy_symbol="SNDK",
                          entropy_dex="io", hedge_symbol="SNDK",
-                         hedge_venue="lighter-rh"):
+                         hedge_venue="lighter-rh", rotate_daily=True):
     entropy = SignalVenue("entropy")
     hedge = SignalVenue("hedge")
     set_signal_book(entropy, bid=100.10, ask=100.11, ts=1000.0)
@@ -72,6 +93,7 @@ def make_signal_recorder(path, sample_sec=1.0, *, entropy_symbol="SNDK",
         entropy_symbol=entropy_symbol, entropy_dex=entropy_dex,
         hedge_symbol=hedge_symbol,
         hedge_venue=hedge_venue,
+        signal_rotate_daily=rotate_daily,
     )
     return rec, entropy, hedge
 
@@ -205,6 +227,107 @@ def test_minute_aggregation_and_rollover():
     # closes carry the last books
     assert float(m2["entropy_bid"]) == 100.09
     assert float(m2["hedge_ask"]) == 100.01
+
+
+def test_minute_header_appends_reference_fields_before_samples():
+    assert HEADER[-24:] == [
+        "entropy_oracle_px", "entropy_index_px", "entropy_mark_px",
+        "entropy_funding_current_bps_per_hour",
+        "entropy_funding_last_bps_per_hour", "entropy_funding_last_ts_ms",
+        "entropy_reference_age_ms", "hedge_oracle_px", "hedge_index_px",
+        "hedge_mark_px", "hedge_funding_current_bps_per_hour",
+        "hedge_funding_last_bps_per_hour", "hedge_funding_last_ts_ms",
+        "hedge_reference_age_ms", "reference_update_skew_ms",
+        "reference_basis_close_bps",
+        "funding_diff_close_bps_per_hour", "residual_open_bps",
+        "residual_high_bps", "residual_low_bps", "residual_close_bps",
+        "residual_mean_bps", "residual_std_bps", "samples",
+    ]
+
+
+def test_minute_reference_stats_use_only_samples_with_reference(monkeypatch):
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+    entropy_book, hedge_book = OrderBook(), OrderBook()
+    entropy_reference, hedge_reference = ReferenceState(), ReferenceState()
+    set_book(entropy_book, 100.09, 100.11)
+    set_book(hedge_book, 99.99, 100.01)
+    monotonic_clock = [50.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec = MinuteRecorder(
+        path, entropy_book, hedge_book, staleness_sec=1e9,
+        entropy_reference=entropy_reference,
+        hedge_reference=hedge_reference,
+    )
+
+    rec.sample(1_700_000_000.0)
+    entropy_reference.apply(
+        ReferenceUpdate(
+            oracle_px=100.05, index_px=100.04, mark_px=100.06,
+            funding_current_bps_per_hour=0.12,
+            funding_last_bps_per_hour=0.10,
+            funding_last_ts_ms=1_699_999_000_000,
+        ), source="websocket", received_mono=49.8)
+    hedge_reference.apply(
+        ReferenceUpdate(
+            oracle_px=100.01, index_px=100.00, mark_px=100.02,
+            funding_current_bps_per_hour=0.04,
+            funding_last_bps_per_hour=0.03,
+            funding_last_ts_ms=1_699_999_100_000,
+        ), source="websocket", received_mono=49.5)
+    monotonic_clock[0] = 50.5
+    rec.sample(1_700_000_010.0)
+    rec.close()
+
+    with open(path, newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+    premium = (((100.09 + 100.11) / 2) /
+               ((99.99 + 100.01) / 2) - 1.0) * 1e4
+    basis = (100.05 / 100.00 - 1.0) * 1e4
+    residual = premium - basis
+    assert row["samples"] == "2"
+    assert float(row["entropy_oracle_px"]) == 100.05
+    assert float(row["hedge_index_px"]) == 100.00
+    assert row["entropy_funding_last_ts_ms"] == "1699999000000"
+    assert row["hedge_funding_last_ts_ms"] == "1699999100000"
+    assert float(row["entropy_reference_age_ms"]) == pytest.approx(700.0)
+    assert float(row["hedge_reference_age_ms"]) == pytest.approx(1000.0)
+    assert float(row["reference_update_skew_ms"]) == pytest.approx(300.0)
+    assert float(row["reference_basis_close_bps"]) == pytest.approx(
+        basis, abs=0.001)
+    assert float(row["funding_diff_close_bps_per_hour"]) == pytest.approx(
+        0.08)
+    for field in (
+            "residual_open_bps", "residual_high_bps",
+            "residual_low_bps", "residual_close_bps",
+            "residual_mean_bps"):
+        assert float(row[field]) == pytest.approx(residual, abs=0.001)
+    assert float(row["residual_std_bps"]) == 0.0
+
+
+def test_minute_missing_reference_keeps_orderbook_row_and_blanks_reference():
+    path = os.path.join(tempfile.mkdtemp(), "minutes.csv")
+    entropy_book, hedge_book = OrderBook(), OrderBook()
+    set_book(entropy_book, 100.09, 100.11)
+    set_book(hedge_book, 99.99, 100.01)
+    rec = MinuteRecorder(
+        path, entropy_book, hedge_book, staleness_sec=1e9,
+        entropy_reference=ReferenceState(),
+        hedge_reference=ReferenceState(),
+    )
+
+    rec.sample(1_700_000_000.0)
+    rec.close()
+
+    with open(path, newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+    assert row["samples"] == "1"
+    assert row["premium_close_bps"]
+    for field in (
+            "entropy_oracle_px", "hedge_index_px",
+            "reference_basis_close_bps", "residual_open_bps",
+            "residual_close_bps"):
+        assert row[field] == ""
 
 
 def test_stale_books_are_skipped():
@@ -497,6 +620,37 @@ def test_signal_directions_have_independent_lifecycles():
     assert sell_id != buy_id
 
 
+def test_signal_recorder_writes_neutral_snapshots_without_raw_signal(
+        tmp_path, monkeypatch):
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time,
+        "monotonic",
+        lambda: monotonic_clock[0],
+    )
+    path = tmp_path / "signals.csv"
+    rec, entropy, hedge = make_signal_recorder(str(path), sample_sec=1.0)
+    set_signal_book(entropy, bid=100.00, ask=100.01, ts=1000.0)
+    set_signal_book(hedge, bid=100.00, ask=100.01, ts=1000.0)
+
+    rec.observe(now=1000.0)
+    monotonic_clock[0] = 100.5
+    rec.observe(now=1000.5)
+    monotonic_clock[0] = 101.0
+    rec.observe(now=1001.0)
+    rec.close(now=1001.0)
+
+    rows = read_signal_rows(path)
+    assert [row["event"] for row in rows] == ["snapshot", "snapshot"]
+    assert all(row["direction"] == "" for row in rows)
+    assert len({row["event_id"] for row in rows}) == 2
+    assert all(float(row["entropy_bid"]) == 100.0 for row in rows)
+    assert all(float(row["entropy_ask"]) == 100.01 for row in rows)
+    assert all(float(row["hedge_bid"]) == 100.0 for row in rows)
+    assert all(float(row["hedge_ask"]) == 100.01 for row in rows)
+    assert all(float(row["crossable_notional_usd"]) > 0 for row in rows)
+
+
 def test_signal_metrics_use_plan_and_book_update_times(monkeypatch):
     path = os.path.join(tempfile.mkdtemp(), "signals.csv")
     entropy = SignalVenue("entropy", fee_bps=0.3)
@@ -572,6 +726,91 @@ def test_signal_metrics_use_plan_and_book_update_times(monkeypatch):
     assert float(row["expected_edge_usd"]) == pytest.approx(
         expected_plan.exp_edge_usd
     )
+
+
+def test_signal_header_appends_reference_fields():
+    assert SIGNAL_HEADER[-18:] == [
+        "entropy_oracle_px", "entropy_mark_px",
+        "entropy_funding_current_bps_per_hour",
+        "entropy_funding_last_bps_per_hour", "entropy_funding_last_ts_ms",
+        "entropy_reference_age_ms", "hedge_index_px", "hedge_mark_px",
+        "hedge_funding_current_bps_per_hour",
+        "hedge_funding_last_bps_per_hour", "hedge_funding_last_ts_ms",
+        "hedge_reference_age_ms", "reference_update_skew_ms",
+        "reference_basis_bps", "signed_executable_premium_bps",
+        "signed_residual_bps", "residual_edge_bps",
+        "net_funding_bps_per_hour",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("direction", "expected_signed_premium", "expected_residual_edge",
+     "expected_funding"),
+    [
+        ("sell_entropy", (100.20 / 100.00 - 1.0) * 1e4,
+         ((100.20 / 100.00 - 1.0) - (100.05 / 100.00 - 1.0)) * 1e4,
+         0.08),
+        ("buy_entropy", (100.21 / 99.99 - 1.0) * 1e4,
+         -(((100.21 / 99.99 - 1.0) - (100.05 / 100.00 - 1.0)) * 1e4),
+         -0.08),
+    ],
+)
+def test_signal_snapshot_records_directional_reference_metrics(
+        monkeypatch, direction, expected_signed_premium,
+        expected_residual_edge, expected_funding):
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, entropy, hedge = make_signal_recorder(path)
+    set_signal_book(entropy, bid=100.20, ask=100.21, ts=1000.0)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=1000.0)
+    set_reference(
+        entropy, received_mono=99.8, oracle_px=100.05, mark_px=100.06,
+        current_funding=0.12, last_funding=0.10,
+        last_funding_ts_ms=900_000)
+    set_reference(
+        hedge, received_mono=99.5, index_px=100.00, mark_px=100.02,
+        current_funding=0.04, last_funding=0.03,
+        last_funding_ts_ms=800_000)
+    monkeypatch.setattr(recorder_module.time, "monotonic", lambda: 100.0)
+
+    row = rec._snapshot(direction, now=1000.0)
+
+    basis = (100.05 / 100.00 - 1.0) * 1e4
+    assert row["entropy_oracle_px"] == 100.05
+    assert row["entropy_mark_px"] == 100.06
+    assert row["hedge_index_px"] == 100.00
+    assert row["hedge_mark_px"] == 100.02
+    assert row["entropy_funding_last_ts_ms"] == 900_000
+    assert row["hedge_funding_last_ts_ms"] == 800_000
+    assert row["entropy_reference_age_ms"] == pytest.approx(200.0)
+    assert row["hedge_reference_age_ms"] == pytest.approx(500.0)
+    assert row["reference_update_skew_ms"] == pytest.approx(300.0)
+    assert row["reference_basis_bps"] == pytest.approx(basis)
+    assert row["signed_executable_premium_bps"] == pytest.approx(
+        expected_signed_premium)
+    signed_residual = expected_signed_premium - basis
+    assert row["signed_residual_bps"] == pytest.approx(signed_residual)
+    assert row["residual_edge_bps"] == pytest.approx(
+        expected_residual_edge)
+    assert row["net_funding_bps_per_hour"] == pytest.approx(
+        expected_funding)
+
+
+def test_signal_missing_reference_keeps_original_signal_fields_blank():
+    path = os.path.join(tempfile.mkdtemp(), "signals.csv")
+    rec, _, _ = make_signal_recorder(path)
+
+    rec.observe(now=1000.0)
+    rec.close(now=1000.0)
+
+    row = read_signal_rows(path)[0]
+    assert row["event"] == "start"
+    assert row["top_edge_bps"]
+    assert row["plan_status"] == "ok"
+    for field in (
+            "entropy_oracle_px", "hedge_index_px",
+            "reference_basis_bps", "signed_residual_bps",
+            "residual_edge_bps", "net_funding_bps_per_hour"):
+        assert row[field] == ""
 
 
 def test_signal_freshness_uses_monotonic_time_when_wall_clock_rolls_back(
@@ -653,6 +892,147 @@ def test_signal_append_keeps_single_header():
         lines = fh.read().splitlines()
     assert lines.count(",".join(SIGNAL_HEADER)) == 1
     assert len(lines) == 5
+
+
+def test_signal_recorder_rotates_on_utc_day_boundary(monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    archive = tmp_path / "signals-20260910.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        archived_rows = list(csv.DictReader(fh))
+    current_rows = read_signal_rows(path)
+    assert [row["event"] for row in archived_rows] == ["start"]
+    assert [row["event"] for row in current_rows] == ["sample", "end"]
+
+
+def test_signal_recorder_recovers_existing_utc_day_before_rotating(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    first, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    first.observe(now=day_one)
+    first.close(now=day_one)
+
+    monotonic_clock[0] = 200.0
+    second, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    second.observe(now=day_one + 2)
+    second.close(now=day_one + 2)
+
+    archive = tmp_path / "signals-20260910.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        assert [row["event"] for row in csv.DictReader(fh)] == [
+            "start", "end"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "start", "end"]
+
+
+def test_signal_rotation_gzip_failure_keeps_raw_and_continues(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    original_gzip_open = gzip.open
+
+    def fail_writes(path, mode="rb", *args, **kwargs):
+        if "w" in mode:
+            raise OSError("disk full")
+        return original_gzip_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(gzip, "open", fail_writes)
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    raw = tmp_path / "signals-20260910.csv"
+    assert raw.exists()
+    assert [row["event"] for row in read_signal_rows(raw)] == ["start"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "sample", "end"]
+
+
+def test_signal_daily_rotation_can_be_disabled(monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_one = datetime(
+        2026, 9, 10, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(
+        str(path), rotate_daily=False)
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one)
+    rec.observe(now=day_one)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_one + 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_one + 2)
+    rec.observe(now=day_one + 2)
+    rec.close(now=day_one + 2)
+
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "start", "sample", "end"]
+    assert not list(tmp_path.glob("*.gz"))
+
+
+def test_signal_recorder_rotates_when_utc_date_moves_backward(
+        monkeypatch, tmp_path):
+    path = tmp_path / "signals.csv"
+    day_two = datetime(
+        2026, 9, 11, 0, 0, 1, tzinfo=timezone.utc).timestamp()
+    monotonic_clock = [100.0]
+    monkeypatch.setattr(
+        recorder_module.time, "monotonic", lambda: monotonic_clock[0])
+    rec, entropy, hedge = make_signal_recorder(str(path))
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_two)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_two)
+    rec.observe(now=day_two)
+    monotonic_clock[0] = 102.0
+    set_signal_book(entropy, bid=100.10, ask=100.11, ts=day_two - 2)
+    set_signal_book(hedge, bid=99.99, ask=100.00, ts=day_two - 2)
+
+    rec.observe(now=day_two - 2)
+    rec.close(now=day_two - 2)
+
+    archive = tmp_path / "signals-20260911.csv.gz"
+    assert archive.exists()
+    with gzip.open(archive, "rt", newline="", encoding="utf-8") as fh:
+        assert [row["event"] for row in csv.DictReader(fh)] == ["start"]
+    assert [row["event"] for row in read_signal_rows(path)] == [
+        "sample", "end"]
 
 
 def test_signal_rotates_old_header_before_writing():

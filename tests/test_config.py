@@ -16,6 +16,8 @@ from entropy_arb.config import (  # noqa: E402
     load_config,
     validate_output_paths,
 )
+from entropy_arb.runtime_paths import strategy_paths  # noqa: E402
+from entropy_arb.strategy import MarketIdentity  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 EXAMPLE = os.path.join(ROOT, "config.example.yaml")
@@ -50,7 +52,8 @@ def load(yaml_text: str, symbol="SNDK", hedge="lighter-rh",
 
 def test_example_config_loads():
     cfg = load_config(EXAMPLE, NO_ENV,
-                      symbol="SNDK", hedge_venue="lighter-rh")
+                      symbol="SNDK", hedge_venue="lighter-rh",
+                      record_only=True)
     assert cfg.symbol == "SNDK"
     assert cfg.entropy.kind == "hl" and cfg.entropy.hl_dex == "io"
     assert cfg.hedge_venue == "lighter-rh"
@@ -66,7 +69,7 @@ def test_example_config_loads():
 def test_hedge_symbol_can_differ_from_entropy_symbol():
     cfg = load_config(
         EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol="ANTHROPIC",
-        hedge_venue="lighter-rh")
+        hedge_venue="lighter-rh", record_only=True)
 
     assert cfg.symbol == "ANTH"
     assert cfg.entropy.symbol == "ANTH"
@@ -96,9 +99,11 @@ def test_hedge_symbol_rejects_embedded_control_characters():
 
 def test_example_config_uses_venue_specific_hedge_fee_defaults():
     lighter = load_config(EXAMPLE, NO_ENV,
-                          symbol="SNDK", hedge_venue="lighter-rh")
+                          symbol="SNDK", hedge_venue="lighter-rh",
+                          record_only=True)
     tradexyz = load_config(EXAMPLE, NO_ENV,
-                           symbol="SNDK", hedge_venue="tradexyz")
+                           symbol="SNDK", hedge_venue="tradexyz",
+                           record_only=True)
 
     assert lighter.hedge.fee_bps == 0.0
     assert tradexyz.hedge.fee_bps == 1.0
@@ -126,6 +131,84 @@ def test_minimal_defaults():
     assert cfg.entropy.fee_bps == 0.9
     assert cfg.recorder_enabled is True
     assert cfg.recorder_signal_csv == "logs/signals.csv"
+    assert cfg.recorder_signal_rotate_daily is True
+    assert cfg.reference_rest_recovery_sec == 15.0
+    assert cfg.reference_stale_sec == 60.0
+    assert cfg.reference_residual_alert_bps == 20.0
+    assert cfg.reference_residual_persist_sec == 30.0
+
+
+def test_missing_strategy_keeps_fixed_premium_mode():
+    cfg = load(MINIMAL)
+
+    assert cfg.strategy_mode == "fixed_premium"
+    assert cfg.strategy_live_enabled is False
+
+
+def test_example_enables_residual_shadow_defaults():
+    cfg = load_config(
+        EXAMPLE, NO_ENV, symbol="ANTH", hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh", record_only=True)
+
+    assert cfg.strategy_mode == "residual_dynamic"
+    assert cfg.strategy_window_minutes == 180
+    assert cfg.strategy_min_samples == 120
+    assert cfg.strategy_soft_hold_minutes == 60
+    assert cfg.strategy_hard_hold_minutes == 360
+    assert cfg.strategy_live_enabled is False
+    assert cfg.slippage_bootstrap_bps == 5.0
+    assert cfg.slippage_hard_max_bps == 20.0
+
+
+@pytest.mark.parametrize(("section", "needle"), [
+    ("strategy:\n  mode: other\n", "strategy.mode"),
+    ("strategy:\n  mode: residual_dynamic\n  min_samples: 181\n",
+     "min_samples"),
+    ("strategy:\n  mode: residual_dynamic\n  lower_quantile: 0.9\n"
+     "  upper_quantile: 0.1\n", "quantile"),
+    ("strategy:\n  mode: residual_dynamic\n  soft_hold_minutes: 360\n"
+     "  hard_hold_minutes: 60\n", "soft_hold_minutes"),
+    ("slippage:\n  min_bps: 21\n  hard_max_bps: 20\n",
+     "slippage.min_bps"),
+])
+def test_dynamic_config_rejects_invalid_cross_field_values(section, needle):
+    expect_error(MINIMAL + section, needle, record_only=True)
+
+
+def test_dynamic_live_requires_positive_persistence():
+    expect_error(
+        MINIMAL
+        + "strategy:\n  mode: residual_dynamic\n  live_enabled: true\n"
+        + "execution:\n  premium_persist_sec: 0\n",
+        "premium_persist_sec",
+    )
+
+
+def test_residual_live_requires_explicit_live_enabled():
+    expect_error(
+        MINIMAL
+        + "strategy:\n  mode: residual_dynamic\n  live_enabled: false\n",
+        "live_enabled",
+    )
+
+
+def test_reference_and_signal_rotation_can_be_overridden():
+    cfg = load(
+        MINIMAL
+        + "\nreference:\n"
+        + "  rest_recovery_sec: 5\n"
+        + "  stale_sec: 30\n"
+        + "  residual_alert_bps: 12.5\n"
+        + "  residual_persist_sec: 8\n"
+        + "recorder:\n"
+        + "  signal_rotate_daily: false\n"
+    )
+
+    assert cfg.reference_rest_recovery_sec == 5.0
+    assert cfg.reference_stale_sec == 30.0
+    assert cfg.reference_residual_alert_bps == 12.5
+    assert cfg.reference_residual_persist_sec == 8.0
+    assert cfg.recorder_signal_rotate_daily is False
 
 
 def test_recorder_signal_csv_can_be_overridden():
@@ -208,6 +291,66 @@ def test_record_only_rejects_signal_and_log_path_collision():
             + "logging:\n"
             + "  file: ./logs/shared.csv\n",
             record_only=True,
+        )
+
+
+def test_record_only_rejects_final_shadow_campaign_path_collision(tmp_path):
+    cfg = load_config(
+        EXAMPLE,
+        NO_ENV,
+        symbol="ANTH",
+        hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh",
+        record_only=True,
+        validate_outputs=False,
+    )
+    cfg.strategy_state_file = str(tmp_path / "campaign.json")
+    cfg.strategy_event_csv = str(tmp_path / "events.csv")
+    market = MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh")
+    paths = strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        market,
+        shadow=True,
+    )
+    cfg.recorder_csv = str(paths.campaign)
+    cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+
+    with pytest.raises(ConfigError, match="must use different paths"):
+        validate_output_paths(
+            cfg,
+            record_only=True,
+            log_file_active=False,
+        )
+
+
+def test_live_rejects_final_pending_state_path_collision(tmp_path):
+    cfg = load_config(
+        EXAMPLE,
+        NO_ENV,
+        symbol="ANTH",
+        hedge_symbol="ANTHROPIC",
+        hedge_venue="lighter-rh",
+        record_only=True,
+        validate_outputs=False,
+    )
+    cfg.strategy_state_file = str(tmp_path / "campaign.json")
+    cfg.strategy_event_csv = str(tmp_path / "events.csv")
+    cfg.recorder_enabled = False
+    market = MarketIdentity("ANTH", "io", "ANTHROPIC", "lighter-rh")
+    paths = strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        market,
+        shadow=False,
+    )
+    cfg.trades_csv = str(paths.pending)
+
+    with pytest.raises(ConfigError, match="must use different paths"):
+        validate_output_paths(
+            cfg,
+            record_only=False,
+            log_file_active=False,
         )
 
 
@@ -363,6 +506,8 @@ def test_unknown_key_rejected():
                  "unknown config key 'thresholdz'")
     expect_error(MINIMAL + "\nsizing:\n  take_fractionn: 0.5\n",
                  "sizing.take_fractionn")
+    expect_error(MINIMAL + "\nreference:\n  polling_sec: 5\n",
+                 "reference.polling_sec")
 
 
 def test_markets_no_longer_config_keys():
@@ -423,6 +568,10 @@ def test_nonpositive_band():
     ("execution:\n  reconcile_sec: 0\n", "reconcile_sec"),
     ("execution:\n  venue_probe_sec: 0\n", "venue_probe_sec"),
     ("execution:\n  http_keepalive_sec: -1\n", "http_keepalive_sec"),
+    ("reference:\n  rest_recovery_sec: 0\n", "rest_recovery_sec"),
+    ("reference:\n  stale_sec: 0\n", "reference.stale_sec"),
+    ("reference:\n  residual_alert_bps: -1\n", "residual_alert_bps"),
+    ("reference:\n  residual_persist_sec: -1\n", "residual_persist_sec"),
     ("logging:\n  status_interval_sec: 0\n", "status_interval_sec"),
     ("logging:\n  level: LOUD\n", "logging.level"),
 ])
@@ -432,6 +581,8 @@ def test_invalid_runtime_boundaries_are_rejected(section, needle):
 
 def test_nonfinite_numbers_are_rejected():
     expect_error(MINIMAL + "sizing:\n  max_order_notional_usd: .nan\n",
+                 "finite")
+    expect_error(MINIMAL + "reference:\n  residual_alert_bps: .nan\n",
                  "finite")
 
 

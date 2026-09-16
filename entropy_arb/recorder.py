@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .book import OrderBook, plan_arb
+from .csv_rotation import rotate_csv_gzip
+from .reference import ReferenceState, calculate_reference_metrics
 
 log = logging.getLogger("recorder")
 
@@ -46,7 +48,19 @@ HEADER = ["minute_ts", "time_utc", "entropy_symbol", "entropy_dex",
           "premium_open_bps", "premium_high_bps", "premium_low_bps",
           "premium_close_bps", "premium_mean_bps", "premium_std_bps",
           "sell_edge_mean_bps", "sell_edge_max_bps",
-          "buy_edge_mean_bps", "buy_edge_max_bps", "samples"]
+          "buy_edge_mean_bps", "buy_edge_max_bps",
+          "entropy_oracle_px", "entropy_index_px", "entropy_mark_px",
+          "entropy_funding_current_bps_per_hour",
+          "entropy_funding_last_bps_per_hour",
+          "entropy_funding_last_ts_ms", "entropy_reference_age_ms",
+          "hedge_oracle_px", "hedge_index_px", "hedge_mark_px",
+          "hedge_funding_current_bps_per_hour",
+          "hedge_funding_last_bps_per_hour", "hedge_funding_last_ts_ms",
+          "hedge_reference_age_ms", "reference_update_skew_ms",
+          "reference_basis_close_bps",
+          "funding_diff_close_bps_per_hour", "residual_open_bps",
+          "residual_high_bps", "residual_low_bps", "residual_close_bps",
+          "residual_mean_bps", "residual_std_bps", "samples"]
 
 SIGNAL_HEADER = [
     "ts_ms", "time_utc", "entropy_symbol", "entropy_dex",
@@ -60,6 +74,16 @@ SIGNAL_HEADER = [
     "crossable_notional_usd", "buy_depth_slippage_bps",
     "sell_depth_slippage_bps", "leg_slippage_limit_bps",
     "expected_edge_usd",
+    "entropy_oracle_px", "entropy_mark_px",
+    "entropy_funding_current_bps_per_hour",
+    "entropy_funding_last_bps_per_hour", "entropy_funding_last_ts_ms",
+    "entropy_reference_age_ms", "hedge_index_px", "hedge_mark_px",
+    "hedge_funding_current_bps_per_hour",
+    "hedge_funding_last_bps_per_hour", "hedge_funding_last_ts_ms",
+    "hedge_reference_age_ms", "reference_update_skew_ms",
+    "reference_basis_bps", "signed_executable_premium_bps",
+    "signed_residual_bps", "residual_edge_bps",
+    "net_funding_bps_per_hour",
 ]
 
 
@@ -144,13 +168,71 @@ def _valid_signal_tail(path: str) -> bool:
     event_id_index = SIGNAL_HEADER.index("event_id")
     event_index = SIGNAL_HEADER.index("event")
     return bool(timestamp_ok and row[event_id_index]
-                and row[event_index] in {"start", "sample", "end"})
+                and row[event_index]
+                in {"start", "sample", "end", "snapshot"})
+
+
+def _reference_observation(
+        entropy: Optional[ReferenceState],
+        hedge: Optional[ReferenceState], now_mono: float) -> dict:
+    e_snapshot = entropy.snapshot if entropy is not None else None
+    h_snapshot = hedge.snapshot if hedge is not None else None
+    e_age = entropy.age_ms(now_mono) if entropy is not None else None
+    h_age = hedge.age_ms(now_mono) if hedge is not None else None
+    skew = None
+    if (e_snapshot is not None and e_snapshot.source
+            and h_snapshot is not None and h_snapshot.source):
+        skew = abs(e_snapshot.received_mono - h_snapshot.received_mono) * 1000.0
+    basis = None
+    if (e_snapshot is not None and e_snapshot.oracle_px is not None
+            and h_snapshot is not None and h_snapshot.index_px is not None):
+        basis = (e_snapshot.oracle_px / h_snapshot.index_px - 1.0) * 1e4
+    funding_diff = None
+    if (e_snapshot is not None
+            and e_snapshot.funding_current_bps_per_hour is not None
+            and h_snapshot is not None
+            and h_snapshot.funding_current_bps_per_hour is not None):
+        funding_diff = (e_snapshot.funding_current_bps_per_hour
+                        - h_snapshot.funding_current_bps_per_hour)
+
+    def value(snapshot, field):
+        if snapshot is None:
+            return None
+        return getattr(snapshot, field)
+
+    return {
+        "entropy_oracle_px": value(e_snapshot, "oracle_px"),
+        "entropy_index_px": value(e_snapshot, "index_px"),
+        "entropy_mark_px": value(e_snapshot, "mark_px"),
+        "entropy_funding_current_bps_per_hour": value(
+            e_snapshot, "funding_current_bps_per_hour"),
+        "entropy_funding_last_bps_per_hour": value(
+            e_snapshot, "funding_last_bps_per_hour"),
+        "entropy_funding_last_ts_ms": value(
+            e_snapshot, "funding_last_ts_ms"),
+        "entropy_reference_age_ms": e_age,
+        "hedge_oracle_px": value(h_snapshot, "oracle_px"),
+        "hedge_index_px": value(h_snapshot, "index_px"),
+        "hedge_mark_px": value(h_snapshot, "mark_px"),
+        "hedge_funding_current_bps_per_hour": value(
+            h_snapshot, "funding_current_bps_per_hour"),
+        "hedge_funding_last_bps_per_hour": value(
+            h_snapshot, "funding_last_bps_per_hour"),
+        "hedge_funding_last_ts_ms": value(
+            h_snapshot, "funding_last_ts_ms"),
+        "hedge_reference_age_ms": h_age,
+        "reference_update_skew_ms": skew,
+        "reference_basis_bps": basis,
+        "funding_diff_bps_per_hour": funding_diff,
+    }
 
 
 class _MinuteAgg:
     __slots__ = ("minute", "n", "p_open", "p_high", "p_low", "p_close",
                  "p_sum", "p_sumsq", "s_sum", "s_max", "b_sum", "b_max",
-                 "e_bid", "e_ask", "h_bid", "h_ask")
+                 "e_bid", "e_ask", "h_bid", "h_ask", "reference_close",
+                 "r_n", "r_open", "r_high", "r_low", "r_close",
+                 "r_sum", "r_sumsq")
 
     def __init__(self, minute: int) -> None:
         self.minute = minute
@@ -162,8 +244,13 @@ class _MinuteAgg:
         self.b_sum = 0.0
         self.b_max = -math.inf
         self.e_bid = self.e_ask = self.h_bid = self.h_ask = 0.0
+        self.reference_close = {}
+        self.r_n = 0
+        self.r_open = self.r_high = self.r_low = self.r_close = 0.0
+        self.r_sum = self.r_sumsq = 0.0
 
-    def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float) -> None:
+    def add(self, e_bid: float, e_ask: float, h_bid: float, h_ask: float,
+            reference: Optional[dict] = None) -> None:
         e_mid = (e_bid + e_ask) / 2.0
         h_mid = (h_bid + h_ask) / 2.0
         prem = (e_mid / h_mid - 1.0) * 1e4
@@ -182,31 +269,81 @@ class _MinuteAgg:
         self.b_sum += buy_edge
         self.b_max = max(self.b_max, buy_edge)
         self.e_bid, self.e_ask, self.h_bid, self.h_ask = e_bid, e_ask, h_bid, h_ask
+        if reference is not None:
+            self.reference_close = reference
+            basis = reference["reference_basis_bps"]
+            if basis is not None:
+                residual = prem - basis
+                if self.r_n == 0:
+                    self.r_open = self.r_high = self.r_low = residual
+                self.r_n += 1
+                self.r_high = max(self.r_high, residual)
+                self.r_low = min(self.r_low, residual)
+                self.r_close = residual
+                self.r_sum += residual
+                self.r_sumsq += residual * residual
 
     def row(self, entropy_symbol: str, entropy_dex: str,
             hedge_symbol: str, hedge_venue: str) -> list:
         mean = self.p_sum / self.n
         var = max(self.p_sumsq / self.n - mean * mean, 0.0)
         ts = self.minute * 60
-        return [ts,
-                datetime.fromtimestamp(ts, tz=timezone.utc)
-                .strftime("%Y-%m-%dT%H:%M:%SZ"),
-                entropy_symbol, entropy_dex, hedge_symbol, hedge_venue,
-                f"{self.e_bid:.10g}", f"{self.e_ask:.10g}",
-                f"{self.h_bid:.10g}", f"{self.h_ask:.10g}",
-                f"{self.p_open:.3f}", f"{self.p_high:.3f}",
-                f"{self.p_low:.3f}", f"{self.p_close:.3f}",
-                f"{mean:.3f}", f"{math.sqrt(var):.3f}",
-                f"{self.s_sum / self.n:.3f}", f"{self.s_max:.3f}",
-                f"{self.b_sum / self.n:.3f}", f"{self.b_max:.3f}",
-                self.n]
+        values = {
+            "minute_ts": ts,
+            "time_utc": datetime.fromtimestamp(ts, tz=timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "entropy_symbol": entropy_symbol,
+            "entropy_dex": entropy_dex,
+            "hedge_symbol": hedge_symbol,
+            "hedge_venue": hedge_venue,
+            "entropy_bid": f"{self.e_bid:.10g}",
+            "entropy_ask": f"{self.e_ask:.10g}",
+            "hedge_bid": f"{self.h_bid:.10g}",
+            "hedge_ask": f"{self.h_ask:.10g}",
+            "premium_open_bps": f"{self.p_open:.3f}",
+            "premium_high_bps": f"{self.p_high:.3f}",
+            "premium_low_bps": f"{self.p_low:.3f}",
+            "premium_close_bps": f"{self.p_close:.3f}",
+            "premium_mean_bps": f"{mean:.3f}",
+            "premium_std_bps": f"{math.sqrt(var):.3f}",
+            "sell_edge_mean_bps": f"{self.s_sum / self.n:.3f}",
+            "sell_edge_max_bps": f"{self.s_max:.3f}",
+            "buy_edge_mean_bps": f"{self.b_sum / self.n:.3f}",
+            "buy_edge_max_bps": f"{self.b_max:.3f}",
+            "samples": self.n,
+        }
+        for field, value in self.reference_close.items():
+            if field == "reference_basis_bps":
+                values["reference_basis_close_bps"] = (
+                    "" if value is None else f"{value:.3f}")
+            elif field == "funding_diff_bps_per_hour":
+                values["funding_diff_close_bps_per_hour"] = (
+                    "" if value is None else f"{value:.6g}")
+            elif field.endswith("_ts_ms"):
+                values[field] = "" if value is None else str(value)
+            elif field in HEADER:
+                values[field] = "" if value is None else f"{value:.10g}"
+        if self.r_n:
+            r_mean = self.r_sum / self.r_n
+            r_var = max(self.r_sumsq / self.r_n - r_mean * r_mean, 0.0)
+            values.update({
+                "residual_open_bps": f"{self.r_open:.3f}",
+                "residual_high_bps": f"{self.r_high:.3f}",
+                "residual_low_bps": f"{self.r_low:.3f}",
+                "residual_close_bps": f"{self.r_close:.3f}",
+                "residual_mean_bps": f"{r_mean:.3f}",
+                "residual_std_bps": f"{math.sqrt(r_var):.3f}",
+            })
+        return [values.get(field, "") for field in HEADER]
 
 
 class MinuteRecorder:
     def __init__(self, path: str, entropy_book: OrderBook, hedge_book: OrderBook,
                  staleness_sec: float, interval_sec: float = 1.0, *,
                  entropy_symbol: str = "", entropy_dex: str = "",
-                 hedge_symbol: str = "", hedge_venue: str = "") -> None:
+                 hedge_symbol: str = "", hedge_venue: str = "",
+                 entropy_reference: Optional[ReferenceState] = None,
+                 hedge_reference: Optional[ReferenceState] = None) -> None:
         self.path = path
         self.entropy_book = entropy_book
         self.hedge_book = hedge_book
@@ -216,6 +353,8 @@ class MinuteRecorder:
         self.entropy_dex = entropy_dex
         self.hedge_symbol = hedge_symbol
         self.hedge_venue = hedge_venue
+        self.entropy_reference = entropy_reference
+        self.hedge_reference = hedge_reference
         self.rows_written = 0
         self._agg: Optional[_MinuteAgg] = None
         self._fh = None
@@ -271,7 +410,9 @@ class MinuteRecorder:
             return
         if self._agg is None:
             self._agg = _MinuteAgg(minute)
-        self._agg.add(e_bid, e_ask, h_bid, h_ask)
+        reference = _reference_observation(
+            self.entropy_reference, self.hedge_reference, time.monotonic())
+        self._agg.add(e_bid, e_ask, h_bid, h_ask, reference)
 
     def close(self) -> None:
         """Flush the partial minute and close the file (call on shutdown)."""
@@ -345,7 +486,8 @@ class SignalRecorder:
                  leg_slippage_bps: float, staleness_sec: float,
                  entropy_symbol: str, entropy_dex: str,
                  hedge_symbol: str, hedge_venue: str,
-                 sample_sec: float = 1.0) -> None:
+                 sample_sec: float = 1.0,
+                 signal_rotate_daily: bool = True) -> None:
         self.path = path
         self.entropy = entropy
         self.hedge = hedge
@@ -364,13 +506,17 @@ class SignalRecorder:
         self.entropy_dex = entropy_dex
         self.hedge_symbol = hedge_symbol
         self.hedge_venue = hedge_venue
+        self.signal_rotate_daily = signal_rotate_daily
         self.rows_written = 0
         self._states = {"sell_entropy": None, "buy_entropy": None}
         self._event_seq = {"sell_entropy": 0, "buy_entropy": 0}
+        self._snapshot_seq = 0
+        self._last_snapshot_mono = None
         self._run_id = uuid.uuid4().hex
         self._pending_rows = deque()
         self._fh = None
         self._writer = None
+        self._current_utc_day = None
         self._closed = False
         self._serialization_failed = False
 
@@ -386,6 +532,15 @@ class SignalRecorder:
                             "rotated to %s",
                             self.path, old_path)
                 os.replace(self.path, old_path)
+        if (self._current_utc_day is None and os.path.exists(self.path)
+                and os.path.getsize(self.path) > 0):
+            last_row = _last_csv_row(self.path)
+            if last_row and last_row != SIGNAL_HEADER:
+                ts_index = SIGNAL_HEADER.index("ts_ms")
+                self._current_utc_day = datetime.fromtimestamp(
+                    float(last_row[ts_index]) / 1000.0,
+                    tz=timezone.utc,
+                ).date()
         new = not os.path.exists(self.path) or os.path.getsize(self.path) == 0
         self._fh = open(self.path, "a", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._fh, fieldnames=SIGNAL_HEADER)
@@ -393,6 +548,28 @@ class SignalRecorder:
             self._writer.writeheader()
             self._fh.flush()
         log.info("recording signal lifecycles -> %s", self.path)
+
+    def _rotate_before(self, row: dict) -> None:
+        row_day = datetime.fromtimestamp(
+            float(row["ts_ms"]) / 1000.0, tz=timezone.utc).date()
+        if self._current_utc_day is None:
+            self._current_utc_day = row_day
+            return
+        if (not self.signal_rotate_daily
+                or row_day == self._current_utc_day):
+            return
+        self._fh.flush()
+        self._fh.close()
+        self._fh = self._writer = None
+        result = rotate_csv_gzip(self.path, self._current_utc_day)
+        if not result.compressed:
+            log.warning(
+                "signal archive compression failed; raw CSV preserved at %s",
+                result.archive_path,
+            )
+        self._current_utc_day = None
+        self._open()
+        self._current_utc_day = row_day
 
     def _books_status(self, now: float) -> Optional[str]:
         books = (self.entropy.book, self.hedge.book)
@@ -438,6 +615,33 @@ class SignalRecorder:
             )
         else:
             plan_status = invalid
+        reference = _reference_observation(
+            self.entropy.reference, self.hedge.reference, mono_now)
+        reference_fields = {
+            field: "" if reference[field] is None else reference[field]
+            for field in (
+                "entropy_oracle_px", "entropy_mark_px",
+                "entropy_funding_current_bps_per_hour",
+                "entropy_funding_last_bps_per_hour",
+                "entropy_funding_last_ts_ms", "entropy_reference_age_ms",
+                "hedge_index_px", "hedge_mark_px",
+                "hedge_funding_current_bps_per_hour",
+                "hedge_funding_last_bps_per_hour",
+                "hedge_funding_last_ts_ms", "hedge_reference_age_ms",
+                "reference_update_skew_ms",
+            )
+        }
+        reference_metrics = None
+        if None not in (e_bid, e_ask, h_bid, h_ask):
+            reference_metrics = calculate_reference_metrics(
+                direction=direction,
+                entropy_bid=e_bid,
+                entropy_ask=e_ask,
+                hedge_bid=h_bid,
+                hedge_ask=h_ask,
+                entropy=self.entropy.reference.snapshot,
+                hedge=self.hedge.reference.snapshot,
+            )
         row = {
             "entropy_bid": "" if e_bid is None else e_bid,
             "entropy_ask": "" if e_ask is None else e_ask,
@@ -460,7 +664,16 @@ class SignalRecorder:
             "total_fee_bps": buy.fee_bps + sell.fee_bps,
             "plan_status": plan_status,
             "leg_slippage_limit_bps": self.leg_slippage_bps,
+            **reference_fields,
         }
+        if reference_metrics is not None:
+            for field in (
+                    "reference_basis_bps",
+                    "signed_executable_premium_bps",
+                    "signed_residual_bps", "residual_edge_bps",
+                    "net_funding_bps_per_hour"):
+                value = getattr(reference_metrics, field)
+                row[field] = "" if value is None else value
         if plan is not None:
             row.update({
                 "qty": plan.qty,
@@ -511,6 +724,40 @@ class SignalRecorder:
         })
         self._pending_rows.append(row)
 
+    def _top_common_notional(self) -> Optional[float]:
+        levels = (
+            self.entropy.book.sorted_bids(),
+            self.entropy.book.sorted_asks(),
+            self.hedge.book.sorted_bids(),
+            self.hedge.book.sorted_asks(),
+        )
+        if any(not side for side in levels):
+            return None
+        return min(side[0][0] * side[0][1] for side in levels)
+
+    def _queue_snapshot(self, wall_now: float, mono_now: float) -> None:
+        self._snapshot_seq += 1
+        row = {name: "" for name in SIGNAL_HEADER}
+        row.update(self._snapshot("sell_entropy", wall_now))
+        common_notional = self._top_common_notional()
+        row.update({
+            "ts_ms": int(wall_now * 1000),
+            "time_utc": datetime.fromtimestamp(wall_now, tz=timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "entropy_symbol": self.entropy_symbol,
+            "entropy_dex": self.entropy_dex,
+            "hedge_symbol": self.hedge_symbol,
+            "hedge_venue": self.hedge_venue,
+            "event_id": (
+                f"snapshot-{int(wall_now * 1000)}-{self._run_id}-"
+                f"{self._snapshot_seq}"),
+            "event": "snapshot",
+            "direction": "",
+            "crossable_notional_usd": (
+                "" if common_notional is None else common_notional),
+        })
+        self._pending_rows.append(row)
+
     def _flush_pending(self) -> None:
         if not self._pending_rows:
             return
@@ -519,6 +766,7 @@ class SignalRecorder:
         while self._pending_rows:
             row = self._pending_rows.popleft()
             try:
+                self._rotate_before(row)
                 self._writer.writerow(row)
             except BaseException:
                 self._serialization_failed = True
@@ -530,6 +778,7 @@ class SignalRecorder:
                 flush: bool = True) -> None:
         wall_now = time.time() if now is None else now
         mono_now = time.monotonic()
+        pending_before = len(self._pending_rows)
         for direction in self._states:
             active = self._states[direction]
             qualifies, end_reason = self._qualifies(direction, wall_now)
@@ -556,6 +805,14 @@ class SignalRecorder:
                     "end", direction, active, wall_now, mono_now,
                     end_reason)
                 self._states[direction] = None
+        if len(self._pending_rows) > pending_before:
+            self._last_snapshot_mono = mono_now
+        elif (not any(self._states.values())
+              and (self._last_snapshot_mono is None
+                   or mono_now - self._last_snapshot_mono
+                   >= self.sample_sec)):
+            self._queue_snapshot(wall_now, mono_now)
+            self._last_snapshot_mono = mono_now
         if flush:
             self._flush_pending()
 
@@ -597,7 +854,12 @@ class SignalRecorder:
         active = [state for state in self._states.values()
                   if state is not None]
         if not active:
-            return 3600.0
+            if self._last_snapshot_mono is None:
+                return 0.001
+            return max(
+                self._last_snapshot_mono + self.sample_sec - mono_now,
+                0.001,
+            )
         due = min(state.last_written_mono + self.sample_sec
                   for state in active)
         return max(due - mono_now, 0.001)

@@ -8,9 +8,9 @@ The signal is a fixed band around a configured midline (config.yaml):
 Around the signal: per-direction persistence arming,
 per-venue inventory ladder + position caps, per-venue order budgets and
 reactive rate-limit exclusion, net-delta hedging, venue-outage pausing with
-probing, and periodic on-chain reconciliation. There is no paper mode: the
-bot either trades live or runs --record-only (data collection, no strategy).
-Both venues' books are recorded to 1-minute CSV bars throughout.
+probing, and periodic on-chain reconciliation. ``--record-only`` also runs
+the dynamic residual strategy as an isolated shadow campaign when selected;
+it never sends orders. Both books are recorded to 1-minute CSV bars.
 """
 from __future__ import annotations
 
@@ -20,15 +20,29 @@ import logging
 import math
 import os
 import time
+import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 import aiohttp
 
-from .book import ArbPlan, floor_step, plan_arb
+from .book import ArbPlan, floor_step, plan_arb, walk_depth
+from .campaign import (
+    CampaignRecoveryError,
+    CampaignStateError,
+    CampaignStore,
+    PositionCampaign,
+    reconcile_campaign,
+)
 from .config import Config
+from .live_lock import LiveProcessLock
 from .models import OrderResult
+from .reference import (
+    InvalidReference,
+    ReferenceAlertState,
+    calculate_reference_metrics,
+)
 from .recorder import (
     MinuteRecorder,
     SignalRecorder,
@@ -36,6 +50,25 @@ from .recorder import (
     csv_tail_complete,
     next_archive_path,
 )
+from .recovery_state import (
+    PendingAuditContext,
+    PendingExecutionState,
+    PendingExecutionStateError,
+    PendingExecutionStore,
+    PendingLegState,
+    pending_execution_path,
+)
+from .runtime_paths import StrategyPaths, strategy_paths
+from .slippage import SlippageModel
+from .strategy import (
+    DynamicResidualStrategy,
+    MarketIdentity,
+    MarketView,
+    ResidualModel,
+    StrategyDecision,
+    warm_start_residual_model,
+)
+from .strategy_recorder import StrategyEvent, StrategyEventRecorder
 from .venues.base import VenueAdapter
 from .venues.registry import VenueRuntime, create_venue
 
@@ -66,6 +99,20 @@ class _PendingOrderConfirmation:
     is_buy: bool
     applied_fill: float
     is_residual_hedge: bool = False
+    dynamic_execution: Optional["_PendingDynamicExecution"] = None
+    dynamic_side: str = ""
+
+
+@dataclass
+class _PendingDynamicExecution:
+    execution_id: str
+    decision: StrategyDecision
+    buy: VenueAdapter
+    sell: VenueAdapter
+    buy_result: OrderResult
+    sell_result: OrderResult
+    audit_ok: bool = False
+    applied: bool = False
 
 
 class Engine:
@@ -80,6 +127,17 @@ class Engine:
         self.venues: Dict[str, VenueAdapter] = {}
         self.recorder: Optional[MinuteRecorder] = None
         self.signal_recorder: Optional[SignalRecorder] = None
+        self.strategy_events: Optional[StrategyEventRecorder] = None
+        self.residual_model: Optional[ResidualModel] = None
+        self.dynamic_strategy: Optional[DynamicResidualStrategy] = None
+        self.campaign_store: Optional[CampaignStore] = None
+        self.pending_execution_store: Optional[PendingExecutionStore] = None
+        self._startup_pending_execution: Optional[
+            PendingExecutionState] = None
+        self.campaign: Optional[PositionCampaign] = None
+        self.model_warm_start = None
+        self._live_lock: Optional[LiveProcessLock] = None
+        self._campaign_recovery_blocked = False
         self._recorder_task: Optional[asyncio.Task] = None
         self._signal_task: Optional[asyncio.Task] = None
         self._primary_error: Optional[BaseException] = None
@@ -91,6 +149,7 @@ class Engine:
         self.stop = asyncio.Event()
         self._feed_stop = asyncio.Event()
         self._update_evt = asyncio.Event()
+        self._strategy_evt = asyncio.Event()
         self._reconcile_evt = asyncio.Event()
         # per-venue locks: an execution holds both; a reconcile holds one, so
         # a chain read can never race an in-flight order on that venue
@@ -126,6 +185,11 @@ class Engine:
         self._last_skiplog = 0.0
         self._poke_due: Optional[float] = None
         self._reconcile_due: Optional[float] = None
+        self._dynamic_last_action_mono = 0.0
+        self._dynamic_pending_minute: Optional[int] = None
+        self._dynamic_pending_residual: Optional[float] = None
+        self._dynamic_pending_valid = False
+        self._last_model_event_minute: Optional[int] = None
         # per-direction persistence arming: direction key -> first-seen ts
         self._armed: Dict[str, Optional[float]] = {"sell_entropy": None,
                                                    "buy_entropy": None}
@@ -144,6 +208,9 @@ class Engine:
         self._venue_fetch_fails: Dict[str, int] = {}
         # per-execution records for the dashboard (newest last)
         self.recent_trades: deque = deque(maxlen=50)
+        self._reference_alerts = ReferenceAlertState(
+            alert_bps=cfg.reference_residual_alert_bps,
+            persist_sec=cfg.reference_residual_persist_sec)
 
     # ------------------------------------------------------------- utilities
 
@@ -176,7 +243,9 @@ class Engine:
     def _register_unresolved_order(
             self, venue: VenueAdapter, result: OrderResult, *,
             is_buy: bool, applied_fill: float,
-            is_residual_hedge: bool = False) -> None:
+            is_residual_hedge: bool = False,
+            dynamic_execution: Optional[_PendingDynamicExecution] = None,
+            dynamic_side: str = "") -> None:
         if result.order_ref is None:
             self._unreferenced_unknown = True
             self._auto_repair_disabled = True
@@ -193,6 +262,8 @@ class Engine:
                 is_buy=is_buy,
                 applied_fill=applied_fill,
                 is_residual_hedge=is_residual_hedge,
+                dynamic_execution=dynamic_execution,
+                dynamic_side=dynamic_side,
             ))
         self._post_order_recovery_active = True
 
@@ -221,6 +292,7 @@ class Engine:
     def request_stop(self) -> None:
         self.stop.set()
         self._update_evt.set()
+        self._strategy_evt.set()
         self._reconcile_evt.set()
 
     def _remember_error(self, label: str, error: BaseException) -> None:
@@ -285,6 +357,7 @@ class Engine:
 
     def _record_only_book_update(self, *_args) -> None:
         self._update_evt.set()
+        self._strategy_evt.set()
         if self.signal_recorder is not None:
             try:
                 self.signal_recorder.observe(flush=False)
@@ -305,6 +378,7 @@ class Engine:
             self, source: str = "book",
             venue_key: Optional[str] = None) -> None:
         self._update_evt.set()
+        self._strategy_evt.set()
         if source == "order":
             keys = (venue_key,) if venue_key is not None else tuple(self.venues)
             for key in keys:
@@ -332,6 +406,8 @@ class Engine:
             self.recorder = MinuteRecorder(
                 cfg.recorder_csv, self.entropy.book, self.hedge.book,
                 cfg.staleness_sec,
+                entropy_reference=self.entropy.reference,
+                hedge_reference=self.hedge.reference,
                 entropy_symbol=cfg.entropy.symbol,
                 entropy_dex=cfg.entropy.hl_dex,
                 hedge_symbol=cfg.hedge.symbol,
@@ -360,11 +436,1036 @@ class Engine:
                 entropy_dex=cfg.entropy.hl_dex,
                 hedge_symbol=cfg.hedge.symbol,
                 hedge_venue=cfg.hedge_venue,
+                signal_rotate_daily=cfg.recorder_signal_rotate_daily,
             )
             self._signal_task = asyncio.create_task(
                 self.signal_recorder.run(self.stop, self._update_evt),
                 name="signal-recorder")
             self._track_task(tasks, self._signal_task)
+
+    def _market_identity(self) -> MarketIdentity:
+        return MarketIdentity(
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+        )
+
+    @staticmethod
+    def _reject_legacy_strategy_state(paths: StrategyPaths) -> None:
+        candidates = [(paths.legacy_campaign, paths.campaign)]
+        if paths.legacy_pending is not None and paths.pending is not None:
+            candidates.append((paths.legacy_pending, paths.pending))
+        for legacy, current in candidates:
+            if (os.path.abspath(legacy) != os.path.abspath(current)
+                    and legacy.exists()):
+                raise RuntimeError(
+                    "legacy unscoped strategy state exists; verify exchange "
+                    "positions, then move it manually before restart: "
+                    f"{legacy} -> {current}")
+
+    def _initialize_dynamic_strategy(
+            self, *, now_wall: Optional[float] = None) -> None:
+        """Create the residual model, shadow/live state and event journal."""
+        if self.cfg.strategy_mode != "residual_dynamic":
+            return
+        if self.dynamic_strategy is not None:
+            raise RuntimeError("dynamic strategy is already initialized")
+        cfg = self.cfg
+        paths = strategy_paths(
+            cfg.strategy_state_file,
+            cfg.strategy_event_csv,
+            self._market_identity(),
+            shadow=self.record_only,
+        )
+        self._reject_legacy_strategy_state(paths)
+        wall = time.time() if now_wall is None else now_wall
+        self.residual_model = ResidualModel(
+            window_minutes=cfg.strategy_window_minutes,
+            min_samples=cfg.strategy_min_samples,
+            lower_quantile=cfg.strategy_lower_quantile,
+            upper_quantile=cfg.strategy_upper_quantile,
+            regime_window_minutes=cfg.strategy_regime_window_minutes,
+            recovery_minutes=cfg.strategy_regime_recovery_minutes,
+        )
+        self.model_warm_start = warm_start_residual_model(
+            self.residual_model,
+            path=cfg.recorder_csv,
+            identity=self._market_identity(),
+            now_minute=int(wall // 60),
+            max_age_sec=cfg.strategy_entry_reference_max_age_sec,
+            max_skew_sec=cfg.strategy_entry_reference_max_skew_sec,
+        )
+        slippage = SlippageModel(
+            bootstrap_bps=cfg.slippage_bootstrap_bps,
+            min_bps=cfg.slippage_min_bps,
+            safety_bps=cfg.slippage_safety_bps,
+            hard_max_bps=cfg.slippage_hard_max_bps,
+            min_live_samples=cfg.slippage_min_live_samples,
+        )
+        self.dynamic_strategy = DynamicResidualStrategy(
+            slippage=slippage,
+            reference_max_age_sec=(
+                cfg.strategy_entry_reference_max_age_sec),
+            reference_max_skew_sec=(
+                cfg.strategy_entry_reference_max_skew_sec),
+            exit_band_fraction=cfg.strategy_exit_band_fraction,
+            min_exit_band_bps=cfg.strategy_min_exit_band_bps,
+            min_expected_profit_bps=cfg.strategy_min_expected_profit_bps,
+            soft_hold_sec=cfg.strategy_soft_hold_minutes * 60.0,
+            hard_hold_sec=cfg.strategy_hard_hold_minutes * 60.0,
+            hard_slippage_bps=cfg.slippage_hard_max_bps,
+            max_edge_fraction=cfg.slippage_max_edge_fraction,
+        )
+        self.campaign_store = CampaignStore(str(paths.campaign), shadow=False)
+        if paths.pending is not None:
+            self.pending_execution_store = PendingExecutionStore(paths.pending)
+        if self.record_only:
+            self._load_dynamic_campaign()
+        self.strategy_events = StrategyEventRecorder(paths.events)
+
+        log.info(
+            "dynamic residual model warm start: accepted=%d "
+            "identity_rejected=%d reference_rejected=%d value_rejected=%d "
+            "time_rejected=%d",
+            self.model_warm_start.accepted,
+            self.model_warm_start.rejected_identity,
+            self.model_warm_start.rejected_reference,
+            self.model_warm_start.rejected_value,
+            self.model_warm_start.rejected_time,
+        )
+
+    def _load_dynamic_campaign(self) -> None:
+        self.campaign = self.campaign_store.load()
+        if (self.campaign is not None
+                and self.campaign.identity != self._market_identity()):
+            raise CampaignStateError(
+                "saved campaign market identity does not match config")
+        expected_mode = "shadow" if self.record_only else "live"
+        if (self.campaign is not None
+                and self.campaign.mode != expected_mode):
+            raise CampaignStateError(
+                "saved campaign mode does not match engine mode")
+
+    def _load_pending_execution_state(self) -> None:
+        if self.pending_execution_store is None:
+            return
+        pending = self.pending_execution_store.load()
+        if pending is None:
+            return
+        if pending.identity != self._market_identity():
+            raise PendingExecutionStateError(
+                "saved pending execution market identity does not match "
+                "config")
+        recoverable = (pending.audit_ok and all(
+            not leg.unresolved or leg.order_ref is not None
+            for leg in (pending.buy, pending.sell)))
+        self._campaign_recovery_blocked = True
+        self._pause_for_recovery(
+            f"recovering pending dynamic execution {pending.execution_id}")
+        if recoverable:
+            self._startup_pending_execution = pending
+            self._pending_snapshot_venues.update(
+                (pending.buy.venue_key, pending.sell.venue_key))
+            self._shutdown_reconcile_required = True
+            log.warning(
+                "saved pending dynamic execution will be resolved before "
+                "trading resumes: execution=%s intent=%s buy_ref=%s "
+                "sell_ref=%s",
+                pending.execution_id, pending.intent,
+                pending.buy.order_ref or "<terminal>",
+                pending.sell.order_ref or "<terminal>")
+            return
+        self._auto_repair_disabled = True
+        log.critical(
+            "saved pending dynamic execution blocks live trading: "
+            "execution=%s intent=%s buy_ref=%s sell_ref=%s; verify both "
+            "exchange orders and positions before clearing %s",
+            pending.execution_id, pending.intent,
+            pending.buy.order_ref or "<not-recorded>",
+            pending.sell.order_ref or "<not-recorded>",
+            self.pending_execution_store.path,
+        )
+
+    @staticmethod
+    def _pending_leg_state(venue, *, is_buy: bool,
+                           result: Optional[OrderResult] = None,
+                           applied_fill: float = 0.0) -> PendingLegState:
+        if result is None:
+            return PendingLegState(
+                venue_key=venue.key, is_buy=is_buy, order_ref=None,
+                status="sending", filled_base=0.0, avg_px=None,
+                applied_fill=0.0, unresolved=True)
+        return PendingLegState(
+            venue_key=venue.key,
+            is_buy=is_buy,
+            order_ref=result.order_ref,
+            status=result.status,
+            filled_base=result.filled_base,
+            avg_px=result.avg_px,
+            applied_fill=applied_fill,
+            unresolved=result.unresolved,
+        )
+
+    def _pending_execution_with_results(
+            self, pending: PendingExecutionState, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult,
+            audit_ok: bool, campaign_applied: bool,
+            now_wall: float) -> PendingExecutionState:
+        settled_at = None
+        if not buy_result.unresolved and not sell_result.unresolved:
+            settled_at = (
+                pending.settled_at
+                if pending.settled_at is not None
+                else max(now_wall, pending.decided_at))
+        return replace(
+            pending,
+            buy=self._pending_leg_state(
+                buy, is_buy=True, result=buy_result,
+                applied_fill=buy_result.filled_base),
+            sell=self._pending_leg_state(
+                sell, is_buy=False, result=sell_result,
+                applied_fill=sell_result.filled_base),
+            audit_ok=audit_ok,
+            campaign_applied=campaign_applied,
+            settled_at=settled_at,
+        )
+
+    def _load_matching_pending_execution(
+            self, execution_id: str) -> PendingExecutionState:
+        if self.pending_execution_store is None:
+            raise RuntimeError("pending execution store is not initialized")
+        pending = self.pending_execution_store.load()
+        if pending is None or pending.execution_id != execution_id:
+            raise _OrderRecoveryInvariantError(
+                "pending dynamic execution journal is missing or changed")
+        return pending
+
+    def _clear_pending_execution_if_safe(
+            self, pending: PendingExecutionState) -> bool:
+        if self.pending_execution_store is None:
+            raise RuntimeError("pending execution store is not initialized")
+        if (pending.buy.unresolved or pending.sell.unresolved
+                or not pending.audit_ok or not pending.campaign_applied
+                or abs(sum(v.position for v in self.venues.values()))
+                > self.cfg.net_tolerance_base
+                or not self._reconcile_live_campaign()):
+            return False
+        self.pending_execution_store.save(None)
+        if (self._startup_pending_execution is not None
+                and self._startup_pending_execution.execution_id
+                == pending.execution_id):
+            self._startup_pending_execution = None
+            self._campaign_recovery_blocked = False
+        return True
+
+    def _pending_execution_active(self) -> bool:
+        return (self.pending_execution_store is not None
+                and self.pending_execution_store.load() is not None)
+
+    @staticmethod
+    def _terminal_pending_leg(
+            leg: PendingLegState, result: OrderResult) -> PendingLegState:
+        if result.unresolved:
+            raise _OrderRecoveryInvariantError(
+                "persisted order reference did not resolve to a terminal "
+                "OrderResult")
+        if (result.order_ref is not None
+                and result.order_ref != leg.order_ref):
+            raise _OrderRecoveryInvariantError(
+                "resolved order reference does not match persisted state")
+        if result.filled_base + 1e-12 < leg.filled_base:
+            raise _OrderRecoveryInvariantError(
+                "resolved fill regressed below the persisted quantity")
+        return PendingLegState(
+            venue_key=leg.venue_key,
+            is_buy=leg.is_buy,
+            order_ref=result.order_ref or leg.order_ref,
+            status=result.status,
+            filled_base=result.filled_base,
+            avg_px=result.avg_px,
+            applied_fill=result.filled_base,
+            unresolved=False,
+        )
+
+    def _campaign_after_pending(
+            self, pending: PendingExecutionState) -> Optional[PositionCampaign]:
+        matched = min(pending.buy.filled_base, pending.sell.filled_base)
+        if matched <= 0:
+            return pending.campaign_before
+        buy_px = pending.buy.avg_px
+        sell_px = pending.sell.avg_px
+        if buy_px is None or sell_px is None:
+            raise _OrderRecoveryInvariantError(
+                "persisted matched fill has no average price")
+        entropy_px = buy_px if pending.buy.venue_key == "entropy" else sell_px
+        hedge_px = buy_px if pending.buy.venue_key == "hedge" else sell_px
+        fees = matched * (
+            entropy_px * pending.entropy_fee_bps
+            + hedge_px * pending.hedge_fee_bps) / 1e4
+        if pending.intent == "OPEN":
+            return PositionCampaign(
+                campaign_id=pending.campaign_id,
+                mode="live",
+                identity=pending.identity,
+                direction=pending.direction,
+                opened_at=pending.decided_at,
+                qty=matched,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=pending.frozen_model,
+                entry_boundary_bps=pending.entry_boundary_bps,
+                exit_target_bps=pending.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        if pending.campaign_before is None:
+            raise _OrderRecoveryInvariantError(
+                "persisted non-OPEN execution has no prior campaign")
+        return pending.campaign_before.apply_matched_fill(
+            intent=pending.intent,
+            direction=pending.campaign_before.direction,
+            qty=matched,
+            entropy_px=entropy_px,
+            hedge_px=hedge_px,
+            fees_usd=fees,
+        )
+
+    def _record_pending_campaign_event(
+            self, pending: PendingExecutionState) -> None:
+        if pending.settled_at is None:
+            raise _OrderRecoveryInvariantError(
+                "terminal pending execution has no settlement time")
+        matched = min(pending.buy.filled_base, pending.sell.filled_base)
+        if (matched > 0
+                and (pending.buy.avg_px is None
+                     or pending.sell.avg_px is None)):
+            raise _OrderRecoveryInvariantError(
+                "persisted matched fill has no average price")
+        entropy_px = None
+        hedge_px = None
+        if matched > 0:
+            entropy_px = (pending.buy.avg_px
+                          if pending.buy.venue_key == "entropy"
+                          else pending.sell.avg_px)
+            hedge_px = (pending.buy.avg_px
+                        if pending.buy.venue_key == "hedge"
+                        else pending.sell.avg_px)
+        prior = pending.campaign_before
+        campaign_after = self._campaign_after_pending(pending)
+        final_pnl = None
+        hold_seconds = None
+        if (matched > 0 and prior is not None
+                and pending.intent in {"CLOSE", "FORCED_CLOSE"}):
+            fees = matched * (
+                entropy_px * pending.entropy_fee_bps
+                + hedge_px * pending.hedge_fee_bps) / 1e4
+            final_pnl = self._close_fill_pnl(
+                prior, qty=matched, entropy_px=entropy_px,
+                hedge_px=hedge_px, fees_usd=fees)
+            hold_seconds = max(
+                pending.settled_at - prior.opened_at, 0.0)
+        event = "execution_settled"
+        if matched > 0:
+            event = (
+                "campaign_closed"
+                if prior is not None and campaign_after is None
+                else "campaign_changed")
+        campaign_status = ""
+        if campaign_after is not None:
+            campaign_status = campaign_after.status_at(
+                pending.settled_at,
+                soft_sec=self.cfg.strategy_soft_hold_minutes * 60.0,
+                hard_sec=self.cfg.strategy_hard_hold_minutes * 60.0,
+            )
+        audit = pending.audit
+        model = pending.frozen_model
+        identity = pending.identity
+        self.strategy_events.record(StrategyEvent(
+            ts=pending.settled_at,
+            mode="live",
+            event=event,
+            intent=pending.intent,
+            reason=audit.reason,
+            decision_id=f"execution-{pending.execution_id}",
+            campaign_id=pending.campaign_id,
+            entropy_symbol=identity.entropy_symbol,
+            entropy_dex=identity.entropy_dex,
+            hedge_symbol=identity.hedge_symbol,
+            hedge_venue=identity.hedge_venue,
+            direction=pending.direction,
+            campaign_status=campaign_status,
+            model_version=str(model.version),
+            model_samples=model.samples,
+            model_status=model.status,
+            model_median_bps=model.median_bps,
+            model_lower_bps=model.lower_bps,
+            model_upper_bps=model.upper_bps,
+            model_iqr_bps=model.iqr_bps,
+            signed_residual_bps=audit.signed_residual_bps,
+            reference_basis_bps=audit.reference_basis_bps,
+            entry_boundary_bps=pending.entry_boundary_bps,
+            exit_target_bps=pending.exit_target_bps,
+            top_convergence_bps=audit.top_convergence_bps,
+            convergence_bps=audit.convergence_bps,
+            round_trip_fee_bps=audit.round_trip_fee_bps,
+            buy_slippage_budget_bps=audit.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=audit.sell_slippage_budget_bps,
+            projected_net_bps=audit.projected_net_bps,
+            projected_net_usd=audit.projected_net_usd,
+            estimated_campaign_pnl_usd=audit.estimated_campaign_pnl_usd,
+            qty=matched,
+            planned_notional_usd=audit.planned_notional_usd,
+            entropy_reference_age_ms=audit.entropy_reference_age_ms,
+            hedge_reference_age_ms=audit.hedge_reference_age_ms,
+            reference_update_skew_ms=audit.reference_update_skew_ms,
+            net_funding_bps_per_hour=audit.net_funding_bps_per_hour,
+            entropy_fill_px=entropy_px,
+            hedge_fill_px=hedge_px,
+            hold_seconds=hold_seconds,
+            realized_pnl_usd=final_pnl,
+        ))
+
+    async def _resolve_startup_pending_execution(self) -> bool:
+        pending = self._startup_pending_execution
+        if pending is None:
+            return True
+        if self.pending_execution_store is None:
+            raise _OrderRecoveryInvariantError(
+                "pending execution store is not initialized")
+        for side in ("buy", "sell"):
+            leg = getattr(pending, side)
+            if not leg.unresolved:
+                continue
+            venue = self.venues.get(leg.venue_key)
+            if venue is None:
+                raise _OrderRecoveryInvariantError(
+                    f"persisted {side} venue {leg.venue_key!r} is unavailable")
+            result = await venue.resolve_order(leg.order_ref)
+            if result is None:
+                self._schedule_reconcile(1.0)
+                return False
+            if not isinstance(result, OrderResult):
+                raise _OrderRecoveryInvariantError(
+                    "venue resolver returned an invalid order result")
+            venue.last_traded_ts = time.monotonic()
+            terminal_leg = self._terminal_pending_leg(leg, result)
+            other_leg = getattr(
+                pending, "sell" if side == "buy" else "buy")
+            settled_at = None
+            if not terminal_leg.unresolved and not other_leg.unresolved:
+                settled_at = (
+                    pending.settled_at
+                    if pending.settled_at is not None
+                    else max(pending.decided_at, time.time()))
+            pending = replace(
+                pending, settled_at=settled_at, **{side: terminal_leg})
+            self.pending_execution_store.save(pending)
+            self._startup_pending_execution = pending
+        if (abs(pending.buy.filled_base - pending.sell.filled_base)
+                > self.cfg.net_tolerance_base):
+            raise _OrderRecoveryInvariantError(
+                "persisted execution has unmatched terminal fills; residual "
+                "repair requires manual verification after a restart")
+        expected = self._campaign_after_pending(pending)
+        durable_campaign = self.campaign_store.load()
+        if pending.campaign_applied:
+            if durable_campaign != expected:
+                raise _OrderRecoveryInvariantError(
+                    "persisted campaign_applied state does not match the "
+                    "durable campaign")
+            self.campaign = durable_campaign
+        else:
+            if durable_campaign == pending.campaign_before:
+                self.campaign_store.save(expected)
+                durable_campaign = expected
+            elif durable_campaign != expected:
+                raise _OrderRecoveryInvariantError(
+                    "durable campaign matches neither side of the pending "
+                    "execution transaction")
+            self.campaign = durable_campaign
+            pending = replace(pending, campaign_applied=True)
+            self.pending_execution_store.save(pending)
+            self._startup_pending_execution = pending
+        self._record_pending_campaign_event(pending)
+        self._pending_snapshot_venues.update(
+            (pending.buy.venue_key, pending.sell.venue_key))
+        return True
+
+    def _close_dynamic_strategy(self) -> None:
+        if self.strategy_events is not None:
+            self.strategy_events.close()
+
+    def _dynamic_market_view(self, now_mono: float) -> MarketView:
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        entropy_age_ms = self.entropy.reference.age_ms(now_mono=now_mono)
+        hedge_age_ms = self.hedge.reference.age_ms(now_mono=now_mono)
+        skew = None
+        if entropy_ref.source and hedge_ref.source:
+            skew = abs(
+                entropy_ref.received_mono
+                - hedge_ref.received_mono)
+        account_ready = (
+            self.record_only
+            or (self.entropy.ready_to_trade()
+                and self.hedge.ready_to_trade()))
+        post_trade_books = (
+            self.record_only
+            or (self.entropy.book.last_update_mono
+                > self.entropy.last_traded_ts
+                and self.hedge.book.last_update_mono
+                > self.hedge.last_traded_ts))
+        books_ready = (
+            self.entropy.book.is_fresh(self.cfg.staleness_sec)
+            and self.hedge.book.is_fresh(self.cfg.staleness_sec)
+            and account_ready
+            and post_trade_books
+            and not self._venue_down
+        )
+        return MarketView(
+            entropy_book=self.entropy.book,
+            hedge_book=self.hedge.book,
+            entropy_oracle_px=entropy_ref.oracle_px,
+            hedge_index_px=hedge_ref.index_px,
+            entropy_reference_age_sec=(
+                None if entropy_age_ms is None else entropy_age_ms / 1000.0),
+            hedge_reference_age_sec=(
+                None if hedge_age_ms is None else hedge_age_ms / 1000.0),
+            reference_skew_sec=skew,
+            books_ready=books_ready,
+            entropy_fee_bps=self.entropy.fee_bps,
+            hedge_fee_bps=self.hedge.fee_bps,
+            take_fraction=self.cfg.take_fraction,
+            entry_cap_notional=self.cfg.max_order_notional,
+            min_base=self._min_base,
+            min_notional=self._min_notional,
+            size_step=self._step,
+        )
+
+    def _dynamic_entry_cap(self, direction: str) -> float:
+        entropy_mid = self.entropy.book.mid()
+        hedge_mid = self.hedge.book.mid()
+        if entropy_mid is None or hedge_mid is None:
+            return 0.0
+        if self.record_only and self.campaign is not None:
+            sign = -1.0 if self.campaign.direction == "sell_entropy" else 1.0
+            entropy_position = sign * self.campaign.qty
+            hedge_position = -sign * self.campaign.qty
+        else:
+            entropy_position = self.entropy.position
+            hedge_position = self.hedge.position
+        if direction == "sell_entropy":
+            entropy_room_base = (
+                self.entropy.cap_usd / entropy_mid + entropy_position)
+            hedge_room_base = (
+                self.hedge.cap_usd / hedge_mid - hedge_position)
+            entropy_levels = self.entropy.book.sorted_bids()
+            hedge_levels = self.hedge.book.sorted_asks()
+        else:
+            entropy_room_base = (
+                self.entropy.cap_usd / entropy_mid - entropy_position)
+            hedge_room_base = (
+                self.hedge.cap_usd / hedge_mid + hedge_position)
+            entropy_levels = self.entropy.book.sorted_asks()
+            hedge_levels = self.hedge.book.sorted_bids()
+
+        def capacity_notional(levels, room_base: float) -> float:
+            if not levels or room_base <= 0:
+                return 0.0
+            quantity = min(room_base, sum(size for _, size in levels))
+            return walk_depth(levels, quantity)[1]
+
+        entropy_room = capacity_notional(
+            entropy_levels, entropy_room_base)
+        hedge_room = capacity_notional(hedge_levels, hedge_room_base)
+        return max(0.0, min(
+            self.cfg.max_order_notional, entropy_room, hedge_room))
+
+    def _decide_dynamic(self, *, model, now_wall: float,
+                        now_mono: float) -> StrategyDecision:
+        market = self._dynamic_market_view(now_mono)
+        decision = self.dynamic_strategy.decide(
+            market=market,
+            model=model,
+            campaign=self.campaign,
+            now_wall=now_wall,
+            now_mono=now_mono,
+        )
+        if decision.intent not in {"OPEN", "ADD"}:
+            return decision
+        entry_cap = self._dynamic_entry_cap(decision.direction)
+        if entry_cap >= market.entry_cap_notional:
+            return decision
+        return self.dynamic_strategy.decide(
+            market=replace(market, entry_cap_notional=entry_cap),
+            model=model,
+            campaign=self.campaign,
+            now_wall=now_wall,
+            now_mono=now_mono,
+        )
+
+    def _current_dynamic_residual(
+            self, now_mono: float) -> tuple[Optional[float], bool]:
+        market = self._dynamic_market_view(now_mono)
+        gate = self.dynamic_strategy._book_gate(market)
+        if gate is None:
+            gate = self.dynamic_strategy._reference_gate(market)
+        if gate is not None:
+            return None, False
+        entropy_mid = market.entropy_book.mid()
+        hedge_mid = market.hedge_book.mid()
+        basis = (
+            market.entropy_oracle_px / market.hedge_index_px - 1.0) * 1e4
+        residual = (entropy_mid / hedge_mid - 1.0) * 1e4 - basis
+        return residual, True
+
+    def _advance_dynamic_model(
+            self, *, now_wall: float, now_mono: float) -> None:
+        """Retain the latest sample and commit one close per elapsed minute."""
+        minute = int(now_wall // 60)
+        residual, valid = self._current_dynamic_residual(now_mono)
+        pending = self._dynamic_pending_minute
+        if pending is None:
+            self._dynamic_pending_minute = minute
+        elif minute > pending:
+            self.residual_model.observe(
+                minute=pending,
+                residual_bps=self._dynamic_pending_residual,
+                valid=self._dynamic_pending_valid,
+            )
+            for missing in range(pending + 1, minute):
+                self.residual_model.observe(
+                    minute=missing, residual_bps=None, valid=False)
+            self._dynamic_pending_minute = minute
+        elif minute < pending:
+            return
+        self._dynamic_pending_residual = residual
+        self._dynamic_pending_valid = valid
+
+    def _record_model_snapshot(self, *, now_wall: float) -> None:
+        minute = int(now_wall // 60)
+        if self._last_model_event_minute == minute:
+            return
+        self._last_model_event_minute = minute
+        model = self.residual_model.snapshot(now_minute=minute)
+        self.strategy_events.record(StrategyEvent(
+            ts=now_wall,
+            mode="shadow" if self.record_only else "live",
+            event="model_snapshot",
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+            campaign_id=("" if self.campaign is None
+                         else self.campaign.campaign_id),
+            direction=("" if self.campaign is None
+                       else self.campaign.direction),
+            model_version=str(model.version),
+            model_samples=model.samples,
+            model_status=model.status,
+            model_median_bps=model.median_bps,
+            model_lower_bps=model.lower_bps,
+            model_upper_bps=model.upper_bps,
+            model_iqr_bps=model.iqr_bps,
+        ))
+
+    def _record_dynamic_decision(
+            self, decision: StrategyDecision, *, now_wall: float,
+            campaign_id: str = "", event: str = "decision",
+            filled_qty: Optional[float] = None,
+            entropy_fill_px: Optional[float] = None,
+            hedge_fill_px: Optional[float] = None,
+            realized_pnl_usd: Optional[float] = None,
+            hold_seconds: Optional[float] = None,
+            decision_id: str = "") -> None:
+        model = decision.model
+        plan = decision.plan
+        planned_notional = None
+        projected_net_bps = None
+        projected_net_usd = None
+        qty = None
+        if plan is not None:
+            qty = plan.qty
+            planned_notional = max(plan.buy_notional, plan.sell_notional)
+            projected_net_bps = getattr(plan, "projected_net_bps", None)
+            if projected_net_bps is not None:
+                projected_net_usd = (
+                    planned_notional * projected_net_bps / 1e4)
+        (entropy_age, hedge_age, reference_skew_ms,
+         funding) = self._decision_reference_audit_values(
+             decision.direction)
+
+        active = self.campaign
+        self.strategy_events.record(StrategyEvent(
+            ts=now_wall,
+            mode="shadow" if self.record_only else "live",
+            event=event,
+            intent=decision.intent,
+            reason=decision.reason,
+            decision_id=decision_id or uuid.uuid4().hex,
+            campaign_id=(campaign_id or (
+                "" if active is None else active.campaign_id)),
+            entropy_symbol=self.cfg.entropy.symbol,
+            entropy_dex=self.cfg.entropy.hl_dex,
+            hedge_symbol=self.cfg.hedge.symbol,
+            hedge_venue=self.cfg.hedge_venue,
+            direction=decision.direction,
+            campaign_status=("" if active is None else active.status_at(
+                now_wall,
+                soft_sec=self.cfg.strategy_soft_hold_minutes * 60.0,
+                hard_sec=self.cfg.strategy_hard_hold_minutes * 60.0)),
+            model_version=("" if model is None else str(model.version)),
+            model_samples=(None if model is None else model.samples),
+            model_status=("" if model is None else model.status),
+            model_median_bps=(None if model is None else model.median_bps),
+            model_lower_bps=(None if model is None else model.lower_bps),
+            model_upper_bps=(None if model is None else model.upper_bps),
+            model_iqr_bps=(None if model is None else model.iqr_bps),
+            signed_residual_bps=decision.signed_residual_bps,
+            reference_basis_bps=decision.reference_basis_bps,
+            entry_boundary_bps=decision.entry_boundary_bps,
+            exit_target_bps=decision.exit_target_bps,
+            top_convergence_bps=decision.top_convergence_bps,
+            convergence_bps=decision.convergence_bps,
+            round_trip_fee_bps=decision.round_trip_fee_bps,
+            buy_slippage_budget_bps=decision.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=decision.sell_slippage_budget_bps,
+            projected_net_bps=projected_net_bps,
+            projected_net_usd=projected_net_usd,
+            estimated_campaign_pnl_usd=(
+                decision.estimated_campaign_pnl_usd),
+            qty=qty if filled_qty is None else filled_qty,
+            planned_notional_usd=planned_notional,
+            entropy_reference_age_ms=entropy_age,
+            hedge_reference_age_ms=hedge_age,
+            reference_update_skew_ms=reference_skew_ms,
+            net_funding_bps_per_hour=funding,
+            entropy_fill_px=entropy_fill_px,
+            hedge_fill_px=hedge_fill_px,
+            hold_seconds=hold_seconds,
+            realized_pnl_usd=realized_pnl_usd,
+        ))
+
+    def _decision_reference_audit_values(
+            self, direction: str,
+            ) -> tuple[Optional[float], Optional[float],
+                       Optional[float], Optional[float]]:
+        now_mono = time.monotonic()
+        entropy_age = self.entropy.reference.age_ms(now_mono)
+        hedge_age = self.hedge.reference.age_ms(now_mono)
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        reference_skew_ms = None
+        if entropy_ref.source and hedge_ref.source:
+            reference_skew_ms = abs(
+                entropy_ref.received_mono
+                - hedge_ref.received_mono) * 1000.0
+        funding = None
+        if (entropy_ref.funding_current_bps_per_hour is not None
+                and hedge_ref.funding_current_bps_per_hour is not None):
+            funding = (entropy_ref.funding_current_bps_per_hour
+                       - hedge_ref.funding_current_bps_per_hour)
+            if direction == "buy_entropy":
+                funding = -funding
+        return entropy_age, hedge_age, reference_skew_ms, funding
+
+    def _pending_audit_context(
+            self, decision: StrategyDecision) -> PendingAuditContext:
+        plan = decision.plan
+        planned_notional = max(plan.buy_notional, plan.sell_notional)
+        projected_net_bps = getattr(plan, "projected_net_bps", None)
+        projected_net_usd = None
+        if projected_net_bps is not None:
+            projected_net_usd = planned_notional * projected_net_bps / 1e4
+        (entropy_age, hedge_age, reference_skew_ms,
+         funding) = self._decision_reference_audit_values(
+             decision.direction)
+        return PendingAuditContext(
+            reason=decision.reason,
+            signed_residual_bps=decision.signed_residual_bps,
+            reference_basis_bps=decision.reference_basis_bps,
+            top_convergence_bps=decision.top_convergence_bps,
+            convergence_bps=decision.convergence_bps,
+            round_trip_fee_bps=decision.round_trip_fee_bps,
+            buy_slippage_budget_bps=decision.buy_slippage_budget_bps,
+            sell_slippage_budget_bps=decision.sell_slippage_budget_bps,
+            projected_net_bps=projected_net_bps,
+            projected_net_usd=projected_net_usd,
+            estimated_campaign_pnl_usd=(
+                decision.estimated_campaign_pnl_usd),
+            entropy_reference_age_ms=entropy_age,
+            hedge_reference_age_ms=hedge_age,
+            reference_update_skew_ms=reference_skew_ms,
+            net_funding_bps_per_hour=funding,
+            planned_notional_usd=planned_notional,
+        )
+
+    @staticmethod
+    def _shadow_fill_prices(
+            decision: StrategyDecision,
+            campaign_direction: Optional[str] = None) -> tuple[float, float]:
+        direction = campaign_direction or decision.direction
+        if decision.intent in {"OPEN", "ADD"}:
+            if direction == "sell_entropy":
+                return decision.plan.sell_limit, decision.plan.buy_limit
+            return decision.plan.buy_limit, decision.plan.sell_limit
+        if direction == "sell_entropy":
+            return decision.plan.buy_limit, decision.plan.sell_limit
+        return decision.plan.sell_limit, decision.plan.buy_limit
+
+    @staticmethod
+    def _close_fill_pnl(
+            campaign: PositionCampaign, *, qty: float,
+            entropy_px: float, hedge_px: float,
+            fees_usd: float) -> float:
+        if campaign.direction == "buy_entropy":
+            gross_per_base = (
+                entropy_px - campaign.entropy_avg_px
+                + campaign.hedge_avg_px - hedge_px)
+        else:
+            gross_per_base = (
+                campaign.entropy_avg_px - entropy_px
+                + hedge_px - campaign.hedge_avg_px)
+        return campaign.realized_pnl_usd + gross_per_base * qty - fees_usd
+
+    def _apply_shadow_decision(
+            self, decision: StrategyDecision, *, now_wall: float) -> None:
+        if decision.intent not in {"OPEN", "ADD", "CLOSE", "FORCED_CLOSE"}:
+            raise ValueError("only executable decisions can be applied")
+        if not self.record_only:
+            raise RuntimeError("shadow decisions require record-only mode")
+        prior = self.campaign
+        campaign_direction = (
+            decision.direction if prior is None else prior.direction)
+        entropy_px, hedge_px = self._shadow_fill_prices(
+            decision, campaign_direction)
+        qty = decision.plan.qty
+        fees = qty * (
+            entropy_px * self.entropy.fee_bps
+            + hedge_px * self.hedge.fee_bps) / 1e4
+        final_pnl = None
+        hold_seconds = None
+        if decision.intent == "OPEN":
+            if prior is not None:
+                raise RuntimeError("cannot open a second campaign")
+            self.campaign = PositionCampaign(
+                campaign_id=uuid.uuid4().hex,
+                mode="shadow",
+                identity=self._market_identity(),
+                direction=decision.direction,
+                opened_at=now_wall,
+                qty=qty,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        else:
+            if prior is None:
+                raise RuntimeError("campaign decision has no active campaign")
+            if decision.intent in {"CLOSE", "FORCED_CLOSE"}:
+                final_pnl = self._close_fill_pnl(
+                    prior, qty=qty, entropy_px=entropy_px,
+                    hedge_px=hedge_px, fees_usd=fees)
+                hold_seconds = max(now_wall - prior.opened_at, 0.0)
+            self.campaign = prior.apply_matched_fill(
+                intent=decision.intent,
+                direction=prior.direction,
+                qty=qty,
+                entropy_px=entropy_px,
+                hedge_px=hedge_px,
+                fees_usd=fees,
+            )
+        self.campaign_store.save(self.campaign)
+        campaign_id = (
+            prior.campaign_id if prior is not None
+            else self.campaign.campaign_id)
+        event = (
+            "campaign_closed"
+            if prior is not None and self.campaign is None
+            else "campaign_changed")
+        self._record_dynamic_decision(
+            decision, now_wall=now_wall,
+            campaign_id=campaign_id, event=event,
+            entropy_fill_px=entropy_px,
+            hedge_fill_px=hedge_px,
+            realized_pnl_usd=final_pnl,
+            hold_seconds=hold_seconds,
+        )
+
+    def _apply_live_matched_fill(
+            self, decision: StrategyDecision, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult,
+            matched: float, now_wall: float,
+            pending: Optional[PendingExecutionState] = None) -> None:
+        if self.record_only:
+            raise RuntimeError("live fills require live mode")
+        self._record_live_slippage(
+            decision,
+            buy=buy,
+            sell=sell,
+            buy_result=buy_result,
+            sell_result=sell_result,
+        )
+        if matched <= 0:
+            if pending is None:
+                self._record_dynamic_decision(
+                    decision, now_wall=now_wall,
+                    event="execution_settled", filled_qty=0.0)
+            return
+        if buy_result.avg_px is None or sell_result.avg_px is None:
+            raise RuntimeError(
+                "matched live fill is missing an average price")
+        entropy_px = (
+            buy_result.avg_px if buy.key == "entropy"
+            else sell_result.avg_px)
+        hedge_px = (
+            buy_result.avg_px if buy.key == "hedge"
+            else sell_result.avg_px)
+        entropy_fee_bps = (
+            self.entropy.fee_bps if pending is None
+            else pending.entropy_fee_bps)
+        hedge_fee_bps = (
+            self.hedge.fee_bps if pending is None
+            else pending.hedge_fee_bps)
+        fees = matched * (
+            entropy_px * entropy_fee_bps
+            + hedge_px * hedge_fee_bps) / 1e4
+        prior = self.campaign
+        final_pnl = None
+        hold_seconds = None
+        if decision.intent == "OPEN":
+            if prior is not None:
+                raise RuntimeError("cannot open a second live campaign")
+            self.campaign = PositionCampaign(
+                campaign_id=(
+                    uuid.uuid4().hex if pending is None
+                    else pending.campaign_id),
+                mode="live",
+                identity=self._market_identity(),
+                direction=decision.direction,
+                opened_at=(
+                    now_wall if pending is None else pending.decided_at),
+                qty=matched,
+                entropy_avg_px=entropy_px,
+                hedge_avg_px=hedge_px,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                fees_usd=fees,
+                realized_pnl_usd=-fees,
+            )
+        else:
+            if prior is None:
+                raise RuntimeError(
+                    "live campaign fill has no active campaign")
+            if decision.intent in {"CLOSE", "FORCED_CLOSE"}:
+                final_pnl = self._close_fill_pnl(
+                    prior, qty=matched, entropy_px=entropy_px,
+                    hedge_px=hedge_px, fees_usd=fees)
+                hold_seconds = max(now_wall - prior.opened_at, 0.0)
+            self.campaign = prior.apply_matched_fill(
+                intent=decision.intent,
+                direction=prior.direction,
+                qty=matched,
+                entropy_px=entropy_px,
+                hedge_px=hedge_px,
+                fees_usd=fees,
+            )
+        self.campaign_store.save(self.campaign)
+        campaign_id = (
+            prior.campaign_id if prior is not None
+            else self.campaign.campaign_id)
+        event = (
+            "campaign_closed"
+            if prior is not None and self.campaign is None
+            else "campaign_changed")
+        if pending is None:
+            self._record_dynamic_decision(
+                decision, now_wall=now_wall,
+                campaign_id=campaign_id, event=event,
+                filled_qty=matched,
+                entropy_fill_px=entropy_px,
+                hedge_fill_px=hedge_px,
+                realized_pnl_usd=final_pnl,
+                hold_seconds=hold_seconds,
+            )
+        self._dynamic_last_action_mono = time.monotonic()
+
+    def _record_live_slippage(
+            self, decision: StrategyDecision, *, buy, sell,
+            buy_result: OrderResult, sell_result: OrderResult) -> None:
+        plan = decision.plan
+        expected_buy = plan.buy_notional / plan.qty
+        expected_sell = plan.sell_notional / plan.qty
+        now = time.monotonic()
+        if buy_result.filled_base > 0:
+            adverse = max(
+                (buy_result.avg_px / expected_buy - 1.0) * 1e4, 0.0)
+            self.dynamic_strategy.slippage.record(
+                venue=buy.key,
+                side="buy",
+                now=now,
+                adverse_bps=adverse,
+                decision_budget_bps=decision.buy_slippage_budget_bps,
+            )
+        if sell_result.filled_base > 0:
+            adverse = max(
+                (expected_sell / sell_result.avg_px - 1.0) * 1e4, 0.0)
+            self.dynamic_strategy.slippage.record(
+                venue=sell.key,
+                side="sell",
+                now=now,
+                adverse_bps=adverse,
+                decision_budget_bps=decision.sell_slippage_budget_bps,
+            )
+
+    @staticmethod
+    def _dynamic_execution_plan(decision: StrategyDecision, buy, sell) -> ArbPlan:
+        source = decision.plan
+        top_buy = buy.book.best_ask()
+        top_sell = sell.book.best_bid()
+        top_premium = (top_sell / top_buy - 1.0) * 1e4
+        return ArbPlan(
+            qty=source.qty,
+            buy_limit=source.buy_limit,
+            sell_limit=source.sell_limit,
+            buy_notional=source.buy_notional,
+            sell_notional=source.sell_notional,
+            q_max=getattr(source, "q_max", source.qty),
+            q_max_notional=(
+                getattr(source, "q_max", source.qty) * source.buy_limit),
+            top_premium_bps=top_premium,
+            marginal_premium_bps=(
+                source.sell_limit / source.buy_limit - 1.0) * 1e4,
+            buy_fee=buy.fee_bps / 1e4,
+            sell_fee=sell.fee_bps / 1e4,
+        )
+
+    def _dynamic_entry_persisted(
+            self, decision: StrategyDecision, now_mono: float) -> bool:
+        if decision.intent not in {"OPEN", "ADD"}:
+            return True
+        delay = self.cfg.premium_persist_sec
+        if delay <= 0:
+            return True
+        direction = decision.direction
+        other = "buy_entropy" if direction == "sell_entropy" else "sell_entropy"
+        self._armed[other] = None
+        armed = self._armed.get(direction)
+        if armed is None:
+            self._armed[direction] = now_mono
+            self._schedule_poke(delay)
+            return False
+        elapsed = now_mono - armed
+        if elapsed < delay:
+            self._schedule_poke(delay - elapsed)
+            return False
+        return True
 
     # ------------------------------------------------------------- lifecycle
 
@@ -390,6 +1491,101 @@ class Engine:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+
+    async def _reference_recovery_loop(self, venue: VenueAdapter) -> None:
+        recovery_active = False
+        while not self.stop.is_set():
+            now = time.monotonic()
+            if venue.reference.ws_is_fresh(
+                    self.cfg.reference_stale_sec, now_mono=now):
+                recovery_active = False
+                delay = min(self.cfg.reference_rest_recovery_sec,
+                            self.cfg.reference_stale_sec)
+            else:
+                age_ms = venue.reference.age_ms(now_mono=now)
+                if not recovery_active and age_ms is not None:
+                    remaining = self.cfg.reference_stale_sec - age_ms / 1000.0
+                    if remaining > 0.0:
+                        delay = min(self.cfg.reference_rest_recovery_sec,
+                                    remaining)
+                    else:
+                        recovery_active = True
+                        delay = 0.0
+                else:
+                    recovery_active = True
+                    try:
+                        await venue.refresh_reference_rest()
+                    except (aiohttp.ClientError, asyncio.TimeoutError,
+                            InvalidReference) as exc:
+                        log.warning("[%s] reference REST recovery failed: %s",
+                                    venue.name, exc)
+                    delay = self.cfg.reference_rest_recovery_sec
+            if delay <= 0.0:
+                continue
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
+    def _observe_reference(self, now_mono: Optional[float] = None) -> None:
+        now = time.monotonic() if now_mono is None else now_mono
+        entropy_ref = self.entropy.reference.snapshot
+        hedge_ref = self.hedge.reference.snapshot
+        entropy_age = self.entropy.reference.age_ms(now_mono=now)
+        hedge_age = self.hedge.reference.age_ms(now_mono=now)
+        stale_limit_ms = self.cfg.reference_stale_sec * 1000.0
+        stale = (
+            entropy_ref.oracle_px is None
+            or hedge_ref.index_px is None
+            or entropy_age is None
+            or hedge_age is None
+            or entropy_age > stale_limit_ms
+            or hedge_age > stale_limit_ms
+        )
+        e_bid, e_ask = self.entropy.book.best_bid(), self.entropy.book.best_ask()
+        h_bid, h_ask = self.hedge.book.best_bid(), self.hedge.book.best_ask()
+        sell_residual = buy_residual = None
+        if not stale and None not in (e_bid, e_ask, h_bid, h_ask):
+            sell_residual = calculate_reference_metrics(
+                direction="sell_entropy",
+                entropy_bid=e_bid, entropy_ask=e_ask,
+                hedge_bid=h_bid, hedge_ask=h_ask,
+                entropy=entropy_ref, hedge=hedge_ref,
+            ).signed_residual_bps
+            buy_residual = calculate_reference_metrics(
+                direction="buy_entropy",
+                entropy_bid=e_bid, entropy_ask=e_ask,
+                hedge_bid=h_bid, hedge_ask=h_ask,
+                entropy=entropy_ref, hedge=hedge_ref,
+            ).signed_residual_bps
+        for event in self._reference_alerts.observe(
+                now_mono=now,
+                sell_residual_bps=sell_residual,
+                buy_residual_bps=buy_residual,
+                stale=stale):
+            if event.kind == "stale":
+                if event.active:
+                    log.warning(
+                        "reference data stale or incomplete — observation "
+                        "continues without blocking trading")
+                else:
+                    log.info("reference data recovered")
+            elif event.active:
+                log.warning(
+                    "%s reference residual alert: %+.2f bps",
+                    event.direction, event.value_bps)
+            else:
+                log.info(
+                    "%s reference residual recovered: %+.2f bps",
+                    event.direction, event.value_bps)
+
+    async def _reference_monitor_loop(self) -> None:
+        while not self.stop.is_set():
+            self._observe_reference()
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
 
     async def _cleanup(self, tasks: List[asyncio.Task]) -> None:
         self.request_stop()
@@ -436,9 +1632,20 @@ class Engine:
         for venue in self.venues.values():
             await self._close_resource(
                 f"[{venue.name}] close", venue.close)
+        try:
+            self._close_dynamic_strategy()
+        except BaseException as exc:
+            self._remember_error("strategy event recorder close", exc)
         if self.session is not None:
             await self._close_resource(
                 "HTTP session close", self.session.close)
+        if self._live_lock is not None:
+            try:
+                self._live_lock.release()
+            except BaseException as exc:
+                self._remember_error("live process lock release", exc)
+            finally:
+                self._live_lock = None
 
     async def _close_resource(self, label: str, close) -> None:
         task = asyncio.create_task(close(), name=f"close-{label}")
@@ -498,6 +1705,13 @@ class Engine:
                 self.entropy.init_signer()
                 self.hedge.init_signer()
             self.entropy.configure_peer(self.hedge)
+            if live:
+                self._live_lock = LiveProcessLock.from_market(
+                    self._market_identity(),
+                    self.entropy.account_lock_id(),
+                    self.hedge.account_lock_id(),
+                )
+                self._live_lock.acquire()
 
             self._step = 10 ** -min(
                 self.entropy.size_decimals, self.hedge.size_decimals)
@@ -514,10 +1728,18 @@ class Engine:
                 cfg.upper_bps, self.entropy.fee_bps, self.hedge.fee_bps,
                 self._step, self._min_notional)
 
+            if cfg.strategy_mode == "residual_dynamic":
+                self._initialize_dynamic_strategy()
+
             if self.record_only:
-                log.warning(
-                    "RECORD-ONLY — collecting minute data, no strategy, "
-                    "no orders")
+                if cfg.strategy_mode == "residual_dynamic":
+                    log.warning(
+                        "RECORD-ONLY SHADOW — evaluating dynamic residual "
+                        "campaigns, no orders")
+                else:
+                    log.warning(
+                        "RECORD-ONLY — collecting minute data, no strategy, "
+                        "no orders")
             else:
                 log.warning(
                     "LIVE — real orders will be sent (use --record-only "
@@ -528,6 +1750,22 @@ class Engine:
                     " ".join(f"{v.name}={v.position:+.6g}"
                              for v in self.venues.values()),
                     sum(v.position for v in self.venues.values()))
+                if cfg.strategy_mode == "residual_dynamic":
+                    self._load_dynamic_campaign()
+                    self._load_pending_execution_state()
+                    if self._startup_pending_execution is None:
+                        try:
+                            reconcile_campaign(
+                                self.campaign,
+                                entropy_position=self.entropy.position,
+                                hedge_position=self.hedge.position,
+                                step=self._step,
+                                net_tolerance=cfg.net_tolerance_base,
+                            )
+                        except CampaignRecoveryError as exc:
+                            self._campaign_recovery_blocked = True
+                            self._auto_repair_disabled = True
+                            self._pause_for_recovery(str(exc))
                 startup_net = sum(
                     v.position for v in self.venues.values())
                 if abs(startup_net) > cfg.net_tolerance_base:
@@ -541,11 +1779,20 @@ class Engine:
             for venue in self.venues.values():
                 for task in venue.start_tasks(self._feed_stop, notify, live):
                     self._track_task(tasks, task)
-            if not self.record_only:
-                self._start_recorders(tasks)
+                self._track_task(
+                    tasks, asyncio.create_task(
+                        self._reference_recovery_loop(venue),
+                        name=f"reference-rest-{venue.key}"))
+            if ((not self.record_only
+                 or cfg.strategy_mode == "residual_dynamic")
+                    and (not self._campaign_recovery_blocked
+                         or self._startup_pending_execution is not None)):
+                if not self.record_only:
+                    self._start_recorders(tasks)
                 self._track_task(
                     tasks, asyncio.create_task(
                         self._strategy_loop(), name="strategy"))
+            if not self.record_only:
                 self._track_task(
                     tasks, asyncio.create_task(
                         self._balance_loop(), name="balances"))
@@ -556,6 +1803,9 @@ class Engine:
             self._track_task(
                 tasks,
                 asyncio.create_task(self._status_loop(), name="status"))
+            self._track_task(
+                tasks, asyncio.create_task(
+                    self._reference_monitor_loop(), name="reference-monitor"))
             if live:
                 self._track_task(
                     tasks, asyncio.create_task(
@@ -750,12 +2000,14 @@ class Engine:
             base = self.cfg.lower_bps - self.cfg.midline_bps
         return base + self._inv_add_bps(buy, sell)
 
-    def _headroom(self, buy, sell, ref_px: float) -> float:
-        hb = buy.cap_usd - buy.position * ref_px
-        hs = sell.cap_usd + sell.position * ref_px
-        return min(hb, hs)
+    def _headroom(self, buy, sell, *, buy_px: float,
+                  sell_px: float) -> float:
+        buy_base = buy.cap_usd / buy_px - buy.position
+        sell_base = sell.cap_usd / sell_px + sell.position
+        return min(buy_base, sell_base) * buy_px
 
-    def _plan(self, buy, sell, cap_notional: float):
+    def _plan(self, buy, sell, cap_notional: float, *,
+              max_base: Optional[float] = None):
         return plan_arb(
             buy.book, sell.book,
             threshold_bps=self._eff_threshold(buy, sell),
@@ -765,14 +2017,29 @@ class Engine:
             min_base=self._min_base,
             min_notional=self._min_notional,
             size_step=self._step,
+            max_base=max_base,
         )
 
     # -------------------------------------------------------------- strategy
 
+    @staticmethod
+    def _dynamic_wakeup_timeout() -> float:
+        now = time.time()
+        return max(60.0 - now % 60.0 + 0.01, 0.01)
+
     async def _strategy_loop(self) -> None:
+        dynamic = self.cfg.strategy_mode == "residual_dynamic"
+        wakeup = self._strategy_evt if dynamic else self._update_evt
         while not self.stop.is_set():
-            await self._update_evt.wait()
-            self._update_evt.clear()
+            if dynamic:
+                try:
+                    await asyncio.wait_for(
+                        wakeup.wait(), timeout=self._dynamic_wakeup_timeout())
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await wakeup.wait()
+            wakeup.clear()
             if self.stop.is_set():
                 break
             try:
@@ -791,7 +2058,10 @@ class Engine:
 
         def _fire() -> None:
             self._poke_due = None
-            self._update_evt.set()
+            if self.cfg.strategy_mode == "residual_dynamic":
+                self._strategy_evt.set()
+            else:
+                self._update_evt.set()
 
         self._poke_due = due
         loop.call_at(due, _fire)
@@ -805,6 +2075,9 @@ class Engine:
     async def _evaluate(self) -> None:
         cfg = self.cfg
         if self.halted:
+            return
+        if cfg.strategy_mode == "residual_dynamic":
+            await self._evaluate_dynamic()
             return
         now = time.monotonic()
         if now - self.last_trade_mono < cfg.cooldown_sec:
@@ -826,7 +2099,133 @@ class Engine:
         t.add_done_callback(self._execution_done)
         await asyncio.shield(t)
 
-    async def _execute_locked(self, buy, sell, plan: ArbPlan) -> None:
+    async def _evaluate_dynamic(self) -> None:
+        if self.dynamic_strategy is None or self.residual_model is None:
+            raise RuntimeError("dynamic strategy is not initialized")
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        self._advance_dynamic_model(
+            now_wall=now_wall, now_mono=now_mono)
+        self._record_model_snapshot(now_wall=now_wall)
+        model = self.residual_model.snapshot(
+            now_minute=int(now_wall // 60))
+        if self._recovery_required:
+            self._clear_armed()
+            self._record_dynamic_decision(
+                StrategyDecision(
+                    intent="SKIP", direction="",
+                    reason="POSITION_RECOVERY_REQUIRED", model=model),
+                now_wall=now_wall)
+            return
+        if self._pending_execution_active():
+            self._pause_for_recovery(
+                "a dynamic execution journal is awaiting position "
+                "reconciliation")
+            self._record_dynamic_decision(
+                StrategyDecision(
+                    intent="SKIP", direction="",
+                    reason="PENDING_EXECUTION_RECOVERY", model=model),
+                now_wall=now_wall)
+            return
+        decision = self._decide_dynamic(
+            model=model, now_wall=now_wall, now_mono=now_mono)
+        if decision.intent == "SKIP":
+            self._clear_armed()
+            self._record_dynamic_decision(
+                decision, now_wall=now_wall)
+            return
+        if (decision.intent in {"OPEN", "ADD"}
+                and now_mono - self._dynamic_last_action_mono
+                < self.cfg.cooldown_sec):
+            self._schedule_poke(
+                self.cfg.cooldown_sec
+                - (now_mono - self._dynamic_last_action_mono))
+            deferred = StrategyDecision(
+                intent="SKIP", direction=decision.direction,
+                reason="COOLDOWN", model=decision.model)
+            self._record_dynamic_decision(
+                deferred, now_wall=now_wall)
+            self._clear_armed()
+            return
+        if not self._dynamic_entry_persisted(decision, now_mono):
+            deferred = StrategyDecision(
+                intent="SKIP", direction=decision.direction,
+                reason="ENTRY_PERSISTING", model=decision.model)
+            self._record_dynamic_decision(
+                deferred, now_wall=now_wall)
+            return
+        self._clear_armed()
+        if self.record_only:
+            self._apply_shadow_decision(decision, now_wall=now_wall)
+            self._dynamic_last_action_mono = now_mono
+            return
+        if decision.direction == "sell_entropy":
+            buy, sell = self.hedge, self.entropy
+        else:
+            buy, sell = self.entropy, self.hedge
+        buy_lock = self._vlock(buy.key)
+        sell_lock = self._vlock(sell.key)
+        await buy_lock.acquire()
+        try:
+            await sell_lock.acquire()
+        except BaseException:
+            buy_lock.release()
+            raise
+        handed_to_execution = False
+        try:
+            recheck_wall = time.time()
+            recheck_mono = time.monotonic()
+            self._advance_dynamic_model(
+                now_wall=recheck_wall, now_mono=recheck_mono)
+            self._record_model_snapshot(now_wall=recheck_wall)
+            recheck_model = self.residual_model.snapshot(
+                now_minute=int(recheck_wall // 60))
+            if self._recovery_required:
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="POSITION_RECOVERY_REQUIRED", model=recheck_model)
+            elif (self._venue_limited(buy) or self._venue_limited(sell)):
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="VENUE_RATE_LIMITED", model=recheck_model)
+            elif not (self._venue_rate_ok(buy) and self._venue_rate_ok(sell)):
+                revalidated = StrategyDecision(
+                    intent="SKIP", direction=decision.direction,
+                    reason="VENUE_ORDER_BUDGET", model=recheck_model)
+            else:
+                revalidated = self._decide_dynamic(
+                    model=recheck_model, now_wall=recheck_wall,
+                    now_mono=recheck_mono)
+            if (revalidated.intent != decision.intent
+                    or revalidated.direction != decision.direction
+                    or revalidated.plan is None):
+                self._clear_armed()
+                self._record_dynamic_decision(
+                    StrategyDecision(
+                        intent="SKIP", direction=decision.direction,
+                        reason=f"PRE_SEND_{revalidated.reason}",
+                        model=recheck_model),
+                    now_wall=recheck_wall)
+                return
+            decision = revalidated
+            execution_plan = self._dynamic_execution_plan(
+                decision, buy, sell)
+            task = asyncio.create_task(
+                self._execute_locked(
+                    buy, sell, execution_plan, decision=decision),
+                name=f"dynamic-{decision.intent.lower()}")
+            handed_to_execution = True
+        finally:
+            if not handed_to_execution:
+                buy_lock.release()
+                sell_lock.release()
+        self._exec_tasks.add(task)
+        task.add_done_callback(self._execution_done)
+        await asyncio.shield(task)
+
+    async def _execute_locked(
+            self, buy, sell, plan: ArbPlan, *,
+            decision: Optional[StrategyDecision] = None) -> None:
         """Run one execution while holding both venue locks (acquired by the
         caller), then release them and settle the aftermath: unresolved
         outcomes escalate to reconcile, everything else gets a net-delta
@@ -834,7 +2233,11 @@ class Engine:
         unresolved = False
         audit_error = None
         try:
-            unresolved = await self._execute(buy, sell, plan)
+            if decision is None:
+                unresolved = await self._execute(buy, sell, plan)
+            else:
+                unresolved = await self._execute(
+                    buy, sell, plan, decision=decision)
         except _TradeAuditFailure as exc:
             audit_error = exc.error
             self._audit_repair_errors.add(audit_error)
@@ -940,21 +2343,51 @@ class Engine:
                 continue
             if plan is None:
                 continue
-            headroom = self._headroom(buy, sell, plan.buy_limit)
-            if headroom < plan.buy_notional:
-                plan, _ = self._plan(buy, sell,
-                                     min(cfg.max_order_notional, headroom))
+            while plan is not None:
+                buy_mid = buy.book.mid()
+                sell_mid = sell.book.mid()
+                if buy_mid is None or sell_mid is None:
+                    plan = None
+                    break
+                # Limits protect execution prices, while position caps protect
+                # current exposure. Never value either leg below its mid.
+                buy_risk_px = max(
+                    plan.buy_limit * (1 + cfg.leg_slippage_bps / 1e4),
+                    buy_mid)
+                sell_risk_px = max(plan.sell_limit, sell_mid)
+                headroom = self._headroom(
+                    buy, sell,
+                    buy_px=buy_risk_px,
+                    sell_px=sell_risk_px,
+                )
+                headroom_base = max(headroom / buy_risk_px, 0.0)
+                if plan.qty <= headroom_base + 1e-12:
+                    break
+                prior_qty = plan.qty
+                plan, _ = self._plan(
+                    buy, sell, cfg.max_order_notional,
+                    max_base=headroom_base)
                 if plan is None:
                     self._skiplog("%s blocked by position caps (headroom $%.0f)",
                                   dkey, max(headroom, 0.0))
-                    continue
+                    break
+                if plan.qty >= prior_qty - 1e-12:
+                    self._skiplog(
+                        "%s blocked: position-cap replanning did not reduce "
+                        "quantity", dkey)
+                    plan = None
+                    break
+            if plan is None:
+                continue
             if best is None or plan.exp_edge_usd > best[2].exp_edge_usd:
                 best = (buy, sell, plan)
         return best
 
     # ------------------------------------------------------------- execution
 
-    async def _execute(self, buy, sell, plan: ArbPlan) -> bool:
+    async def _execute(
+            self, buy, sell, plan: ArbPlan, *,
+            decision: Optional[StrategyDecision] = None) -> bool:
         """Send both legs and settle the fills. Both venue locks are held by
         the caller. Returns True when an outcome is unresolved and the caller
         must escalate to reconcile."""
@@ -971,9 +2404,81 @@ class Engine:
                  direction, buy.name, plan.qty, plan.buy_limit, sell.name,
                  plan.sell_limit, plan.buy_notional, plan.q_max_notional,
                  plan.marginal_premium_bps, plan.exp_edge_usd)
-        slip = cfg.leg_slippage_bps / 1e4
-        buy_bound = buy.px_round(plan.buy_limit * (1 + slip), round_up=False)
-        sell_bound = sell.px_round(plan.sell_limit * (1 - slip), round_up=True)
+        buy_slippage_bps = (
+            cfg.leg_slippage_bps if decision is None
+            else decision.buy_slippage_budget_bps)
+        sell_slippage_bps = (
+            cfg.leg_slippage_bps if decision is None
+            else decision.sell_slippage_budget_bps)
+        if buy_slippage_bps is None or sell_slippage_bps is None:
+            raise RuntimeError("execution is missing slippage protection")
+        reduce_only = bool(
+            decision is not None
+            and decision.intent in {"CLOSE", "FORCED_CLOSE"})
+        if decision is None:
+            buy_bound = buy.px_round(
+                plan.buy_limit * (1 + buy_slippage_bps / 1e4),
+                round_up=False)
+            sell_bound = sell.px_round(
+                plan.sell_limit * (1 - sell_slippage_bps / 1e4),
+                round_up=True)
+        else:
+            source = decision.plan
+            buy_depth = source.buy_depth_slippage_bps / 1e4
+            sell_depth = source.sell_depth_slippage_bps / 1e4
+            decision_best_ask = source.buy_limit / (1 + buy_depth)
+            decision_best_bid = source.sell_limit * (1 + sell_depth)
+            buy_bound = buy.px_round(
+                decision_best_ask * (1 + buy_slippage_bps / 1e4),
+                round_up=False)
+            sell_bound = sell.px_round(
+                decision_best_bid / (1 + sell_slippage_bps / 1e4),
+                round_up=True)
+        pending_state = None
+        if decision is not None:
+            if self.pending_execution_store is None:
+                raise RuntimeError(
+                    "pending execution store is not initialized")
+            if self.pending_execution_store.load() is not None:
+                raise RuntimeError(
+                    "cannot overwrite an unfinished dynamic execution "
+                    "journal")
+            decided_at = time.time()
+            pending_campaign_id = (
+                uuid.uuid4().hex if self.campaign is None
+                else self.campaign.campaign_id)
+            expected_buy_px = decision.plan.buy_notional / decision.plan.qty
+            expected_sell_px = decision.plan.sell_notional / decision.plan.qty
+            pending_state = PendingExecutionState(
+                execution_id=uuid.uuid4().hex,
+                identity=self._market_identity(),
+                intent=decision.intent,
+                direction=decision.direction,
+                campaign_id=pending_campaign_id,
+                qty=plan.qty,
+                decided_at=decided_at,
+                frozen_model=decision.model,
+                entry_boundary_bps=decision.entry_boundary_bps,
+                exit_target_bps=decision.exit_target_bps,
+                entropy_expected_px=(
+                    expected_buy_px if buy.key == "entropy"
+                    else expected_sell_px),
+                hedge_expected_px=(
+                    expected_buy_px if buy.key == "hedge"
+                    else expected_sell_px),
+                entropy_fee_bps=self.entropy.fee_bps,
+                hedge_fee_bps=self.hedge.fee_bps,
+                campaign_before=self.campaign,
+                buy=self._pending_leg_state(buy, is_buy=True),
+                sell=self._pending_leg_state(sell, is_buy=False),
+                audit=self._pending_audit_context(decision),
+                settled_at=None,
+                audit_ok=False,
+                campaign_applied=False,
+            )
+            # The durable marker must exist before either submission coroutine
+            # can start.  A persistence failure therefore sends no order.
+            self.pending_execution_store.save(pending_state)
         self._record_send(buy)
         self._record_send(sell)
         order_submitted_at = {}
@@ -983,8 +2488,10 @@ class Engine:
             return await venue.send_taker(**kwargs)
 
         settlement = asyncio.gather(
-            submit(buy, is_buy=True, qty=plan.qty, limit_px=buy_bound),
-            submit(sell, is_buy=False, qty=plan.qty, limit_px=sell_bound),
+            submit(buy, is_buy=True, qty=plan.qty, limit_px=buy_bound,
+                   reduce_only=reduce_only),
+            submit(sell, is_buy=False, qty=plan.qty, limit_px=sell_bound,
+                   reduce_only=reduce_only),
             return_exceptions=True)
         cancellation = None
         while True:
@@ -998,6 +2505,7 @@ class Engine:
                 if cancellation is None:
                     cancellation = exc
         settled_at = time.monotonic()
+        settled_wall = time.time()
         buy.last_traded_ts = sell.last_traded_ts = settled_at
         results = []
         for result in raw_results:
@@ -1014,13 +2522,27 @@ class Engine:
                                   (sell, sinfo, "sell")):
             if info.err:
                 log.error("[%s] %s leg: %s", venue.name, side, info.err)
-        for venue, info, is_buy in (
-                (buy, binfo, True), (sell, sinfo, False)):
+        dynamic_pending = None
+        if decision is not None and (binfo.unresolved or sinfo.unresolved):
+            dynamic_pending = _PendingDynamicExecution(
+                execution_id=pending_state.execution_id,
+                decision=decision,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+            )
+        for venue, info, is_buy, dynamic_side in (
+                (buy, binfo, True, "buy"),
+                (sell, sinfo, False, "sell")):
             if not info.unresolved:
                 continue
             self._register_unresolved_order(
                 venue, info, is_buy=is_buy,
-                applied_fill=info.filled_base)
+                applied_fill=info.filled_base,
+                dynamic_execution=dynamic_pending,
+                dynamic_side=dynamic_side,
+            )
         bfill = binfo.filled_base
         sfill = sinfo.filled_base
         buy.position += bfill
@@ -1033,6 +2555,18 @@ class Engine:
             spx = sinfo.avg_px or plan.sell_limit
             sell.cash += sfill * spx * (1 - plan.sell_fee)
             sell.volume_usd += sfill * spx
+        if pending_state is not None:
+            pending_state = self._pending_execution_with_results(
+                pending_state,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+                audit_ok=False,
+                campaign_applied=False,
+                now_wall=settled_wall,
+            )
+            self.pending_execution_store.save(pending_state)
 
         matched = min(bfill, sfill)
         fill_edge = 0.0
@@ -1097,12 +2631,37 @@ class Engine:
             audit_failure = _TradeAuditFailure(exc)
         self.last_trade_ts = time.time()
         self.last_trade_mono = time.monotonic()
-        if cancellation is not None:
-            if audit_failure is not None:
-                self._remember_error("trade audit write", audit_failure.error)
+        if cancellation is not None and audit_failure is not None:
+            self._remember_error("trade audit write", audit_failure.error)
             raise cancellation
         if audit_failure is not None:
             raise audit_failure from audit_failure.error
+        if pending_state is not None:
+            pending_state = replace(pending_state, audit_ok=True)
+            self.pending_execution_store.save(pending_state)
+        if decision is not None and not unresolved:
+            self._apply_live_matched_fill(
+                decision,
+                buy=buy,
+                sell=sell,
+                buy_result=binfo,
+                sell_result=sinfo,
+                matched=matched,
+                now_wall=pending_state.settled_at,
+                pending=pending_state,
+            )
+            pending_state = replace(
+                pending_state, campaign_applied=True)
+            self.pending_execution_store.save(pending_state)
+            self._record_pending_campaign_event(pending_state)
+            self._pending_snapshot_venues.update((buy.key, sell.key))
+            self._shutdown_reconcile_required = True
+            self._pause_for_recovery(
+                "dynamic execution awaits refreshed positions")
+        elif dynamic_pending is not None:
+            dynamic_pending.audit_ok = True
+        if cancellation is not None:
+            raise cancellation
         return bool(unresolved)
 
     def _record_trade(self, direction: str, plan: ArbPlan, fill_edge,
@@ -1196,8 +2755,8 @@ class Engine:
             ref = v.book.best_bid() if is_sell else v.book.best_ask()
             if ref is None:
                 continue
-            limit = v.px_round(ref * (1 - slip), False) if is_sell \
-                else v.px_round(ref * (1 + slip), True)
+            limit = v.px_round(ref * (1 - slip), True) if is_sell \
+                else v.px_round(ref * (1 + slip), False)
             if qty * limit < max(cfg.min_order_notional, v.min_quote):
                 continue
             await lk.acquire()  # verified free, no awaits since: fast path
@@ -1347,7 +2906,33 @@ class Engine:
                     and all(result is True for result in got))
         if hedge and complete:
             await self._maybe_hedge()
+            if (abs(sum(v.position for v in self.venues.values()))
+                    <= self.cfg.net_tolerance_base
+                    and not self._reconcile_live_campaign()):
+                return False
         return complete
+
+    def _reconcile_live_campaign(self) -> bool:
+        if (self.record_only
+                or self.cfg.strategy_mode != "residual_dynamic"):
+            return True
+        try:
+            reconcile_campaign(
+                self.campaign,
+                entropy_position=self.entropy.position,
+                hedge_position=self.hedge.position,
+                step=self._step,
+                net_tolerance=self.cfg.net_tolerance_base,
+            )
+        except CampaignRecoveryError as exc:
+            self._campaign_recovery_blocked = True
+            self._auto_repair_disabled = True
+            self._pause_for_recovery(str(exc))
+            log.critical(
+                "dynamic campaign does not match refreshed positions; "
+                "manual recovery required: %s", exc)
+            return False
+        return True
 
     async def _reconcile_venue(self, v, strict: bool) -> bool:
         async with self._vlock(v.key):
@@ -1414,6 +2999,11 @@ class Engine:
         confirmations = list(self._pending_order_confirmations)
         pending = []
         resolved_residual = False
+        dynamic_executions = {
+            id(item.dynamic_execution): item.dynamic_execution
+            for item in confirmations
+            if item.dynamic_execution is not None
+        }
         for index, confirmation in enumerate(confirmations):
             # Keep the current and unprocessed references recoverable if this
             # iteration is cancelled or violates the adapter contract.
@@ -1466,6 +3056,15 @@ class Engine:
                 venue.volume_usd += additional_fill * px
             resolved_residual = (
                 resolved_residual or confirmation.is_residual_hedge)
+            dynamic = confirmation.dynamic_execution
+            if dynamic is not None:
+                if confirmation.dynamic_side == "buy":
+                    dynamic.buy_result = result
+                elif confirmation.dynamic_side == "sell":
+                    dynamic.sell_result = result
+                else:
+                    raise _OrderRecoveryInvariantError(
+                        "dynamic order confirmation has no valid side")
             log.warning(
                 "[%s] unresolved order %s reached terminal status %s "
                 "with fill %.6g",
@@ -1482,6 +3081,59 @@ class Engine:
                 "remaining — automatic repair disabled; manual recovery "
                 "required")
         self._pending_order_confirmations = pending
+        for dynamic in dynamic_executions.values():
+            if dynamic.applied:
+                continue
+            if (dynamic.buy_result.unresolved
+                    or dynamic.sell_result.unresolved):
+                continue
+            if not dynamic.audit_ok:
+                raise _OrderRecoveryInvariantError(
+                    "dynamic order results resolved before trade audit "
+                    "completed")
+            try:
+                pending_execution = self._load_matching_pending_execution(
+                    dynamic.execution_id)
+                settled_wall = time.time()
+                pending_execution = self._pending_execution_with_results(
+                    pending_execution,
+                    buy=dynamic.buy,
+                    sell=dynamic.sell,
+                    buy_result=dynamic.buy_result,
+                    sell_result=dynamic.sell_result,
+                    audit_ok=True,
+                    campaign_applied=False,
+                    now_wall=settled_wall,
+                )
+                self.pending_execution_store.save(pending_execution)
+                self._apply_live_matched_fill(
+                    dynamic.decision,
+                    buy=dynamic.buy,
+                    sell=dynamic.sell,
+                    buy_result=dynamic.buy_result,
+                    sell_result=dynamic.sell_result,
+                    matched=min(
+                        dynamic.buy_result.filled_base,
+                        dynamic.sell_result.filled_base),
+                    now_wall=pending_execution.settled_at,
+                    pending=pending_execution,
+                )
+                pending_execution = replace(
+                    pending_execution, campaign_applied=True)
+                self.pending_execution_store.save(pending_execution)
+                self._record_pending_campaign_event(pending_execution)
+                self._pending_snapshot_venues.update(
+                    (dynamic.buy.key, dynamic.sell.key))
+                self._shutdown_reconcile_required = True
+                self._pause_for_recovery(
+                    "resolved dynamic execution awaits refreshed positions")
+                dynamic.applied = True
+            except BaseException as exc:
+                self._auto_repair_disabled = True
+                self._remember_error(
+                    "dynamic campaign state after order recovery", exc)
+                self.request_stop()
+                raise
         if pending:
             self._schedule_reconcile(1.0)
             return False
@@ -1492,11 +3144,15 @@ class Engine:
         order_recovery = bool(
             self._post_order_recovery_active
             or self._pending_order_confirmations
-            or self._pending_snapshot_venues)
+            or self._pending_snapshot_venues
+            or self._startup_pending_execution is not None)
         try:
+            if not await self._resolve_startup_pending_execution():
+                return False
             if not await self._resolve_pending_orders():
                 return False
         except _OrderRecoveryInvariantError as exc:
+            startup_failure = self._startup_pending_execution is not None
             self._auto_repair_disabled = True
             manual = list(self._pending_order_confirmations)
             self._manual_order_confirmations.extend(manual)
@@ -1507,6 +3163,13 @@ class Engine:
                     ", ".join(
                         f"{item.venue.name}:{item.order_ref}"
                         for item in manual))
+            if startup_failure:
+                # No order was submitted by this process.  Keep the durable
+                # journal for manual recovery, but stop retrying an invariant
+                # that has already been classified as non-automatic so
+                # shutdown can release the live process lock.
+                self._startup_pending_execution = None
+                self._pending_snapshot_venues.clear()
             self._shutdown_reconcile_required = bool(
                 self._pending_snapshot_venues)
             self._residual_book_after.clear()
@@ -1537,10 +3200,26 @@ class Engine:
             self._residual_waiting_book_venues.clear()
             self._post_order_recovery_active = False
             return False
-        await self._maybe_hedge()
+        positions_were_refreshed = complete and not order_recovery
+        hedged = await self._maybe_hedge()
         net = sum(v.position for v in self.venues.values())
+        pending_execution = (
+            None if self.pending_execution_store is None
+            else self.pending_execution_store.load())
+        if (pending_execution is not None
+                and abs(net) <= self.cfg.net_tolerance_base
+                and (hedged or not positions_were_refreshed)):
+            complete = await self._reconcile_positions(
+                hedge=False, strict=strict)
+            if not complete:
+                return False
+            net = sum(v.position for v in self.venues.values())
         recovered = (generation == self._recovery_generation
-                     and abs(net) <= self.cfg.net_tolerance_base)
+                     and abs(net) <= self.cfg.net_tolerance_base
+                     and self._reconcile_live_campaign())
+        if recovered and pending_execution is not None:
+            recovered = self._clear_pending_execution_if_safe(
+                pending_execution)
         if recovered:
             self._shutdown_reconcile_required = False
             self._recovery_required = False

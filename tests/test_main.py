@@ -22,6 +22,19 @@ class WaitingEngine:
         await self.stop.wait()
 
 
+def test_record_only_help_mentions_residual_shadow_strategy(
+        monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["main.py", "--help"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        main_module.main()
+
+    assert exit_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "shadow strategy" in output
+    assert "send no orders" in output
+
+
 def test_dashboard_failure_stops_engine_and_propagates():
     class BrokenDashboard:
         @staticmethod

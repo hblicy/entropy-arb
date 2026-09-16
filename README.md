@@ -82,9 +82,10 @@ of `lighter`, `lighter-rh`, or `tradexyz`. If the hedge venue uses a different
 name for the same asset, add `--hedge-symbol`; it defaults to `--symbol` when
 omitted.
 
-There is **no paper mode** — the bot either collects data (`--record-only`)
-or trades live. Validate with recorded data and tiny position caps, not with
-simulated fills.
+`--record-only` never sends orders. With `strategy.mode: residual_dynamic` it
+also advances a separate shadow campaign using planned prices; those assumed
+fills are validation evidence, not executable or realized PnL. The legacy
+`fixed_premium` mode continues to collect data only.
 
 **1. Collect data first** (no credentials needed):
 
@@ -100,14 +101,38 @@ python3 main.py --record-only --symbol ANTH --hedge lighter-rh \
   --hedge-symbol ANTHROPIC --no-dashboard
 ```
 
+For a VPS or `screen` session, preserve console logs explicitly:
+
+```bash
+python -u main.py \
+  --record-only \
+  --symbol ANTH \
+  --hedge lighter-rh \
+  --hedge-symbol ANTHROPIC \
+  --no-dashboard \
+  2>&1 | tee -a logs/engine.log
+```
+
 Let it run for at least a few hours (a day is better — premiums have
 intraday regimes). It writes minute aggregates to `logs/minutes.csv` and,
-in `--record-only` only, signal lifecycles to `logs/signals.csv`. A signal
-row is written immediately on `start`, once per second as `sample`, and on
-disappearance, stale books, or shutdown as `end`. These rows are observation
-only: they do not gate entries or change live strategy behavior. The signal
-path can be changed with `recorder.signal_csv`. Both files include each leg's
-native symbol, the Entropy DEX, and the hedge venue on every row.
+in `--record-only` only, continuous top-of-book observations to
+`logs/signals.csv`. While no fixed-premium signal is active it writes a neutral
+`snapshot` about once per second; an active signal instead writes `start`,
+one-second `sample` rows, then `end` on disappearance, stale books, or shutdown.
+These rows are observation only: they do not gate entries or change live
+strategy behavior. The signal path can be changed with `recorder.signal_csv`.
+Both files include each leg's native symbol, the Entropy DEX, and the hedge
+venue on every row.
+
+Reference prices and funding are collected on the existing market-data
+WebSockets, initialized by REST, and refreshed by REST while a reference
+stream is stale. Hyperliquid and Lighter funding are normalized to
+`bps/hour`. In `fixed_premium` mode, reference failures and residual alerts remain
+observational only. In `residual_dynamic` mode, fresh, sufficiently aligned
+reference data is required for new risk; hard exits remain available without it.
+Signal rows append both legs' reference price/funding/age fields plus the
+directional signed executable premium, signed residual, residual edge, and
+net funding. Missing reference values stay blank without dropping the signal.
 
 Use a separate `recorder.csv` for each symbol/venue combination. The analyzer
 accepts legacy files with the old `symbol` identity or with no market columns,
@@ -120,11 +145,21 @@ creation or write failure stops the process with an error. If a minute row has
 already been handed to the CSV writer when `flush()` reports an ambiguous I/O
 failure, that minute aggregate is not blindly written again; this prevents
 duplicates but cannot guarantee delivery after a failed flush.
+With `recorder.signal_rotate_daily: true`, `signals.csv` rolls at the first
+row of a new UTC day. A September 10 file becomes
+`signals-20260910.csv.gz`; conflicts use `.gz.1`, `.gz.2`, and so on. The gzip
+is fully verified before the raw archive is removed. If compression fails,
+the dated raw CSV is retained and recording continues in a new `signals.csv`.
 
 **2. Analyze and set your thresholds:**
 
 ```bash
 python3 tools/analyze.py --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
+python3 tools/analyze.py --csv logs/minutes-20260910.csv.gz \
+  --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
+python3 tools/analyze.py --csv logs/minutes.csv \
+  --strategy-csv logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.shadow.csv \
+  --entropy-fee-bps 0.9 --hedge-fee-bps 0.0
 ```
 
 It analyzes `logs/minutes.csv` and prints the premium distribution, how often
@@ -133,6 +168,84 @@ for `config.yaml`. Restart fragments carrying the same market and minute are
 combined before sample filtering, so a minute is counted once. It does not
 analyze `logs/signals.csv`, and it will not mix multiple identified markets
 from one minute file.
+When the new reference columns contain valid samples, the analyzer also prints
+the minute-close distributions of reference basis, signed residual, and
+funding difference. With `--strategy-csv` it additionally reports completed
+and open campaigns, hold windows, forced closes, model availability, reject
+reasons, and shadow/realized results. Plain `.csv` and `.csv.gz` inputs use the
+same logic.
+
+Replay rotated raw signal files before considering live operation. This is a
+read-only **top-of-book approximation**; it deliberately does not report its
+assumed fills as actual PnL. Files produced by current versions contain
+continuous `snapshot` coverage. Legacy files containing only threshold-triggered
+lifecycles remain readable, but the result is explicitly marked
+`threshold-censored legacy` and must not be treated as a complete timeline.
+For mixed signal files, `coverage start` is the first `snapshot` actually used
+for continuous replay. `censored prefix: yes` means older lifecycle rows precede
+that snapshot, statistics start at the snapshot, and the earlier timeline is
+incomplete. Pure legacy input reports `coverage start: n/a`.
+The replay also reports its requested and actual coverage end; an incomplete
+timeline is flagged instead of extending the last quote to the requested end:
+
+```bash
+python3 tools/replay_strategy.py \
+  --minutes logs/minutes.csv \
+  --signals logs/signals-20260912.csv.gz \
+            logs/signals-20260913.csv.gz \
+            logs/signals.csv \
+  --config config.yaml
+```
+
+### Dynamic residual shadow-to-live gate
+
+Set `strategy.mode: residual_dynamic` to use the rolling signed-residual model.
+The default `strategy.live_enabled: false` is a second, independent live safety
+gate. Real dynamic orders are possible only when all three conditions hold:
+
+1. `strategy.mode` is `residual_dynamic`;
+2. `strategy.live_enabled` is `true`;
+3. the command does not contain `--record-only`.
+
+`strategy.state_file` and `strategy.event_csv` are base paths. The engine adds
+a deterministic market tag and then the mode marker, so different symbols,
+venues, and live/shadow runs never share strategy state. For the ANTH example,
+the derived live files are
+`logs/campaign-state.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.json`, its
+`.pending.json` journal, and
+`logs/strategy-events.io--ANTH--lighter-rh--ANTHROPIC-ae4e3987a8.csv`;
+record-only uses the corresponding `.shadow.json` and `.shadow.csv` files.
+
+After upgrading, startup deliberately refuses an old unscoped state such as
+`logs/campaign-state.json`, `logs/campaign-state.pending.json`, or
+`logs/campaign-state.shadow.json`. First verify both exchange positions and
+identify the exact market and mode that own the file; then back it up and move
+it manually to the path named in the startup error. Never rename an old state
+blindly or reuse one file for another market.
+
+Live startup first reads both real
+positions, then accepts the saved campaign only when its pair, direction and
+matched quantity agree. A missing/mismatched/corrupt state pauses dynamic
+trading for manual recovery; it is never reconstructed from positions.
+Every dynamic live submission also writes the market-scoped `.pending.json`
+journal before either leg can start. If that file
+contains an unfinished execution after a restart, the engine automatically
+resolves only legs with durable order references, applies the campaign change
+exactly once, and clears the journal only after both exchange positions have
+been refreshed and agree. Missing references, an incomplete trade audit, or
+contradictory state stays blocked for manual verification; the engine never
+guesses or resends the original order.
+New code writes and auto-loads active pending state only as schema v4. An empty
+schema v3 journal is accepted as having no pending execution, but an active v3
+journal is left unchanged and blocks startup for manual verification. Schema
+v2, unknown, and malformed journals also fail closed: manually verify both
+venues' order histories and actual positions before handling them; do not
+delete a journal or edit its schema version directly. A record-only upgrade
+with no pending file is unaffected. In schema v4,
+`settled_at` is when the engine first confirms that both legs are terminal;
+the recovered event timestamp and hold duration use that time. Completing an
+upgrade, tests, or replay is not authorization to set `live_enabled: true`;
+live enablement still requires a separate manual check.
 
 **3. Go live** — fill in `.env`, install the signing SDKs, and start with
 the smallest position caps that clear the venue minimums:
@@ -146,8 +259,26 @@ The direct runtime and signing dependencies are pinned, including Lighter at
 a specific Git commit. Upgrade them deliberately and repeat the full test and
 record-only checks before deploying the new environment.
 
-Running without `--record-only` sends real orders immediately once both
-feeds are fresh and the band is crossed.
+Running without `--record-only` uses real accounts. The fixed strategy can send
+as soon as both feeds are fresh and its band is crossed. The dynamic strategy
+also requires its independent live gate, ready model, persistence checks,
+reference checks, and campaign-state reconciliation.
+
+Live mode also holds an operating-system lock object for each signing account:
+an abstract Unix-domain socket on Linux or a `Global\\` named mutex on Windows.
+Within the same Linux network namespace or Windows global object namespace, a
+second live process exits before feeds or strategy tasks start if any signing
+account is already in use, including across markets. The operating system
+releases the object when the process exits; do not bypass this guard. Separate
+hosts or Linux network namespaces (including ordinary isolated containers)
+cannot share it and must use different API wallets/signing accounts.
+`--record-only` does not take a lock.
+
+Before upgrading from a version that used lock files, stop every old live
+engine and confirm that no old `main.py` process remains. Rolling upgrades
+between the file-lock and kernel-lock versions are not supported; starting the
+new version while an old live process is still running can bypass mutual
+exclusion. Record-only processes do not affect this requirement.
 
 **Dashboard.** On a terminal the bot shows a live Rich dashboard: both
 books with age/spread, positions and caps, equity and session PnL, the
@@ -172,6 +303,11 @@ Once per second it samples both live books; once per minute it writes a row:
 | `premium_open/high/low/close/mean/std_bps` | mid-to-mid premium of Entropy over the hedge |
 | `sell_edge_mean/max_bps` | executable premium for SELL entropy (entropy bid / hedge ask − 1) |
 | `buy_edge_mean/max_bps` | executable premium for BUY entropy (hedge bid / entropy ask − 1) |
+| `*_oracle_px`, `*_index_px`, `*_mark_px` | latest available normalized reference prices; unavailable venue fields remain blank |
+| `*_funding_current/last_bps_per_hour`, `*_funding_last_ts_ms` | normalized current/last funding and its exchange timestamp |
+| `*_reference_age_ms`, `reference_update_skew_ms` | monotonic age of each reference and receive-time skew between legs |
+| `reference_basis_close_bps`, `funding_diff_close_bps_per_hour` | Entropy oracle / hedge index basis; current Entropy funding minus hedge funding |
+| `residual_open/high/low/close/mean/std_bps` | mid-price premium minus reference basis, using only samples with both required references |
 | `samples` | how many of the ~60 seconds both books were fresh |
 
 Recorded edges are pre-fee. Pass each venue's taker fee separately with
@@ -201,11 +337,17 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
 | `*.max_position_usd` | per-venue position cap | 1000 |
 | `*.max_orders_per_min` | per-venue send budget (sliding 60 s) | 120; lighter hedges 30 |
 | `sizing.take_fraction` | fraction of crossable depth taken | 0.5 |
-| `sizing.max_order_notional_usd` | per-slice cap | 500 |
+| `sizing.max_order_notional_usd` | hard cap on each leg's actual planned notional for one slice | 500 |
 | `inventory.scale_bps` / `floor_frac` | inventory ladder (extra bps past `floor_frac` of the cap) | 10 / 0.5 |
 | `execution.premium_persist_sec` | edge must persist before firing | 0.3 |
 | `execution.*` | slippage bounds, timeouts, reconcile cadence… | see file |
 | `recorder.*` | minute data; record-only signal lifecycle path | on, `logs/minutes.csv`; `logs/signals.csv` |
+| `recorder.signal_rotate_daily` | rotate and verified-gzip signal rows by UTC day | true |
+| `reference.rest_recovery_sec` / `stale_sec` | REST recovery cadence / reference stale threshold | 15 / 60 |
+| `reference.residual_alert_bps` / `residual_persist_sec` | stateful observational residual alert threshold / persistence | 20 / 30 |
+| `strategy.mode` / `strategy.live_enabled` | fixed or rolling-residual strategy; independent dynamic live gate | `residual_dynamic` / false |
+| `strategy.state_file` / `strategy.event_csv` | base paths; runtime adds a market hash and live/shadow marker | `logs/campaign-state.json`; `logs/strategy-events.csv` |
+| `slippage.*` | real-fill p95 budget, hard cap and entry degradation controls | see file |
 | `logging.dashboard` / `logging.file` | Rich dashboard on a tty; log file while it runs | on, `logs/engine.log` |
 
 ## Credentials (`.env`, live only)
@@ -249,6 +391,13 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   execution pathologies halt the engine entirely. An ambiguous order result
   freezes new entries until strict position reconciliation and any required
   reduce-only hedge leave the known net position within tolerance.
+- **Crash evidence and single instance**: dynamic live writes a non-secret
+  pending-execution journal before submission and fails closed when it finds
+  unfinished evidence at restart. An OS lock rejects a second live process for
+  any signing account already used in the same Linux network namespace or
+  Windows global object namespace, including across markets; record-only
+  processes remain unaffected. Processes on different hosts or Linux network
+  namespaces must use different API wallets/signing accounts.
 - **Safe shutdown**: after a stop signal, no new opportunity is started and
   the process keeps waiting for every already-submitted two-leg execution to
   settle before closing exchange connections. A long wait is logged as
@@ -256,8 +405,10 @@ and unsafe amount/rate/timeout boundaries are startup errors), credentials in `.
   failures still close every venue and task already created. Any supervised
   background task that fails or exits unexpectedly stops the engine and makes
   the process exit nonzero after cleanup.
-- **Live-only**: there is no simulated-fill mode. `--record-only` is the
-  risk-free way to run it; anything else trades real money.
+- **No-order shadow**: `--record-only` cannot submit orders. Dynamic shadow
+  fills use planned prices only and must not be interpreted as live results;
+  anything without `--record-only` can trade real money when its live gates
+  permit it.
 
 ## Layout
 
@@ -274,7 +425,12 @@ entropy_arb/venues/registry.py  explicit adapter factory registry
 entropy_arb/engine.py    the two-venue strategy loop
 entropy_arb/dashboard.py Rich terminal dashboard
 entropy_arb/recorder.py  1-minute bars + record-only signal lifecycles
-tools/analyze.py         minutes.csv -> suggested thresholds
+entropy_arb/strategy.py  rolling residual model and pure decisions
+entropy_arb/campaign.py  durable one-campaign state and reconciliation
+entropy_arb/recovery_state.py  durable pending-execution journal
+entropy_arb/live_lock.py cross-process live signing-account locks
+tools/analyze.py         minute thresholds + optional campaign summary
+tools/replay_strategy.py read-only top-of-book strategy replay
 tests/                   python3 -m pytest tests/
 ```
 
@@ -290,8 +446,9 @@ foundation for the staged multi-hedge design in
 - **USDG basis** (`lighter-rh`): the hedge quotes in USDG. Part of any
   persistent premium is the stablecoin itself; your midline absorbs the
   level, but a USDG *move* is real PnL.
-- **Funding**: two venues, two independent funding rates; carry is not
-  modeled. Position caps bound it — keep them modest.
+- **Funding**: two venues have independent funding rates. In both strategy
+  modes they are normalized, recorded, and alerted on, but carry does not gate
+  entries or alter thresholds. Position caps bound it — keep them modest.
 - **Thin books**: Entropy depth can be tiny; `take_fraction` and notional
   caps keep clips small, but slippage on the hedge leg after a partial fill
   is real.
@@ -302,7 +459,9 @@ foundation for the staged multi-hedge design in
   deliberately stops for manual recovery, so active monitoring is required.
 
 Use at your own risk. This is trading software operating with real money;
-nothing here is investment advice. Start with tiny position caps.
+nothing here is investment advice. Before any live run, repeat
+`--record-only`, verify the reference columns and `logs/engine.log`, and start
+with tiny position caps. These checks do not make live trading risk-free.
 
 ## License
 

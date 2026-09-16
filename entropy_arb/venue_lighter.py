@@ -33,6 +33,7 @@ from .book import OrderBook
 from .config import VenueConf
 from .feeds import LighterBookFeed
 from .models import OrderResult
+from .reference import InvalidReference, ReferenceState, ReferenceUpdate
 
 log = logging.getLogger("lighter")
 
@@ -58,6 +59,28 @@ REST_TIMEOUT = 10.0
 COI_COUNTER_BITS = 40
 COI_COUNTER_MASK = (1 << COI_COUNTER_BITS) - 1
 COI_RESERVATION_SIZE = 1 << 16
+
+
+def parse_lighter_rest_market(
+        market: dict, funding: Optional[dict]) -> ReferenceUpdate:
+    try:
+        rate = None if funding is None else funding.get("rate")
+        return ReferenceUpdate(
+            index_px=(None if market.get("index_price") is None
+                      else float(market["index_price"])),
+            mark_px=(None if market.get("mark_price") is None
+                     else float(market["mark_price"])),
+            funding_current_bps_per_hour=(
+                None if rate is None else float(rate) * 1e4 / 8.0),
+            funding_last_ts_ms=(
+                None if funding is None or funding.get("timestamp") is None
+                else int(funding["timestamp"])),
+            exchange_ts_ms=(None if market.get("timestamp") is None
+                            else int(market["timestamp"])),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidReference(f"invalid Lighter REST market reference: {exc}") \
+            from exc
 
 
 def _default_coi_state_path() -> Path:
@@ -261,6 +284,7 @@ class LighterVenue:
         self.settle_timeout = settle_timeout_sec
         self.profile = conf.lighter_profile
         self.book = OrderBook()
+        self.reference = ReferenceState()
         self.position = 0.0
         self.cash = 0.0
         self.volume_usd = 0.0     # cumulative filled notional this session
@@ -322,9 +346,40 @@ class LighterVenue:
                      self.market_id, self.price_decimals, self.size_decimals,
                      ob["min_base_amount"], ob["min_quote_amount"],
                      ob.get("taker_fee"))
+            try:
+                await self.refresh_reference_rest()
+            except (aiohttp.ClientError, asyncio.TimeoutError,
+                    InvalidReference) as exc:
+                log.warning("[%s] initial reference REST failed: %s",
+                            self.name, exc)
             return
         raise RuntimeError(f"[{self.name}] {self.conf.symbol} not found on "
                            f"{self.profile.name}")
+
+    async def refresh_reference_rest(self) -> bool:
+        websocket_generation = self.reference.websocket_generation
+        try:
+            markets = await self._get(
+                "/api/v1/orderBookDetails",
+                params={"market_id": self.market_id})
+            market = next(
+                item for item in markets.get("order_book_details") or []
+                if int(item.get("market_id", -1)) == self.market_id)
+            funding_data = await self._get("/api/v1/funding-rates")
+            funding = next(
+                (item for item in funding_data.get("funding_rates") or []
+                 if (int(item.get("market_id", -1)) == self.market_id
+                     and item.get("exchange") == "lighter")),
+                None)
+            update = parse_lighter_rest_market(market, funding)
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            raise InvalidReference(
+                f"invalid Lighter REST reference payload for market "
+                f"{self.market_id}: {exc}") from exc
+        return self.reference.apply_rest_if_ws_unchanged(
+            update,
+            expected_websocket_generation=websocket_generation,
+        )
 
     def init_signer(self) -> None:
         c = self.conf.lighter_creds
@@ -353,6 +408,13 @@ class LighterVenue:
         """Lighter deployments do not share Hyperliquid account state."""
         return
 
+    def account_lock_id(self) -> str:
+        c = self.conf.lighter_creds
+        if c is None or c.account_index is None:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        return f"lighter:{self.profile.chain_id}:{c.account_index}"
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         def book_notify() -> None:
             notify("book", self.key)
@@ -369,7 +431,7 @@ class LighterVenue:
                 notify=order_notify)
         tasks = [asyncio.create_task(
             LighterBookFeed(self.name, self.profile.ws_url, self.market_id,
-                            self.book, book_notify).run(stop),
+                            self.book, book_notify, self.reference).run(stop),
             name=f"book-{self.key}")]
         if orders_feed is not None:
             self.orders_feed = orders_feed

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """entropy-arb entry point.
 
-    # collect minute data only — no strategy, no credentials needed
+    # collect data / run dynamic shadow — no orders, no credentials needed
     python3 main.py --record-only --symbol SNDK --hedge lighter-rh
 
     # venue-native symbols may differ
@@ -14,9 +14,10 @@
 --symbol and --hedge are required on every start: the markets you trade are
 an explicit decision, not a config default. If the hedge venue uses another
 name for the same asset, pass it with --hedge-symbol. Add --cn for a
-Chinese-language dashboard. There is no paper mode. Collect data with
---record-only, set your thresholds with tools/analyze.py, then go live with
-small position caps.
+Chinese-language dashboard. --record-only never sends orders; in dynamic mode
+it also runs a top-of-book shadow strategy whose assumed fills are not actual
+PnL. Collect data, analyze or replay it, then explicitly enable live dynamic
+trading with small position caps.
 
 On a terminal the bot shows a live Rich dashboard (books, signal, positions,
 PnL, last executions) and writes log lines to logging.file; use
@@ -204,8 +205,9 @@ def main() -> None:
     p.add_argument("--env-file", default=".env",
                    help="credentials file (default: .env)")
     p.add_argument("--record-only", action="store_true",
-                   help="only collect minute data, run no strategy, send no "
-                        "orders (needs no credentials)")
+                   help=("collect data and, in residual_dynamic mode, run "
+                         "the shadow strategy; send no orders (needs no "
+                         "credentials)"))
     p.add_argument("--cn", action="store_true",
                    help="display the dashboard in Chinese / 仪表盘使用中文")
     disp = p.add_mutually_exclusive_group()

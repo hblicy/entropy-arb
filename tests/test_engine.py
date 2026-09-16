@@ -4,7 +4,10 @@ Run:  python3 -m pytest tests/  (or  python3 tests/test_engine.py)
 """
 import asyncio
 import csv
+from dataclasses import replace
+import logging
 import os
+from pathlib import Path
 import sys
 import tempfile
 import time
@@ -15,10 +18,31 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import entropy_arb.engine as engine_module  # noqa: E402
-from entropy_arb.book import ArbPlan, OrderBook  # noqa: E402
+from entropy_arb.book import (  # noqa: E402
+    ArbPlan,
+    ConvergencePlan,
+    MatchedClosePlan,
+    OrderBook,
+)
+from entropy_arb.campaign import (  # noqa: E402
+    CampaignStore,
+    PositionCampaign,
+)
 from entropy_arb.config import load_config  # noqa: E402
 from entropy_arb.engine import Engine  # noqa: E402
+from entropy_arb.live_lock import (  # noqa: E402
+    LiveProcessLock,
+    LiveProcessLockError,
+)
 from entropy_arb.models import OrderResult  # noqa: E402
+from entropy_arb.recovery_state import PendingAuditContext  # noqa: E402
+from entropy_arb.reference import (  # noqa: E402
+    ReferenceAlertState,
+    ReferenceState,
+    ReferenceUpdate,
+)
+from entropy_arb.runtime_paths import strategy_paths  # noqa: E402
+from entropy_arb.strategy import MarketIdentity, ModelSnapshot  # noqa: E402
 from entropy_arb.venue_lighter import LighterVenue  # noqa: E402
 
 NO_ENV = os.path.join(tempfile.gettempdir(), "entropy-arb-no-such.env")
@@ -48,9 +72,18 @@ class StubVenue:
         self.orders_per_min = 30
         self.last_traded_ts = 0.0
         self.book = OrderBook()
+        self.reference = ReferenceState()
+        self.reference_refreshes = 0
+
+    async def refresh_reference_rest(self):
+        self.reference_refreshes += 1
+        return False
 
     def ready_to_trade(self):
         return True
+
+    def account_lock_id(self):
+        return f"test-account:{self.key}"
 
     def set_book(self, bid, ask, sz=50.0):
         self.book.apply_hl([[{"px": str(bid), "sz": str(sz)}],
@@ -82,6 +115,16 @@ class PositionVenue(ExecutingVenue):
 
     async def send_taker(self, **kwargs):
         self.send_calls += 1
+        return await super().send_taker(**kwargs)
+
+
+class RecordingPositionVenue(PositionVenue):
+    def __init__(self, key, label, result, chain_position=0.0):
+        super().__init__(key, label, result, chain_position)
+        self.send_args = []
+
+    async def send_taker(self, **kwargs):
+        self.send_args.append(kwargs)
         return await super().send_taker(**kwargs)
 
 
@@ -145,6 +188,15 @@ class LiveLifecycleVenue(LifecycleVenue):
     async def send_taker(self, **_kwargs):
         self.send_calls += 1
         return OrderResult(status="filled", filled_base=0.0)
+
+
+class RecoveringLifecycleVenue(LiveLifecycleVenue):
+    def __init__(self, key, label, chain_position, terminal_results):
+        super().__init__(key, label, chain_position)
+        self.terminal_results = terminal_results
+
+    async def resolve_order(self, order_ref):
+        return self.terminal_results.get(order_ref)
 
 
 class BurstVenue(LifecycleVenue):
@@ -301,8 +353,2346 @@ def make_engine(record_only=False, **thr):
     return eng
 
 
+@pytest.mark.parametrize("sell_position", [-4.9, 4.9])
+def test_fixed_headroom_values_sell_position_at_sell_price(sell_position):
+    eng = make_engine()
+    eng.entropy.cap_usd = 1000.0
+    eng.hedge.cap_usd = 1000.0
+    eng.hedge.position = 0.0
+    eng.entropy.position = sell_position
+    eng.hedge.set_book(99.0, 100.0)
+    eng.entropy.set_book(200.0, 201.0)
+
+    headroom = eng._headroom(
+        eng.hedge, eng.entropy, buy_px=100.0, sell_px=200.0)
+
+    sell_base_headroom = 1000.0 / 200.0 + sell_position
+    assert headroom == pytest.approx(sell_base_headroom * 100.0)
+
+
+def test_fixed_scan_rechecks_cap_after_sell_limit_changes():
+    eng = make_engine()
+    eng.hedge.cap_usd = 10_000.0
+    eng.entropy.cap_usd = 2_000.0
+    eng.entropy.position = -15.0
+    eng.hedge.book.apply_hl([
+        [{"px": "99", "sz": "50"}],
+        [{"px": "100", "sz": "50"}],
+    ])
+    eng.entropy.book.apply_hl([
+        [{"px": "110", "sz": "4.1"},
+         {"px": "105", "sz": "50"}],
+        [{"px": "111", "sz": "50"}],
+    ])
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    buy, sell, plan = result
+    assert buy is eng.hedge
+    assert sell is eng.entropy
+    assert (plan.qty - sell.position) * plan.sell_limit \
+        <= sell.cap_usd + 1e-9
+
+
+def test_fixed_scan_values_sell_position_at_current_mid():
+    eng = make_engine()
+    eng.hedge.cap_usd = 10_000.0
+    eng.entropy.cap_usd = 2_000.0
+    eng.entropy.position = -15.0
+    eng.hedge.book.apply_hl([
+        [{"px": "99", "sz": "50"}],
+        [{"px": "100", "sz": "50"}],
+    ])
+    eng.entropy.book.apply_hl([
+        [{"px": "120", "sz": "1"},
+         {"px": "110", "sz": "50"}],
+        [{"px": "121", "sz": "50"}],
+    ])
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    _, sell, plan = result
+    assert (plan.qty - sell.position) * sell.book.mid() \
+        <= sell.cap_usd + 1e-9
+
+
+def test_fixed_scan_values_buy_position_at_execution_bound():
+    eng = make_engine()
+    eng.cfg.leg_slippage_bps = 100.0
+    eng.hedge.cap_usd = 100.0
+    eng.entropy.cap_usd = 10_000.0
+    eng.hedge.set_book(99.0, 100.0)
+    eng.entropy.set_book(102.0, 103.0)
+    now = time.monotonic()
+    eng._armed["sell_entropy"] = now - 1.0
+
+    result = eng._scan(now)
+
+    assert result is not None
+    buy, _, plan = result
+    buy_bound = plan.buy_limit * (
+        1.0 + eng.cfg.leg_slippage_bps / 1e4)
+    assert (buy.position + plan.qty) * buy_bound \
+        <= buy.cap_usd + 1e-9
+
+
+def make_uninitialized_dynamic_engine(tmp_path, *, record_only=True,
+                                      reference=True):
+    cfg = make_cfg()
+    cfg.strategy_mode = "residual_dynamic"
+    cfg.strategy_window_minutes = 10
+    cfg.strategy_min_samples = 4
+    cfg.strategy_regime_window_minutes = 2
+    cfg.strategy_regime_recovery_minutes = 1
+    cfg.strategy_state_file = str(tmp_path / "campaign-state.json")
+    cfg.strategy_event_csv = str(tmp_path / "strategy-events.csv")
+    cfg.recorder_csv = str(tmp_path / "minutes.csv")
+    cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+    cfg.premium_persist_sec = 0.0
+    cfg.cooldown_sec = 0.0
+    cfg.max_order_notional = 500.0
+    eng = Engine(cfg, record_only=record_only)
+    filled = OrderResult(status="filled", filled_base=0.0)
+    eng.entropy = PositionVenue("entropy", "ENTROPY", filled)
+    eng.hedge = PositionVenue("hedge", "RH", filled)
+    eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
+    eng._step, eng._min_base, eng._min_notional = 0.01, 0.01, 10.0
+    if reference:
+        now = time.monotonic()
+        eng.entropy.reference.apply(
+            ReferenceUpdate(oracle_px=100.0), source="websocket",
+            received_mono=now)
+        eng.hedge.reference.apply(
+            ReferenceUpdate(index_px=100.0), source="websocket",
+            received_mono=now)
+    return eng
+
+
+def make_dynamic_engine(tmp_path, *, reference=True):
+    eng = make_uninitialized_dynamic_engine(
+        tmp_path,
+        record_only=True,
+        reference=reference,
+    )
+    eng._initialize_dynamic_strategy(now_wall=time.time())
+    return eng
+
+
+def configured_strategy_paths(cfg, *, shadow):
+    return strategy_paths(
+        cfg.strategy_state_file,
+        cfg.strategy_event_csv,
+        MarketIdentity(
+            cfg.entropy.symbol,
+            cfg.entropy.hl_dex,
+            cfg.hedge.symbol,
+            cfg.hedge_venue,
+        ),
+        shadow=shadow,
+    )
+
+
+@pytest.mark.parametrize("legacy_kind", ["campaign", "pending"])
+def test_live_dynamic_rejects_legacy_unscoped_state(
+        tmp_path, legacy_kind):
+    eng = make_uninitialized_dynamic_engine(tmp_path, record_only=False)
+    legacy = (
+        Path(eng.cfg.strategy_state_file)
+        if legacy_kind == "campaign"
+        else engine_module.pending_execution_path(
+            eng.cfg.strategy_state_file)
+    )
+    legacy.write_text("legacy-live-state", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as error:
+        eng._initialize_dynamic_strategy(now_wall=time.time())
+
+    message = str(error.value)
+    assert str(legacy) in message
+    paths = strategy_paths(
+        eng.cfg.strategy_state_file,
+        eng.cfg.strategy_event_csv,
+        eng._market_identity(),
+        shadow=False,
+    )
+    expected = paths.campaign if legacy_kind == "campaign" else paths.pending
+    assert str(expected) in message
+    assert legacy.read_text(encoding="utf-8") == "legacy-live-state"
+
+
+def test_record_only_dynamic_rejects_legacy_unscoped_shadow_state(tmp_path):
+    eng = make_uninitialized_dynamic_engine(tmp_path, record_only=True)
+    legacy = CampaignStore(
+        eng.cfg.strategy_state_file,
+        shadow=True,
+    ).path
+    legacy.write_text("legacy-shadow-state", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as error:
+        eng._initialize_dynamic_strategy(now_wall=time.time())
+
+    message = str(error.value)
+    assert str(legacy) in message
+    paths = strategy_paths(
+        eng.cfg.strategy_state_file,
+        eng.cfg.strategy_event_csv,
+        eng._market_identity(),
+        shadow=True,
+    )
+    assert str(paths.campaign) in message
+    assert legacy.read_text(encoding="utf-8") == "legacy-shadow-state"
+
+
+def seed_dynamic_model(eng):
+    now_minute = int(time.time() // 60)
+    for offset, value in enumerate((-20.0, 0.0, 20.0, 40.0)):
+        eng.residual_model.observe(
+            minute=now_minute - 3 + offset,
+            residual_bps=value,
+            valid=True)
+
+
+def set_dynamic_sell_market(eng, residual_bps):
+    hedge_bid, hedge_ask = 99.99, 100.0
+    entropy_bid = hedge_ask * (1.0 + residual_bps / 1e4)
+    eng.entropy.set_book(entropy_bid, entropy_bid + 0.01, sz=20.0)
+    eng.hedge.set_book(hedge_bid, hedge_ask, sz=20.0)
+    for venue in (eng.entropy, eng.hedge):
+        venue.book.last_update_mono = max(
+            venue.book.last_update_mono, venue.last_traded_ts + 1e-6)
+
+
+def test_residual_record_only_shadow_open_and_close_never_sends_orders(
+        tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            assert eng.campaign.mode == "shadow"
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            eng.cfg.cooldown_sec = 3600.0
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.trades == 0
+            assert eng.entropy.position == 0
+            assert eng.hedge.position == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_shadow_adds_never_exceed_cumulative_venue_caps(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            eng.entropy.cap_usd = 100.0
+            eng.hedge.cap_usd = 100.0
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+            first_qty = eng.campaign.qty
+            await eng._evaluate()
+
+            assert eng.campaign.qty == first_qty
+            assert (eng.campaign.qty * eng.entropy.book.mid()
+                    <= eng.entropy.cap_usd + 1.0)
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_entry_cap_converts_mid_headroom_through_sell_book(tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        eng.entropy.cap_usd = 10_000.0
+        eng.hedge.cap_usd = 1_000.0
+        eng.entropy.set_book(100.0, 100.1, sz=50.0)
+        eng.hedge.set_book(99.9, 100.0, sz=50.0)
+        eng.campaign = __import__("dataclasses").replace(
+            dynamic_live_campaign(),
+            mode="shadow",
+            direction="buy_entropy",
+            qty=9.5,
+        )
+        hedge_mid = eng.hedge.book.mid()
+        remaining_base = eng.hedge.cap_usd / hedge_mid - eng.campaign.qty
+        safe_sell_notional = remaining_base * eng.hedge.book.best_bid()
+
+        cap = eng._dynamic_entry_cap("buy_entropy")
+
+        assert cap <= safe_sell_notional + 1e-9
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_dynamic_add_persistence_restarts_after_signal_disappears(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+            first_qty = eng.campaign.qty
+
+            eng.cfg.premium_persist_sec = 10.0
+            await eng._evaluate()
+            eng._armed["sell_entropy"] -= 11.0
+            set_dynamic_sell_market(eng, 30.0)
+            await eng._evaluate()
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+
+            assert eng.campaign.qty == first_qty
+            assert eng._armed["sell_entropy"] is not None
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("ready,reference", [(False, True), (True, False)])
+def test_shadow_model_and_reference_gates_never_create_campaign(
+        tmp_path, ready, reference):
+    async def go():
+        eng = make_dynamic_engine(tmp_path, reference=reference)
+        try:
+            if ready:
+                seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_does_not_require_live_account_readiness(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            eng.entropy.ready_to_trade = lambda: False
+            eng.hedge.ready_to_trade = lambda: False
+
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_state_uses_separate_file_and_survives_restart(tmp_path):
+    async def go():
+        first = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(first)
+            set_dynamic_sell_market(first, 45.0)
+            await first._evaluate()
+            campaign_id = first.campaign.campaign_id
+        finally:
+            first._close_dynamic_strategy()
+
+        assert not (tmp_path / "campaign-state.json").exists()
+        assert first.campaign_store.path.exists()
+
+        second = make_dynamic_engine(tmp_path)
+        try:
+            assert second.campaign.campaign_id == campaign_id
+        finally:
+            second._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_minute_observation_commits_previous_close_and_gaps(
+        tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        set_dynamic_sell_market(eng, 12.0)
+        expected_close = (
+            eng.entropy.book.mid() / eng.hedge.book.mid() - 1.0) * 1e4
+        base = 60_000.0
+        now_mono = time.monotonic()
+        eng._advance_dynamic_model(now_wall=base, now_mono=now_mono)
+        set_dynamic_sell_market(eng, 18.0)
+        eng._advance_dynamic_model(
+            now_wall=base + 60.0 * 3, now_mono=now_mono)
+
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60)).samples == 1
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60)).median_bps == pytest.approx(
+                expected_close)
+        assert eng.residual_model.snapshot(
+            now_minute=int(base // 60) + 2).samples == 1
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_dynamic_strategy_loop_wakes_at_minute_boundary_without_book_event(
+        tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        calls = 0
+
+        async def evaluate():
+            nonlocal calls
+            calls += 1
+            eng.stop.set()
+
+        eng._evaluate = evaluate
+        eng._dynamic_wakeup_timeout = lambda: 0.01
+        try:
+            await asyncio.wait_for(eng._strategy_loop(), timeout=0.1)
+            assert calls == 1
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def dynamic_live_campaign():
+    return PositionCampaign(
+        campaign_id="live-campaign",
+        mode="live",
+        identity=MarketIdentity("SNDK", "io", "SNDK", "lighter-rh"),
+        direction="sell_entropy",
+        opened_at=time.time() - 60,
+        qty=1.0,
+        entropy_avg_px=100.2,
+        hedge_avg_px=100.0,
+        frozen_model=ModelSnapshot(
+            version=1, minute=int(time.time() // 60), samples=120,
+            status="READY", median_bps=0.0, lower_bps=-10.0,
+            q25_bps=-2.0, q75_bps=2.0, upper_bps=10.0),
+        entry_boundary_bps=10.0,
+        exit_target_bps=2.5,
+        fees_usd=0.0,
+        realized_pnl_usd=0.0,
+    )
+
+
+def make_dynamic_live_cfg(tmp_path):
+    cfg = make_cfg()
+    cfg.strategy_mode = "residual_dynamic"
+    cfg.strategy_live_enabled = True
+    cfg.strategy_state_file = str(tmp_path / "campaign-state.json")
+    cfg.strategy_event_csv = str(tmp_path / "strategy-events.csv")
+    cfg.recorder_enabled = False
+    cfg.recorder_csv = str(tmp_path / "minutes.csv")
+    cfg.trades_csv = str(tmp_path / "trades.csv")
+    cfg.entropy.hl_creds = SimpleNamespace(complete=True)
+    cfg.hedge.lighter_creds = SimpleNamespace(complete=True)
+    return cfg
+
+
+def make_live_dynamic_execution_engine(
+        tmp_path, *, buy_fill=1.0, sell_fill=1.0):
+    cfg = make_dynamic_live_cfg(tmp_path)
+    cfg.strategy_window_minutes = 10
+    cfg.strategy_min_samples = 4
+    cfg.strategy_regime_window_minutes = 2
+    cfg.strategy_regime_recovery_minutes = 1
+    cfg.premium_persist_sec = 0.0
+    cfg.cooldown_sec = 0.0
+    cfg.max_order_notional = 500.0
+    eng = Engine(cfg, record_only=False)
+    eng.entropy = RecordingPositionVenue(
+        "entropy", "ENTROPY",
+        OrderResult(status="filled", filled_base=sell_fill,
+                    avg_px=100.45 if sell_fill else None))
+    eng.hedge = RecordingPositionVenue(
+        "hedge", "RH",
+        OrderResult(status="filled", filled_base=buy_fill,
+                    avg_px=100.0 if buy_fill else None))
+    eng.venues = {"entropy": eng.entropy, "hedge": eng.hedge}
+    eng._step, eng._min_base, eng._min_notional = 0.01, 0.01, 10.0
+    now = time.monotonic()
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=100.0), source="websocket",
+        received_mono=now)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=100.0), source="websocket",
+        received_mono=now)
+    eng._initialize_dynamic_strategy(now_wall=time.time())
+    seed_dynamic_model(eng)
+    set_dynamic_sell_market(eng, 45.0)
+    return eng
+
+
+async def reconcile_dynamic_execution(eng):
+    eng.entropy.chain_position = eng.entropy.position
+    eng.hedge.chain_position = eng.hedge.position
+    eng.RECONCILE_GRACE_SEC = 0.0
+    assert await eng._recover_positions(strict=True)
+
+
+def pending_audit_context(planned_notional_usd=100.0,
+                          top_convergence_bps=None):
+    return PendingAuditContext(
+        reason="test fixture",
+        signed_residual_bps=None,
+        reference_basis_bps=None,
+        top_convergence_bps=top_convergence_bps,
+        convergence_bps=None,
+        round_trip_fee_bps=None,
+        buy_slippage_budget_bps=None,
+        sell_slippage_budget_bps=None,
+        projected_net_bps=None,
+        projected_net_usd=None,
+        estimated_campaign_pnl_usd=None,
+        entropy_reference_age_ms=None,
+        hedge_reference_age_ms=None,
+        reference_update_skew_ms=None,
+        net_funding_bps_per_hour=None,
+        planned_notional_usd=planned_notional_usd,
+    )
+
+
+def pending_entry_audit_context(planned_notional_usd=100.0,
+                                top_convergence_bps=20.0,
+                                signed_residual_bps=45.0):
+    return replace(
+        pending_audit_context(planned_notional_usd),
+        signed_residual_bps=signed_residual_bps,
+        reference_basis_bps=0.0,
+        top_convergence_bps=top_convergence_bps,
+        convergence_bps=18.0,
+        round_trip_fee_bps=0.0,
+        buy_slippage_budget_bps=1.0,
+        sell_slippage_budget_bps=1.0,
+        projected_net_bps=6.0,
+        projected_net_usd=planned_notional_usd * 6.0 / 1e4,
+        entropy_reference_age_ms=15.0,
+        hedge_reference_age_ms=20.0,
+        reference_update_skew_ms=5.0,
+    )
+
+
+def restart_open_pending(eng, *, unresolved=True,
+                          campaign_applied=False, audit_ok=True):
+    model = eng.residual_model.snapshot(
+        now_minute=int(time.time() // 60))
+    return engine_module.PendingExecutionState(
+        execution_id="restart-open",
+        identity=eng._market_identity(),
+        intent="OPEN",
+        direction="sell_entropy",
+        campaign_id="restart-campaign",
+        qty=1.0,
+        decided_at=1000.0,
+        frozen_model=model,
+        entry_boundary_bps=model.upper_bps,
+        exit_target_bps=model.q75_bps,
+        entropy_expected_px=100.45,
+        hedge_expected_px=100.0,
+        entropy_fee_bps=eng.entropy.fee_bps,
+        hedge_fee_bps=eng.hedge.fee_bps,
+        campaign_before=None,
+        buy=engine_module.PendingLegState(
+            venue_key="hedge", is_buy=True, order_ref="buy-restart",
+            status="unknown" if unresolved else "filled",
+            filled_base=0.0 if unresolved else 1.0,
+            avg_px=None if unresolved else 100.0,
+            applied_fill=0.0 if unresolved else 1.0,
+            unresolved=unresolved),
+        sell=engine_module.PendingLegState(
+            venue_key="entropy", is_buy=False, order_ref="sell-restart",
+            status="unknown" if unresolved else "filled",
+            filled_base=0.0 if unresolved else 1.0,
+            avg_px=None if unresolved else 100.45,
+            applied_fill=0.0 if unresolved else 1.0,
+            unresolved=unresolved),
+        audit=pending_entry_audit_context(),
+        settled_at=None if unresolved else 1001.0,
+        audit_ok=audit_ok,
+        campaign_applied=campaign_applied,
+    )
+
+
+def restart_close_pending(eng, *, campaign_applied=False):
+    campaign = dynamic_live_campaign()
+    model = campaign.frozen_model
+    return engine_module.PendingExecutionState(
+        execution_id="restart-close",
+        identity=eng._market_identity(),
+        intent="CLOSE",
+        direction=("buy_entropy" if campaign.direction == "sell_entropy"
+                   else "sell_entropy"),
+        campaign_id=campaign.campaign_id,
+        qty=campaign.qty,
+        decided_at=campaign.opened_at + 60.0,
+        frozen_model=model,
+        entry_boundary_bps=campaign.entry_boundary_bps,
+        exit_target_bps=campaign.exit_target_bps,
+        entropy_expected_px=100.1,
+        hedge_expected_px=100.0,
+        entropy_fee_bps=eng.entropy.fee_bps,
+        hedge_fee_bps=eng.hedge.fee_bps,
+        campaign_before=campaign,
+        buy=engine_module.PendingLegState(
+            venue_key="entropy", is_buy=True, order_ref="close-buy",
+            status="filled", filled_base=1.0, avg_px=100.1,
+            applied_fill=1.0, unresolved=False),
+        sell=engine_module.PendingLegState(
+            venue_key="hedge", is_buy=False, order_ref="close-sell",
+            status="filled", filled_base=1.0, avg_px=100.0,
+            applied_fill=1.0, unresolved=False),
+        audit=pending_audit_context(),
+        settled_at=campaign.opened_at + 61.0,
+        audit_ok=True,
+        campaign_applied=campaign_applied,
+    )
+
+
+def read_strategy_events(eng):
+    with open(eng.strategy_events.path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+EXECUTION_BUSINESS_FIELDS = [
+    "ts_ms", "event", "intent", "reason", "decision_id", "campaign_id",
+    "direction", "model_version", "model_samples", "model_status",
+    "model_median_bps", "model_lower_bps", "model_upper_bps",
+    "model_iqr_bps", "signed_residual_bps", "reference_basis_bps",
+    "entry_boundary_bps", "exit_target_bps", "top_convergence_bps",
+    "convergence_bps",
+    "round_trip_fee_bps", "buy_slippage_budget_bps",
+    "sell_slippage_budget_bps", "projected_net_bps",
+    "projected_net_usd", "estimated_campaign_pnl_usd", "qty",
+    "planned_notional_usd", "entropy_reference_age_ms",
+    "hedge_reference_age_ms", "reference_update_skew_ms",
+    "net_funding_bps_per_hour", "entropy_fill_px", "hedge_fill_px",
+    "hold_seconds", "realized_pnl_usd",
+]
+
+
+def execution_event(eng, event="campaign_changed"):
+    return next(row for row in read_strategy_events(eng)
+                if row["event"] == event)
+
+
+def test_dynamic_decision_event_preserves_both_convergence_values(tmp_path):
+    eng = make_dynamic_engine(tmp_path)
+    try:
+        decision = engine_module.StrategyDecision(
+            intent="OPEN",
+            direction="sell_entropy",
+            reason="ENTRY_SIGNAL",
+            top_convergence_bps=32.5,
+            convergence_bps=27.5,
+        )
+
+        eng._record_dynamic_decision(decision, now_wall=1000.0)
+
+        row = read_strategy_events(eng)[-1]
+        assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
+        assert float(row["convergence_bps"]) == pytest.approx(27.5)
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_settled_pending_event_preserves_both_convergence_values(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        pending = restart_open_pending(eng, unresolved=False)
+        pending = replace(
+            pending,
+            audit=replace(
+                pending.audit,
+                signed_residual_bps=57.5,
+                top_convergence_bps=32.5,
+                convergence_bps=27.5,
+            ),
+        )
+
+        eng._record_pending_campaign_event(pending)
+
+        row = execution_event(eng)
+        assert float(row["top_convergence_bps"]) == pytest.approx(32.5)
+        assert float(row["convergence_bps"]) == pytest.approx(27.5)
+    finally:
+        eng._shutdown_reconcile_required = False
+        eng._close_dynamic_strategy()
+
+
+def test_pending_results_use_supplied_wall_clock_for_terminal_settlement(
+        tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    pending = restart_open_pending(eng)
+    buy_result = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.0,
+        order_ref="buy-restart")
+    sell_result = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.45,
+        order_ref="sell-restart")
+    try:
+        one_unknown = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result,
+            sell_result=OrderResult.unknown(
+                "timeout", order_ref="sell-restart"),
+            audit_ok=False, campaign_applied=False, now_wall=1002.0)
+        terminal = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result, sell_result=sell_result,
+            audit_ok=True, campaign_applied=False, now_wall=1002.0)
+        already_settled = eng._pending_execution_with_results(
+            terminal, buy=eng.hedge, sell=eng.entropy,
+            buy_result=buy_result, sell_result=sell_result,
+            audit_ok=True, campaign_applied=False, now_wall=1060.0)
+
+        assert one_unknown.settled_at is None
+        assert terminal.settled_at == 1002.0
+        assert already_settled.settled_at == 1002.0
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_pending_terminal_retry_preserves_zero_settlement_time(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    pending = replace(
+        restart_open_pending(eng, unresolved=False),
+        decided_at=0.0,
+        settled_at=0.0,
+    )
+    try:
+        retried = eng._pending_execution_with_results(
+            pending, buy=eng.hedge, sell=eng.entropy,
+            buy_result=OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-restart"),
+            sell_result=OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.45,
+                order_ref="sell-restart"),
+            audit_ok=True, campaign_applied=False, now_wall=1060.0)
+
+        assert retried.settled_at == 0.0
+    finally:
+        eng._close_dynamic_strategy()
+
+
+def test_immediate_and_startup_execution_events_use_durable_audit_fields(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    normal = make_live_dynamic_execution_engine(tmp_path / "normal")
+    original_buy = normal.hedge.send_taker
+    original_sell = normal.entropy.send_taker
+
+    async def buy_at_settlement(**kwargs):
+        result = await original_buy(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    async def sell_at_settlement(**kwargs):
+        result = await original_sell(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    normal.hedge.send_taker = buy_at_settlement
+    normal.entropy.send_taker = sell_at_settlement
+
+    async def go():
+        restarted = None
+        try:
+            await normal._evaluate()
+            pending = normal.pending_execution_store.load()
+            normal_event = execution_event(normal)
+
+            assert pending.decided_at == 1000.0
+            assert pending.settled_at == 1002.0
+            assert normal_event["ts_ms"] == "1002000"
+
+            restarted = make_live_dynamic_execution_engine(
+                tmp_path / "restarted")
+            restarted._decision_reference_audit_values = lambda _direction: (
+                (_ for _ in ()).throw(
+                    AssertionError("pending events must not read live reference")))
+            restart_pending = replace(pending, campaign_applied=False)
+            restarted.pending_execution_store.save(restart_pending)
+            restarted._startup_pending_execution = restart_pending
+
+            assert await restarted._resolve_startup_pending_execution()
+            restarted_event = execution_event(restarted)
+            assert {
+                key: restarted_event[key] for key in EXECUTION_BUSINESS_FIELDS
+            } == {
+                key: normal_event[key] for key in EXECUTION_BUSINESS_FIELDS
+            }
+            assert restarted_event["campaign_status"] == "OPEN"
+        finally:
+            normal._shutdown_reconcile_required = False
+            normal._close_dynamic_strategy()
+            if restarted is not None:
+                restarted._shutdown_reconcile_required = False
+                restarted._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_in_process_unknown_uses_terminal_confirmation_wall_clock(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    hedge = ConfirmingVenue(
+        "hedge", "RH",
+        OrderResult.unknown("timeout", order_ref="buy-delayed"))
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    eng.hedge = hedge
+    eng.venues = {"entropy": eng.entropy, "hedge": hedge}
+
+    async def go():
+        try:
+            await eng._evaluate()
+            assert eng.pending_execution_store.load().settled_at is None
+
+            wall[0] = 1060.0
+            hedge.terminal_results["buy-delayed"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-delayed")
+            assert await eng._resolve_pending_orders()
+
+            pending = eng.pending_execution_store.load()
+            event = execution_event(eng)
+            assert pending.settled_at == 1060.0
+            assert event["ts_ms"] == "1060000"
+            assert event["decision_id"] == (
+                f"execution-{pending.execution_id}")
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_matched_fill_uses_pending_execution_id_for_event(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            pending = eng.pending_execution_store.load()
+            changed = [row for row in read_strategy_events(eng)
+                       if row["event"] == "campaign_changed"]
+
+            assert len(changed) == 1
+            assert changed[0]["decision_id"] == (
+                f"execution-{pending.execution_id}")
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_pending_recovery_records_open_event_once(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_open_pending(eng, unresolved=False)
+        eng.pending_execution_store.save(pending)
+        eng._startup_pending_execution = pending
+        try:
+            assert await eng._resolve_startup_pending_execution()
+            assert await eng._resolve_startup_pending_execution()
+
+            changed = [row for row in read_strategy_events(eng)
+                       if row["event"] == "campaign_changed"]
+            assert len(changed) == 1
+            assert changed[0]["decision_id"] == "execution-restart-open"
+            assert changed[0]["campaign_id"] == "restart-campaign"
+            assert float(changed[0]["qty"]) == pytest.approx(1.0)
+            assert float(changed[0]["entropy_fill_px"]) == pytest.approx(
+                100.45)
+            assert float(changed[0]["hedge_fill_px"]) == pytest.approx(100.0)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_pending_recovery_records_close_analytics(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_close_pending(eng)
+        eng.campaign_store.save(pending.campaign_before)
+        eng.campaign = pending.campaign_before
+        eng.pending_execution_store.save(pending)
+        eng._startup_pending_execution = pending
+        try:
+            assert await eng._resolve_startup_pending_execution()
+
+            closed = [row for row in read_strategy_events(eng)
+                      if row["event"] == "campaign_closed"]
+            assert len(closed) == 1
+            event = closed[0]
+            assert event["decision_id"] == "execution-restart-close"
+            assert event["campaign_id"] == pending.campaign_id
+            assert float(event["qty"]) == pytest.approx(1.0)
+            assert float(event["entropy_fill_px"]) == pytest.approx(100.1)
+            assert float(event["hedge_fill_px"]) == pytest.approx(100.0)
+            assert float(event["hold_seconds"]) == pytest.approx(61.0)
+            assert float(event["realized_pnl_usd"]) == pytest.approx(0.1)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_startup_restores_matching_campaign(tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        expected = dynamic_live_campaign()
+        paths = configured_strategy_paths(cfg, shadow=False)
+        CampaignStore(str(paths.campaign), shadow=False).save(expected)
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=-1.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=1.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                wait_until(lambda: eng.campaign is not None), timeout=0.3)
+            assert eng.campaign == expected
+            assert not eng._recovery_required
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_live_startup_pending_recovery_resumes_strategy_without_new_orders(
+        tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        eng = Engine(cfg, record_only=False)
+        model = dynamic_live_campaign().frozen_model
+        pending = engine_module.PendingExecutionState(
+            execution_id="startup-lifecycle",
+            identity=eng._market_identity(), intent="OPEN",
+            direction="sell_entropy", campaign_id="startup-campaign",
+            qty=1.0, decided_at=time.time(), frozen_model=model,
+            entry_boundary_bps=model.upper_bps,
+            exit_target_bps=model.q75_bps,
+            entropy_expected_px=100.1, hedge_expected_px=100.0,
+            entropy_fee_bps=0.0, hedge_fee_bps=0.0,
+            campaign_before=None,
+            buy=engine_module.PendingLegState(
+                venue_key="hedge", is_buy=True, order_ref="startup-buy",
+                status="timeout", filled_base=0.0, avg_px=None,
+                applied_fill=0.0, unresolved=True),
+            sell=engine_module.PendingLegState(
+                venue_key="entropy", is_buy=False,
+                order_ref="startup-sell", status="timeout",
+                filled_base=0.0, avg_px=None, applied_fill=0.0,
+                unresolved=True),
+            audit=pending_entry_audit_context(
+                signed_residual_bps=model.q75_bps + 20.0),
+            settled_at=None,
+            audit_ok=True, campaign_applied=False)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        engine_module.PendingExecutionStore(paths.pending).save(pending)
+        venues = {
+            "entropy": RecoveringLifecycleVenue(
+                "entropy", "ENTROPY", -1.0, {
+                    "startup-sell": OrderResult(
+                        status="filled", filled_base=1.0, avg_px=100.1,
+                        order_ref="startup-sell")}),
+            "hedge": RecoveringLifecycleVenue(
+                "hedge", "RH", 1.0, {
+                    "startup-buy": OrderResult(
+                        status="filled", filled_base=1.0, avg_px=100.0,
+                        order_ref="startup-buy")}),
+        }
+        strategy_started = asyncio.Event()
+
+        async def observed_strategy_loop():
+            strategy_started.set()
+            await eng.stop.wait()
+
+        eng._strategy_loop = observed_strategy_loop
+        eng.RECONCILE_GRACE_SEC = 0.0
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(strategy_started.wait(), timeout=0.3)
+            await asyncio.wait_for(
+                wait_until(lambda: not eng._recovery_required), timeout=0.3)
+            assert eng.campaign.campaign_id == "startup-campaign"
+            assert eng.pending_execution_store.load() is None
+            assert all(venue.send_calls == 0 for venue in venues.values())
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_live_startup_unmatched_pending_exits_and_releases_lock(tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        eng = Engine(cfg, record_only=False)
+        model = dynamic_live_campaign().frozen_model
+        pending = engine_module.PendingExecutionState(
+            execution_id="startup-unmatched",
+            identity=eng._market_identity(), intent="OPEN",
+            direction="sell_entropy", campaign_id="startup-campaign",
+            qty=1.0, decided_at=time.time(), frozen_model=model,
+            entry_boundary_bps=model.upper_bps,
+            exit_target_bps=model.q75_bps,
+            entropy_expected_px=100.1, hedge_expected_px=100.0,
+            entropy_fee_bps=0.0, hedge_fee_bps=0.0,
+            campaign_before=None,
+            buy=engine_module.PendingLegState(
+                venue_key="hedge", is_buy=True, order_ref="startup-buy",
+                status="timeout", filled_base=0.0, avg_px=None,
+                applied_fill=0.0, unresolved=True),
+            sell=engine_module.PendingLegState(
+                venue_key="entropy", is_buy=False,
+                order_ref="startup-sell", status="timeout",
+                filled_base=0.0, avg_px=None, applied_fill=0.0,
+                unresolved=True),
+            audit=pending_entry_audit_context(
+                signed_residual_bps=model.q75_bps + 20.0),
+            settled_at=None,
+            audit_ok=True, campaign_applied=False)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        engine_module.PendingExecutionStore(paths.pending).save(pending)
+        venues = {
+            "entropy": RecoveringLifecycleVenue(
+                "entropy", "ENTROPY", -0.7, {
+                    "startup-sell": OrderResult(
+                        status="filled", filled_base=0.7, avg_px=100.1,
+                        order_ref="startup-sell")}),
+            "hedge": RecoveringLifecycleVenue(
+                "hedge", "RH", 1.0, {
+                    "startup-buy": OrderResult(
+                        status="filled", filled_base=1.0, avg_px=100.0,
+                        order_ref="startup-buy")}),
+        }
+        eng.RECONCILE_GRACE_SEC = 0.0
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        try:
+            with pytest.raises(RuntimeError, match="unmatched terminal fills"):
+                await asyncio.wait_for(eng._run_inner(), timeout=0.5)
+        finally:
+            engine_module.create_venue = original
+
+        assert eng._live_lock is None
+        assert eng.pending_execution_store.load() is not None
+        assert eng._shutdown_reconcile_required is False
+        assert eng._pending_snapshot_venues == set()
+        assert all(venue.closed for venue in venues.values())
+        assert all(venue.send_calls == 0 for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_recovery_state_blocks_new_execution(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            eng._recovery_required = True
+
+            await eng._evaluate()
+
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.campaign is None
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_revalidates_signal_after_waiting_for_execution_lock(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        lock = eng._vlock("hedge")
+        await lock.acquire()
+        try:
+            evaluation = asyncio.create_task(eng._evaluate())
+            await asyncio.sleep(0)
+            set_dynamic_sell_market(eng, 10.0)
+            lock.release()
+            await evaluation
+
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+            assert eng.campaign is None
+        finally:
+            if lock.locked():
+                lock.release()
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_startup_mismatch_pauses_without_strategy_or_orders(
+        tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        paths = configured_strategy_paths(cfg, shadow=False)
+        CampaignStore(str(paths.campaign), shadow=False).save(
+            dynamic_live_campaign())
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=0.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=0.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        strategy_started = asyncio.Event()
+
+        async def observed_strategy_loop():
+            strategy_started.set()
+            await eng.stop.wait()
+
+        eng._strategy_loop = observed_strategy_loop
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                wait_until(lambda: eng._recovery_required), timeout=0.3)
+            await asyncio.sleep(0)
+            assert eng._auto_repair_disabled
+            assert not strategy_started.is_set()
+            assert venues["entropy"].send_calls == 0
+            assert venues["hedge"].send_calls == 0
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_periodic_reconcile_blocks_zero_net_campaign_mismatch(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.campaign = dynamic_live_campaign()
+        eng.campaign_store.save(eng.campaign)
+        eng.entropy.position = -1.0
+        eng.hedge.position = 1.0
+        eng.entropy.chain_position = -0.5
+        eng.hedge.chain_position = 0.5
+        try:
+            complete = await eng._reconcile_positions(
+                hedge=True, strict=True)
+
+            assert complete is False
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_post_repair_flat_positions_cannot_resume_with_stale_campaign(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.campaign = __import__("dataclasses").replace(
+            dynamic_live_campaign(), qty=0.3)
+        eng.campaign_store.save(eng.campaign)
+        eng.entropy.position = 0.0
+        eng.hedge.position = 0.0
+        eng.entropy.chain_position = 0.0
+        eng.hedge.chain_position = 0.0
+        eng._recovery_required = True
+        try:
+            recovered = await eng._recover_positions(strict=True)
+
+            assert recovered is False
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert eng.campaign.qty == pytest.approx(0.3)
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_matched_open_fill_persists_campaign_after_trade_audit(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.campaign.mode == "live"
+            assert (eng.campaign_store.load().campaign_id
+                    == eng.campaign.campaign_id)
+            assert eng.entropy.send_calls == 1
+            assert eng.hedge.send_calls == 1
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_pending_audit_context_captures_fixed_decision_and_buy_funding_sign(
+        monkeypatch):
+    eng = make_engine()
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: 105.0)
+    eng.entropy.reference.apply(
+        ReferenceUpdate(funding_current_bps_per_hour=0.7),
+        source="websocket", received_mono=100.25)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(funding_current_bps_per_hour=-0.2),
+        source="websocket", received_mono=101.75)
+    plan = ConvergencePlan(
+        qty=1.0,
+        buy_limit=98.0,
+        sell_limit=100.0,
+        buy_notional=98.0,
+        sell_notional=100.0,
+        q_max=1.0,
+        buy_depth_slippage_bps=1.0,
+        sell_depth_slippage_bps=2.0,
+        open_depth_slippage_bps=3.0,
+        convergence_bps=20.0,
+        projected_net_bps=12.5,
+    )
+    decision = engine_module.StrategyDecision(
+        intent="OPEN",
+        direction="buy_entropy",
+        reason="EXPECTED_NET_PROFIT",
+        plan=plan,
+        signed_residual_bps=-31.0,
+        reference_basis_bps=4.0,
+        top_convergence_bps=23.0,
+        convergence_bps=20.0,
+        round_trip_fee_bps=3.0,
+        buy_slippage_budget_bps=1.5,
+        sell_slippage_budget_bps=2.5,
+        estimated_campaign_pnl_usd=0.125,
+    )
+
+    audit = eng._pending_audit_context(decision)
+
+    expected = PendingAuditContext(
+        reason="EXPECTED_NET_PROFIT",
+        signed_residual_bps=-31.0,
+        reference_basis_bps=4.0,
+        top_convergence_bps=23.0,
+        convergence_bps=20.0,
+        round_trip_fee_bps=3.0,
+        buy_slippage_budget_bps=1.5,
+        sell_slippage_budget_bps=2.5,
+        projected_net_bps=12.5,
+        projected_net_usd=0.125,
+        estimated_campaign_pnl_usd=0.125,
+        entropy_reference_age_ms=4750.0,
+        hedge_reference_age_ms=3250.0,
+        reference_update_skew_ms=1500.0,
+        net_funding_bps_per_hour=-0.9,
+        planned_notional_usd=100.0,
+    )
+    assert audit.reason == expected.reason
+    for name in expected.__dataclass_fields__:
+        if name != "reason":
+            assert getattr(audit, name) == pytest.approx(
+                getattr(expected, name))
+
+
+def test_dynamic_execution_journal_clears_only_after_position_refresh(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        decisions = []
+        original_decide = eng._decide_dynamic
+        original_buy = eng.hedge.send_taker
+        original_sell = eng.entropy.send_taker
+
+        def capture_decision(**kwargs):
+            decision = original_decide(**kwargs)
+            if decision.plan is not None:
+                decisions.append(decision)
+            return decision
+
+        async def checked_buy(**kwargs):
+            pending = eng.pending_execution_store.load()
+            assert pending is not None
+            assert pending.intent == "OPEN"
+            return await original_buy(**kwargs)
+
+        async def checked_sell(**kwargs):
+            assert eng.pending_execution_store.load() is not None
+            return await original_sell(**kwargs)
+
+        eng._decide_dynamic = capture_decision
+        eng.hedge.send_taker = checked_buy
+        eng.entropy.send_taker = checked_sell
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign is not None
+            pending = eng.pending_execution_store.load()
+            decision = decisions[-1]
+            assert pending is not None
+            assert pending.audit.reason == decision.reason
+            assert pending.audit.signed_residual_bps == pytest.approx(
+                decision.signed_residual_bps)
+            assert pending.audit.reference_basis_bps == pytest.approx(
+                decision.reference_basis_bps)
+            assert pending.audit.top_convergence_bps == pytest.approx(
+                decision.top_convergence_bps)
+            assert pending.audit.convergence_bps == pytest.approx(
+                decision.convergence_bps)
+            assert pending.audit.round_trip_fee_bps == pytest.approx(
+                decision.round_trip_fee_bps)
+            assert pending.audit.buy_slippage_budget_bps == pytest.approx(
+                decision.buy_slippage_budget_bps)
+            assert pending.audit.sell_slippage_budget_bps == pytest.approx(
+                decision.sell_slippage_budget_bps)
+            assert pending.audit.projected_net_bps == pytest.approx(
+                decision.plan.projected_net_bps)
+            assert pending.audit.planned_notional_usd == pytest.approx(max(
+                decision.plan.buy_notional, decision.plan.sell_notional))
+            assert pending.audit.projected_net_usd == pytest.approx(
+                pending.audit.planned_notional_usd
+                * decision.plan.projected_net_bps / 1e4)
+            assert pending.audit.entropy_reference_age_ms is not None
+            assert pending.audit.hedge_reference_age_ms is not None
+            assert pending.settled_at is not None
+            assert eng._recovery_required
+            eng.entropy.chain_position = eng.entropy.position
+            eng.hedge.chain_position = eng.hedge.position
+            eng.RECONCILE_GRACE_SEC = 0.0
+
+            assert await eng._recover_positions(strict=True)
+            assert eng.pending_execution_store.load() is None
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_pending_save_failure_has_initial_audit_and_sends_no_orders(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        captured = []
+
+        def fail_save(pending):
+            captured.append(pending)
+            raise OSError("pending disk unavailable")
+
+        eng.pending_execution_store.save = fail_save
+        try:
+            with pytest.raises(OSError, match="pending disk unavailable"):
+                await eng._evaluate()
+
+            assert len(captured) == 1
+            pending = captured[0]
+            assert pending.audit.reason != (
+                "audit context pending engine integration")
+            assert pending.audit.planned_notional_usd > 0.0
+            assert pending.settled_at is None
+            assert eng.entropy.send_calls == 0
+            assert eng.hedge.send_calls == 0
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_saved_pending_execution_blocks_restart_without_new_orders(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        eng.pending_execution_store.save(
+            engine_module.PendingExecutionState(
+                execution_id="interrupted",
+                identity=eng._market_identity(),
+                intent="OPEN",
+                direction="sell_entropy",
+                campaign_id="interrupted-campaign",
+                qty=1.0,
+                decided_at=time.time(),
+                frozen_model=eng.residual_model.snapshot(
+                    now_minute=int(time.time() // 60)),
+                entry_boundary_bps=34.0,
+                exit_target_bps=25.0,
+                entropy_expected_px=100.45,
+                hedge_expected_px=100.0,
+                entropy_fee_bps=eng.entropy.fee_bps,
+                hedge_fee_bps=eng.hedge.fee_bps,
+                campaign_before=None,
+                buy=engine_module.PendingLegState(
+                    venue_key="hedge", is_buy=True, order_ref=None,
+                    status="sending", filled_base=0.0, avg_px=None,
+                    applied_fill=0.0, unresolved=True),
+                sell=engine_module.PendingLegState(
+                    venue_key="entropy", is_buy=False, order_ref=None,
+                    status="sending", filled_base=0.0, avg_px=None,
+                    applied_fill=0.0, unresolved=True),
+                audit=pending_entry_audit_context(),
+                settled_at=None,
+                audit_ok=False,
+                campaign_applied=False,
+            ))
+
+        eng._load_pending_execution_state()
+
+        assert eng._recovery_required
+        assert eng._auto_repair_disabled
+        assert eng._campaign_recovery_blocked
+        assert eng.entropy.send_calls == 0
+        assert eng.hedge.send_calls == 0
+        assert eng.pending_execution_store.load() is not None
+    finally:
+        eng._shutdown_reconcile_required = False
+        eng._close_dynamic_strategy()
+
+
+def test_startup_resolves_persisted_unknown_exactly_once(
+        tmp_path, monkeypatch):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        entropy = ConfirmingVenue(
+            "entropy", "ENTROPY", OrderResult.unknown("unused"),
+            chain_position=-1.0)
+        hedge = ConfirmingVenue(
+            "hedge", "RH", OrderResult.unknown("unused"),
+            chain_position=1.0)
+        entropy.reference, entropy.book = eng.entropy.reference, eng.entropy.book
+        hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+        entropy.terminal_results["sell-restart"] = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.45,
+            order_ref="sell-restart")
+        hedge.terminal_results["buy-restart"] = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0,
+            order_ref="buy-restart")
+        eng.entropy, eng.hedge = entropy, hedge
+        eng.venues = {"entropy": entropy, "hedge": hedge}
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.pending_execution_store.save(restart_open_pending(eng))
+        saved = []
+        original_save = eng.pending_execution_store.save
+
+        def capture_save(pending):
+            if pending is not None:
+                saved.append(pending)
+            original_save(pending)
+
+        eng.pending_execution_store.save = capture_save
+        monkeypatch.setattr(engine_module.time, "time", lambda: 1060.0)
+        try:
+            eng._load_pending_execution_state()
+            assert eng._recovery_required
+            assert not eng._auto_repair_disabled
+
+            assert await eng._recover_positions(strict=True)
+            recovered = eng.campaign
+            assert recovered.campaign_id == "restart-campaign"
+            assert recovered.qty == pytest.approx(1.0)
+            assert eng.pending_execution_store.load() is None
+            terminal = next(
+                pending for pending in saved
+                if pending.settled_at is not None)
+            assert not terminal.buy.unresolved
+            assert not terminal.sell.unresolved
+            assert terminal.settled_at == 1060.0
+            event = execution_event(eng)
+            assert event["ts_ms"] == "1060000"
+            assert event["decision_id"] == "execution-restart-open"
+
+            assert await eng._recover_positions(strict=True)
+            assert eng.campaign == recovered
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_immediate_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    original_buy = eng.hedge.send_taker
+    original_sell = eng.entropy.send_taker
+    original_save = eng.pending_execution_store.save
+    failed_states = []
+
+    async def settle_buy(**kwargs):
+        result = await original_buy(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    async def settle_sell(**kwargs):
+        result = await original_sell(**kwargs)
+        wall[0] = 1002.0
+        return result
+
+    def fail_terminal_save(pending):
+        if pending is not None and pending.settled_at is not None:
+            failed_states.append(pending)
+            raise OSError("terminal pending disk unavailable")
+        original_save(pending)
+
+    eng.hedge.send_taker = settle_buy
+    eng.entropy.send_taker = settle_sell
+    eng.pending_execution_store.save = fail_terminal_save
+
+    async def go():
+        try:
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._evaluate()
+
+            assert len(failed_states) == 1
+            assert not failed_states[0].buy.unresolved
+            assert not failed_states[0].sell.unresolved
+            assert failed_states[0].settled_at == 1002.0
+            assert eng.campaign is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_unknown_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(engine_module.time, "time", lambda: wall[0])
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    hedge = ConfirmingVenue(
+        "hedge", "RH",
+        OrderResult.unknown("timeout", order_ref="buy-delayed"))
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    eng.hedge = hedge
+    eng.venues = {"entropy": eng.entropy, "hedge": hedge}
+
+    async def go():
+        try:
+            await eng._evaluate()
+            original_save = eng.pending_execution_store.save
+
+            def fail_terminal_save(pending):
+                if pending is not None and pending.settled_at is not None:
+                    raise OSError("terminal pending disk unavailable")
+                original_save(pending)
+
+            eng.pending_execution_store.save = fail_terminal_save
+            wall[0] = 1060.0
+            hedge.terminal_results["buy-delayed"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0,
+                order_ref="buy-delayed")
+
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._resolve_pending_orders()
+            assert eng.campaign is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_terminal_pending_save_failure_prevents_campaign_and_event(
+        tmp_path, monkeypatch):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    entropy = ConfirmingVenue(
+        "entropy", "ENTROPY", OrderResult.unknown("unused"))
+    hedge = ConfirmingVenue(
+        "hedge", "RH", OrderResult.unknown("unused"))
+    entropy.reference, entropy.book = eng.entropy.reference, eng.entropy.book
+    hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+    entropy.terminal_results["sell-restart"] = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.45,
+        order_ref="sell-restart")
+    hedge.terminal_results["buy-restart"] = OrderResult(
+        status="filled", filled_base=1.0, avg_px=100.0,
+        order_ref="buy-restart")
+    eng.entropy, eng.hedge = entropy, hedge
+    eng.venues = {"entropy": entropy, "hedge": hedge}
+    pending = restart_open_pending(eng)
+    eng.pending_execution_store.save(pending)
+    eng._startup_pending_execution = pending
+    original_save = eng.pending_execution_store.save
+
+    def fail_terminal_save(saved):
+        if saved is not None and saved.settled_at is not None:
+            raise OSError("terminal pending disk unavailable")
+        original_save(saved)
+
+    eng.pending_execution_store.save = fail_terminal_save
+    monkeypatch.setattr(engine_module.time, "time", lambda: 1060.0)
+
+    async def go():
+        try:
+            with pytest.raises(
+                    OSError, match="terminal pending disk unavailable"):
+                await eng._resolve_startup_pending_execution()
+            assert eng.campaign is None
+            assert eng.campaign_store.load() is None
+            assert not any(row["decision_id"].startswith("execution-")
+                           for row in read_strategy_events(eng))
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_unmatched_persisted_fills_require_manual_recovery(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        entropy = ConfirmingVenue(
+            "entropy", "ENTROPY", OrderResult.unknown("unused"),
+            chain_position=-0.7)
+        hedge = ConfirmingVenue(
+            "hedge", "RH", OrderResult.unknown("unused"),
+            chain_position=1.0)
+        entropy.reference, entropy.book = eng.entropy.reference, eng.entropy.book
+        hedge.reference, hedge.book = eng.hedge.reference, eng.hedge.book
+        entropy.terminal_results["sell-restart"] = OrderResult(
+            status="filled", filled_base=0.7, avg_px=100.45,
+            order_ref="sell-restart")
+        hedge.terminal_results["buy-restart"] = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0,
+            order_ref="buy-restart")
+        eng.entropy, eng.hedge = entropy, hedge
+        eng.venues = {"entropy": entropy, "hedge": hedge}
+        eng.pending_execution_store.save(restart_open_pending(eng))
+        try:
+            eng._load_pending_execution_state()
+
+            assert not await eng._recover_positions(strict=True)
+            assert eng._auto_repair_disabled
+            assert eng.pending_execution_store.load() is not None
+            assert entropy.send_calls == 0
+            assert hedge.send_calls == 0
+            await asyncio.wait_for(
+                eng._drain_executions(poll_sec=0.01), timeout=0.1)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_clears_already_applied_terminal_journal_without_reapply(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_open_pending(
+            eng, unresolved=False, campaign_applied=True)
+        expected = PositionCampaign(
+            campaign_id=pending.campaign_id,
+            mode="live", identity=pending.identity,
+            direction=pending.direction, opened_at=pending.decided_at,
+            qty=1.0, entropy_avg_px=100.45, hedge_avg_px=100.0,
+            frozen_model=pending.frozen_model,
+            entry_boundary_bps=pending.entry_boundary_bps,
+            exit_target_bps=pending.exit_target_bps,
+            fees_usd=0.0, realized_pnl_usd=-0.0)
+        eng.campaign = expected
+        eng.campaign_store.save(expected)
+        eng.entropy.chain_position = -1.0
+        eng.hedge.chain_position = 1.0
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.pending_execution_store.save(pending)
+        try:
+            eng._load_pending_execution_state()
+
+            assert await eng._recover_positions(strict=True)
+            assert eng.campaign == expected
+            assert eng.pending_execution_store.load() is None
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_retries_failed_campaign_persistence_before_clearing_journal(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = restart_open_pending(eng, unresolved=False)
+        eng.entropy.chain_position = -1.0
+        eng.hedge.chain_position = 1.0
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.pending_execution_store.save(pending)
+        original_save = eng.campaign_store.save
+        attempts = 0
+
+        def flaky_save(campaign):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("campaign disk unavailable")
+            original_save(campaign)
+
+        eng.campaign_store.save = flaky_save
+        try:
+            eng._load_pending_execution_state()
+
+            with pytest.raises(OSError, match="campaign disk unavailable"):
+                await eng._recover_positions(strict=True)
+            assert eng.campaign_store.load() is None
+            assert not eng.pending_execution_store.load().campaign_applied
+
+            assert await eng._recover_positions(strict=True)
+            assert eng.campaign.campaign_id == pending.campaign_id
+            assert eng.campaign_store.load() == eng.campaign
+            assert eng.pending_execution_store.load() is None
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_startup_applies_persisted_terminal_close_once(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        prior = dynamic_live_campaign()
+        eng.campaign = prior
+        eng.campaign_store.save(prior)
+        decided_at = time.time()
+        pending = engine_module.PendingExecutionState(
+            execution_id="restart-close", identity=prior.identity,
+            intent="CLOSE", direction="buy_entropy",
+            campaign_id=prior.campaign_id, qty=prior.qty,
+            decided_at=decided_at, frozen_model=prior.frozen_model,
+            entry_boundary_bps=prior.entry_boundary_bps,
+            exit_target_bps=prior.exit_target_bps,
+            entropy_expected_px=100.1, hedge_expected_px=100.0,
+            entropy_fee_bps=0.0, hedge_fee_bps=0.0,
+            campaign_before=prior,
+            buy=engine_module.PendingLegState(
+                venue_key="entropy", is_buy=True, order_ref="close-buy",
+                status="filled", filled_base=1.0, avg_px=100.1,
+                applied_fill=1.0, unresolved=False),
+            sell=engine_module.PendingLegState(
+                venue_key="hedge", is_buy=False, order_ref="close-sell",
+                status="filled", filled_base=1.0, avg_px=100.0,
+                applied_fill=1.0, unresolved=False),
+            audit=pending_audit_context(), settled_at=decided_at,
+            audit_ok=True, campaign_applied=False)
+        eng.entropy.chain_position = 0.0
+        eng.hedge.chain_position = 0.0
+        eng.RECONCILE_GRACE_SEC = 0.0
+        eng.pending_execution_store.save(pending)
+        try:
+            eng._load_pending_execution_state()
+
+            assert await eng._recover_positions(strict=True)
+            assert eng.campaign is None
+            assert eng.campaign_store.load() is None
+            assert eng.pending_execution_store.load() is None
+            assert await eng._recover_positions(strict=True)
+            assert eng.campaign is None
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_process_lock_contention_fails_before_task_or_order_start(
+        tmp_path):
+    async def go():
+        cfg = make_dynamic_live_cfg(tmp_path)
+        cfg.entropy.symbol = "LOCKTEST"
+        cfg.hedge.symbol = "LOCKTEST-HEDGE"
+        venues = {
+            "entropy": LiveLifecycleVenue(
+                "entropy", "ENTROPY", chain_position=0.0),
+            "hedge": LiveLifecycleVenue(
+                "hedge", "RH", chain_position=0.0),
+        }
+        eng = Engine(cfg, record_only=False)
+        guard = LiveProcessLock.from_market(
+            eng._market_identity(),
+            venues["entropy"].account_lock_id(),
+            venues["hedge"].account_lock_id(),
+        )
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        guard.acquire()
+        try:
+            with pytest.raises(LiveProcessLockError, match="already running"):
+                await asyncio.wait_for(eng._run_inner(), timeout=0.3)
+        finally:
+            guard.release()
+            engine_module.create_venue = original
+
+        assert all(venue.send_calls == 0 for venue in venues.values())
+        assert all(venue.closed for venue in venues.values())
+
+    asyncio.run(go())
+
+
+def test_record_only_engine_never_acquires_live_process_lock(tmp_path):
+    async def go():
+        cfg = make_cfg()
+        cfg.recorder_enabled = False
+        cfg.recorder_csv = str(tmp_path / "minutes.csv")
+        cfg.recorder_signal_csv = str(tmp_path / "signals.csv")
+        venues = {
+            "entropy": LifecycleVenue("entropy", "ENTROPY"),
+            "hedge": LifecycleVenue("hedge", "RH"),
+        }
+        eng = Engine(cfg, record_only=True)
+        original = engine_module.create_venue
+        engine_module.create_venue = lambda conf, _runtime: venues[conf.key]
+        task = asyncio.create_task(eng._run_inner())
+        try:
+            await asyncio.wait_for(
+                _wait_until(lambda: eng.markets_ready), timeout=0.3)
+            assert eng._live_lock is None
+        finally:
+            eng.request_stop()
+            await asyncio.gather(task, return_exceptions=True)
+            engine_module.create_venue = original
+
+    async def _wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(0)
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_waits_for_post_trade_books_before_adding(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await eng._evaluate()
+
+            assert eng.entropy.send_calls == 1
+            assert eng.hedge.send_calls == 1
+            assert eng.campaign.qty == pytest.approx(1.0)
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_only_matched_live_fill_changes_campaign_before_residual_recovery(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(
+            tmp_path, buy_fill=1.0, sell_fill=0.7)
+        try:
+            await eng._evaluate()
+
+            assert eng.campaign.qty == pytest.approx(0.7)
+            assert eng.campaign_store.load().qty == pytest.approx(0.7)
+            assert eng._recovery_required
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_residual_repair_refreshes_both_legs_before_clearing_journal(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(
+            tmp_path, buy_fill=1.0, sell_fill=0.7)
+        try:
+            await eng._evaluate()
+            assert eng.pending_execution_store.load() is not None
+            eng.entropy.chain_position = -0.7
+            eng.hedge.chain_position = 1.0
+            original_send = eng.hedge.send_taker
+
+            async def settle_residual(**kwargs):
+                if kwargs.get("is_buy") is False:
+                    eng.hedge.chain_position -= kwargs["qty"]
+                    return OrderResult(
+                        status="filled", filled_base=kwargs["qty"],
+                        avg_px=100.0)
+                return await original_send(**kwargs)
+
+            eng.hedge.send_taker = settle_residual
+            eng.RECONCILE_GRACE_SEC = 0.0
+            set_dynamic_sell_market(eng, 45.0)
+
+            recovered = await eng._recover_positions(strict=True)
+
+            assert recovered
+            assert eng.entropy.position == pytest.approx(-0.7)
+            assert eng.hedge.position == pytest.approx(0.7)
+            assert eng.campaign.qty == pytest.approx(0.7)
+            assert eng.pending_execution_store.load() is None
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_existing_pending_journal_blocks_next_dynamic_submission(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(
+            tmp_path, buy_fill=1.0, sell_fill=0.7)
+        try:
+            await eng._evaluate()
+            pending = eng.pending_execution_store.load()
+            assert pending is not None
+            sends = (eng.entropy.send_calls, eng.hedge.send_calls)
+
+            # Model the already-repaired local state while deliberately
+            # retaining the journal to reproduce the overwrite window.
+            eng.entropy.position = -0.7
+            eng.hedge.position = 0.7
+            eng._recovery_required = False
+            eng._post_order_recovery_active = False
+            set_dynamic_sell_market(eng, 45.0)
+
+            await eng._evaluate()
+
+            assert (eng.entropy.send_calls, eng.hedge.send_calls) == sends
+            assert eng._recovery_required
+            assert (eng.pending_execution_store.load().execution_id
+                    == pending.execution_id)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_campaign_state_write_failure_pauses_new_entries(tmp_path, caplog):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+
+        def fail_save(_campaign):
+            raise OSError("disk full")
+
+        eng.campaign_store.save = fail_save
+        try:
+            with pytest.raises(OSError, match="disk full"):
+                await eng._evaluate()
+            assert eng._recovery_required
+            assert eng._auto_repair_disabled
+            assert "execution processing failed" in caplog.text
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_resolved_unknown_dynamic_fill_updates_campaign_once_confirmed(
+        tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        pending = ConfirmingVenue(
+            "hedge", "RH",
+            OrderResult.unknown(order_ref="hedge-open"))
+        pending.reference = eng.hedge.reference
+        pending.book = eng.hedge.book
+        eng.hedge = pending
+        eng.venues["hedge"] = pending
+        try:
+            await eng._evaluate()
+            assert eng.campaign is None
+            assert eng._recovery_required
+
+            pending.terminal_results["hedge-open"] = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            pending.chain_position = 1.0
+            eng.entropy.chain_position = -1.0
+            eng.RECONCILE_GRACE_SEC = 0.0
+            recovered = await eng._recover_positions(strict=True)
+
+            assert recovered
+            assert eng.campaign.qty == pytest.approx(1.0)
+            assert eng.campaign_store.load().qty == pytest.approx(1.0)
+        finally:
+            eng._shutdown_reconcile_required = False
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_matched_close_clears_campaign_and_persists_flat_state(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await reconcile_dynamic_execution(eng)
+            campaign_id = eng.campaign.campaign_id
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.campaign_store.load() is None
+            with open(eng.strategy_events.path, newline="",
+                      encoding="utf-8") as handle:
+                events = list(csv.DictReader(handle))
+            closed = [row for row in events
+                      if row["event"] == "campaign_closed"]
+            assert len(closed) == 1
+            assert closed[0]["campaign_id"] == campaign_id
+            assert closed[0]["intent"] == "CLOSE"
+            assert closed[0]["realized_pnl_usd"]
+            assert eng.entropy.send_args[0]["reduce_only"] is False
+            assert eng.hedge.send_args[0]["reduce_only"] is False
+            assert eng.entropy.send_args[1]["reduce_only"] is True
+            assert eng.hedge.send_args[1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_forced_close_sends_both_legs_reduce_only(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await reconcile_dynamic_execution(eng)
+            eng.campaign = __import__("dataclasses").replace(
+                eng.campaign,
+                opened_at=(
+                    time.time()
+                    - eng.cfg.strategy_hard_hold_minutes * 60.0
+                    - 1.0),
+            )
+            eng.campaign_store.save(eng.campaign)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_args[-1]["reduce_only"] is True
+            assert eng.hedge.send_args[-1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_dynamic_forced_close_submits_with_nonready_model(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await reconcile_dynamic_execution(eng)
+            eng.campaign = __import__("dataclasses").replace(
+                eng.campaign,
+                opened_at=(
+                    time.time()
+                    - eng.cfg.strategy_hard_hold_minutes * 60.0
+                    - 1.0),
+            )
+            eng.campaign_store.save(eng.campaign)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=1.0, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+            nonready = ModelSnapshot(
+                version=0, minute=int(time.time() // 60), samples=0,
+                status="MODEL_NOT_READY", median_bps=None, lower_bps=None,
+                q25_bps=None, q75_bps=None, upper_bps=None)
+            eng.residual_model.snapshot = (
+                lambda *, now_minute: __import__("dataclasses").replace(
+                    nonready, minute=now_minute))
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_args[-1]["reduce_only"] is True
+            assert eng.hedge.send_args[-1]["reduce_only"] is True
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_dynamic_protection_price_uses_one_total_slippage_budget(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.campaign = dynamic_live_campaign()
+        eng.campaign_store.save(eng.campaign)
+        buy, sell = eng.entropy, eng.hedge
+        buy.set_book(99.9, 100.0)
+        sell.set_book(100.0, 100.1)
+        buy.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0)
+        sell.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.0)
+        source = MatchedClosePlan(
+            qty=1.0,
+            buy_limit=100.1,
+            sell_limit=99.9,
+            buy_notional=100.1,
+            sell_notional=99.9,
+            buy_depth_slippage_bps=10.0,
+            sell_depth_slippage_bps=(100.0 / 99.9 - 1.0) * 1e4,
+        )
+        decision = engine_module.StrategyDecision(
+            intent="FORCED_CLOSE",
+            direction="buy_entropy",
+            reason="HARD_HOLD_LIMIT",
+            plan=source,
+            model=eng.residual_model.snapshot(
+                now_minute=int(time.time() // 60)),
+            entry_boundary_bps=eng.campaign.entry_boundary_bps,
+            exit_target_bps=eng.campaign.exit_target_bps,
+            buy_slippage_budget_bps=20.0,
+            sell_slippage_budget_bps=20.0,
+        )
+        plan = eng._dynamic_execution_plan(decision, buy, sell)
+        try:
+            await eng._execute(buy, sell, plan, decision=decision)
+
+            buy_limit = buy.send_args[-1]["limit_px"]
+            sell_limit = sell.send_args[-1]["limit_px"]
+            assert (buy_limit / 100.0 - 1.0) * 1e4 <= 20.0 + 1e-9
+            assert (100.0 / sell_limit - 1.0) * 1e4 <= 20.0 + 1e-9
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_actual_adverse_slippage_uses_decision_book_average(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        eng.hedge.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.04)
+        eng.entropy.result = OrderResult(
+            status="filled", filled_base=1.0, avg_px=100.40)
+        try:
+            await eng._evaluate()
+
+            buy_sample = eng.dynamic_strategy.slippage.latest("hedge", "buy")
+            sell_sample = eng.dynamic_strategy.slippage.latest(
+                "entropy", "sell")
+            assert buy_sample.adverse_bps == pytest.approx(4.0)
+            assert sell_sample.adverse_bps == pytest.approx(
+                (100.45 / 100.40 - 1.0) * 1e4)
+            assert buy_sample.decision_budget_bps <= 5.0
+            assert sell_sample.decision_budget_bps <= 5.0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_live_slippage_pause_does_not_block_campaign_close(tmp_path):
+    async def go():
+        eng = make_live_dynamic_execution_engine(tmp_path)
+        try:
+            await eng._evaluate()
+            await reconcile_dynamic_execution(eng)
+            quantity = eng.campaign.qty
+            now = time.monotonic()
+            for index in range(5):
+                eng.dynamic_strategy.slippage.record(
+                    venue="entropy", side="buy", now=now + index,
+                    adverse_bps=6.0, decision_budget_bps=5.0)
+            eng.entropy.result = OrderResult(
+                status="filled", filled_base=quantity, avg_px=100.1)
+            eng.hedge.result = OrderResult(
+                status="filled", filled_base=quantity, avg_px=100.0)
+            set_dynamic_sell_market(eng, 10.0)
+
+            await eng._evaluate()
+
+            assert eng.campaign is None
+            assert eng.entropy.send_calls == 2
+            assert eng.hedge.send_calls == 2
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_shadow_fill_never_adds_live_slippage_sample(tmp_path):
+    async def go():
+        eng = make_dynamic_engine(tmp_path)
+        try:
+            seed_dynamic_model(eng)
+            set_dynamic_sell_market(eng, 45.0)
+            await eng._evaluate()
+
+            assert eng.dynamic_strategy.slippage.sample_count(
+                "hedge", "buy") == 0
+            assert eng.dynamic_strategy.slippage.sample_count(
+                "entropy", "sell") == 0
+        finally:
+            eng._close_dynamic_strategy()
+
+    asyncio.run(go())
+
+
+def test_three_recent_slippage_breaches_halves_dynamic_entry_size(tmp_path):
+    eng = make_live_dynamic_execution_engine(tmp_path)
+    try:
+        now = time.monotonic()
+        model = eng.residual_model.snapshot(
+            now_minute=int(time.time() // 60))
+        market = eng._dynamic_market_view(now)
+        baseline = eng.dynamic_strategy.decide(
+            market=market, model=model, campaign=None,
+            now_wall=time.time(), now_mono=now)
+        for index in range(3):
+            eng.dynamic_strategy.slippage.record(
+                venue="entropy", side="sell", now=now + index,
+                adverse_bps=6.0, decision_budget_bps=5.0)
+
+        degraded = eng.dynamic_strategy.decide(
+            market=market, model=model, campaign=None,
+            now_wall=time.time(), now_mono=now + 3)
+
+        assert baseline.intent == "OPEN"
+        assert degraded.intent == "OPEN"
+        assert degraded.plan.qty <= baseline.plan.qty * 0.5
+        assert degraded.plan.qty >= baseline.plan.qty * 0.5 - eng._step
+    finally:
+        eng._close_dynamic_strategy()
+
+
 def approx(a, b, tol=1e-9):
     assert abs(a - b) <= tol, f"{a} != {b}"
+
+
+def test_reference_recovery_repeats_until_websocket_is_fresh():
+    async def go():
+        eng = make_engine(record_only=True)
+        eng.cfg.reference_rest_recovery_sec = 0.01
+        eng.cfg.reference_stale_sec = 0.1
+        venue = eng.entropy
+        venue.reference.apply(
+            ReferenceUpdate(oracle_px=100.0), source="rest",
+            received_mono=time.monotonic() - 1.0)
+        websocket_restored = asyncio.Event()
+
+        async def refresh():
+            venue.reference_refreshes += 1
+            if venue.reference_refreshes == 2:
+                venue.reference.apply(
+                    ReferenceUpdate(oracle_px=100.1), source="websocket")
+                websocket_restored.set()
+            return True
+
+        venue.refresh_reference_rest = refresh
+        task = asyncio.create_task(eng._reference_recovery_loop(venue))
+        await asyncio.wait_for(websocket_restored.wait(), timeout=0.2)
+        await asyncio.sleep(0.03)
+        assert venue.reference_refreshes == 2
+        eng.stop.set()
+        await asyncio.wait_for(task, timeout=0.2)
+
+    asyncio.run(go())
+
+
+def test_expected_reference_rest_failure_does_not_stop_engine(caplog):
+    async def go():
+        eng = make_engine(record_only=True)
+        eng.cfg.reference_rest_recovery_sec = 0.01
+        venue = eng.entropy
+        attempts = 0
+
+        async def refresh():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise engine_module.aiohttp.ClientConnectionError("offline")
+            eng.stop.set()
+            return True
+
+        venue.refresh_reference_rest = refresh
+        await asyncio.wait_for(
+            eng._reference_recovery_loop(venue), timeout=0.2)
+
+        assert attempts == 2
+        assert "reference REST recovery failed" in caplog.text
+
+    asyncio.run(go())
 
 
 def test_eff_threshold_directions():
@@ -318,6 +2708,51 @@ def test_eff_threshold_directions():
         eng.cfg.midline_bps = m
         total = eng._eff_threshold(buy=h, sell=e) + eng._eff_threshold(buy=e, sell=h)
         approx(total, 7.0)
+
+
+def test_reference_state_does_not_change_trade_plan(monkeypatch):
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    eng = make_engine()
+    eng.entropy.set_book(100.20, 100.21)
+    eng.hedge.set_book(99.99, 100.00)
+
+    before = eng._plan(eng.hedge, eng.entropy, 500.0)
+    old = max(time.monotonic() - 3600.0, 0.0)
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=1000.0), source="rest",
+        received_mono=old)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=1.0), source="rest",
+        received_mono=old)
+    after = eng._plan(eng.hedge, eng.entropy, 500.0)
+
+    assert after == before
+
+
+def test_engine_reference_logs_are_stateful_and_observation_only(caplog):
+    caplog.set_level(logging.INFO)
+    eng = make_engine(record_only=True)
+    eng._reference_alerts = ReferenceAlertState(
+        alert_bps=20.0, persist_sec=0.0)
+
+    eng._observe_reference(now_mono=10.0)
+    eng._observe_reference(now_mono=10.1)
+    assert caplog.text.count("reference data stale or incomplete") == 1
+
+    eng.entropy.reference.apply(
+        ReferenceUpdate(oracle_px=100.0), source="rest",
+        received_mono=10.2)
+    eng.hedge.reference.apply(
+        ReferenceUpdate(index_px=100.0), source="rest",
+        received_mono=10.2)
+    eng.entropy.set_book(101.0, 101.1)
+    eng.hedge.set_book(99.9, 100.0)
+    eng._observe_reference(now_mono=10.2)
+    eng._observe_reference(now_mono=10.3)
+
+    assert caplog.text.count("reference data recovered") == 1
+    assert caplog.text.count("sell_entropy reference residual alert") == 1
+    assert eng.stop.is_set() is False
 
 
 def test_inventory_ladder():
@@ -1978,6 +4413,45 @@ def test_hedge_reduces_same_direction_positions_across_all_venues():
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("position", [0.5, -0.5])
+def test_residual_hedge_rounding_stays_inside_slippage_bound(position):
+    class CoarseTickVenue(RecordingPositionVenue):
+        def px_round(self, px, round_up):
+            math = __import__("math")
+            scaled = px * 10.0
+            rounded = math.ceil(scaled) if round_up else math.floor(scaled)
+            return rounded / 10.0
+
+    async def go():
+        eng = make_engine()
+        eng.cfg.hedge_slippage_bps = 20.0
+        result = OrderResult(
+            status="filled", filled_base=abs(position), avg_px=100.0)
+        active = CoarseTickVenue("entropy", "ENTROPY", result)
+        inactive = RecordingPositionVenue(
+            "hedge", "RH", OrderResult(status="filled", filled_base=0.0))
+        active.position = position
+        active.set_book(100.03, 100.04)
+        inactive.position = 0.0
+        inactive.set_book(99.99, 100.0)
+        eng.entropy, eng.hedge = active, inactive
+        eng.venues = {"entropy": active, "hedge": inactive}
+
+        await eng._hedge(position)
+
+        assert len(active.send_args) == 1
+        limit = active.send_args[0]["limit_px"]
+        if position > 0:
+            raw_bound = 100.03 * (1.0 - 20.0 / 1e4)
+            assert limit >= raw_bound
+        else:
+            raw_bound = 100.04 * (1.0 + 20.0 / 1e4)
+            assert limit <= raw_bound
+        assert active.send_args[0]["reduce_only"] is True
+
+    asyncio.run(go())
+
+
 def test_hedge_transport_error_requires_manual_recovery():
     async def go():
         eng = make_engine()
@@ -3199,6 +5673,7 @@ def test_signal_recorder_starts_only_in_record_only_mode():
             record_dir, "signals.csv")
         record_engine.cfg.entropy.symbol = "ANTH"
         record_engine.cfg.hedge.symbol = "ANTHROPIC"
+        record_engine.cfg.recorder_signal_rotate_daily = False
         record_tasks = []
 
         record_engine._start_recorders(record_tasks)
@@ -3208,8 +5683,13 @@ def test_signal_recorder_starts_only_in_record_only_mode():
         assert record_engine.recorder.hedge_symbol == "ANTHROPIC"
         assert record_engine.recorder.entropy_dex == "io"
         assert record_engine.recorder.hedge_venue == "lighter-rh"
+        assert (record_engine.recorder.entropy_reference
+                is record_engine.entropy.reference)
+        assert (record_engine.recorder.hedge_reference
+                is record_engine.hedge.reference)
         assert record_engine.signal_recorder.entropy_symbol == "ANTH"
         assert record_engine.signal_recorder.hedge_symbol == "ANTHROPIC"
+        assert record_engine.signal_recorder.signal_rotate_daily is False
         assert any(task.get_name() == "signal-recorder"
                    for task in record_tasks)
         record_engine.request_stop()
@@ -3528,7 +6008,9 @@ def test_record_only_captures_burst_signal_before_event_coalesces():
         assert os.path.exists(cfg.recorder_signal_csv)
         with open(cfg.recorder_signal_csv, newline="", encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))
-        assert [(row["direction"], row["event"]) for row in rows] == [
+        lifecycle = [row for row in rows if row["event"] != "snapshot"]
+        assert [(row["direction"], row["event"])
+                for row in lifecycle] == [
             ("sell_entropy", "start"),
             ("sell_entropy", "end"),
         ]

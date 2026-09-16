@@ -1,0 +1,63 @@
+# Convergence Audit Semantics Fix
+
+## Scope
+
+Fix the audit ambiguity between the top-of-book convergence used to quote
+entry slippage budgets and the final marginal convergence returned by the
+depth planner. Trading signals, fee calculations, slippage budgets, order
+directions, position limits and execution behavior remain unchanged.
+
+## Root cause
+
+Entry slippage budgets are calculated before depth planning from the current
+top-of-book residual and exit target. After planning, `convergence_bps` is the
+exact convergence at the final executable marginal prices. Persisting that
+value beside the earlier budgets without retaining their input makes the audit
+record appear internally inconsistent.
+
+## Design
+
+Keep `convergence_bps` as the final marginal convergence because it matches the
+planner and `projected_net_bps`. Add `top_convergence_bps` as the explicit
+pre-planning convergence used to quote entry slippage budgets.
+
+- `StrategyDecision` carries both values for `OPEN` and `ADD` decisions.
+- Strategy CSV events persist both values. Existing files with the old header
+  are archived by the recorder's existing header-compatibility behavior.
+- `PendingAuditContext` persists both values so recovery and settled execution
+  events retain the original decision evidence.
+- OPEN and ADD journals require the reference ages and reference update skew
+  that passed the entry reference gate, so restored entry evidence remains
+  self-contained and cannot silently lose its timing context.
+- OPEN and ADD journals also validate the four relationships that can be
+  derived entirely from their persisted decision evidence: top convergence
+  matches direction and exit target, marginal convergence does not exceed the
+  top value, round-trip fees match both venue fees, and projected USD matches
+  notional times projected basis points. Comparisons use a small floating-point
+  tolerance; no market-state-dependent entry rule is reconstructed at load
+  time.
+- Pending state schema advances from v3 to v4. An empty v3 journal remains
+  readable because it contains no ambiguous execution evidence. An active v3
+  journal remains fail-closed: v3 existed both before and after
+  `convergence_bps` changed from the top value to the marginal value, so the
+  producer semantics cannot be recovered reliably. v2, malformed and unknown
+  versions also remain fail-closed.
+
+The alternative of changing `convergence_bps` back to the top-of-book value is
+rejected because it would again diverge from the planner's exact marginal
+result. Deriving the top value only during offline analysis is also rejected
+because pending execution evidence must be self-contained.
+
+## Validation
+
+Tests must first demonstrate the missing distinction, then verify:
+
+1. multi-level entry decisions expose different top and marginal values;
+2. strategy events write both columns;
+3. pending v4 round-trips both values;
+4. empty v3 state remains readable without modifying the source file;
+5. active v3, malformed, v2 and unknown pending schemas fail closed through
+   `PendingExecutionStateError`;
+6. the full test suite, compile check and `git diff --check` pass.
+7. inconsistent OPEN/ADD cross-field evidence fails closed, while equivalent
+   values differing only by floating-point rounding remain readable.

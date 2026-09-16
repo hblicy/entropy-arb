@@ -71,8 +71,8 @@ inventory:
 
 # ======================= EXECUTION / 执行参数 ==============================
 execution:
-  premium_persist_sec: 0     # edge must persist this long before firing / 信号需持续时间
-  cooldown_sec: 0.0            # min gap between executions / 两次执行的最小间隔
+  premium_persist_sec: 3.0     # edge must persist this long before firing / 信号需持续时间
+  cooldown_sec: 60.0           # min gap between executions / 两次执行的最小间隔
   settle_timeout_sec: 10.0      # wait for fill confirmation / 等待成交确认
   leg_slippage_bps: 50.0       # taker limit protection per leg / 每腿滑点保护
   hedge_slippage_bps: 20.0     # price protection on delta hedges / 对冲滑点保护
@@ -97,6 +97,52 @@ recorder:
   enabled: true
   csv: logs/minutes.csv
   signal_csv: logs/signals.csv
+  signal_rotate_daily: true     # gzip and rotate signals at UTC midnight / UTC 每日轮转压缩
+
+# ================= REFERENCE OBSERVATION / 参考数据观测 ====================
+# Reference prices drive residual_dynamic entry safety. Funding remains
+# observation/alert-only and does not block entries.
+# reference 价格参与 residual_dynamic 的开仓门禁；资金费仍只记录和告警。
+reference:
+  rest_recovery_sec: 15
+  stale_sec: 60
+  residual_alert_bps: 20
+  residual_persist_sec: 30
+
+# ================= DYNAMIC RESIDUAL STRATEGY / 动态残差策略 ===============
+# This example is deliberately shadow-only. Removing --record-only still
+# refuses live startup until live_enabled is explicitly changed to true.
+# state_file and event_csv are base paths. Runtime adds a deterministic market
+# tag and then a live/shadow marker; do not pre-build the final filename here.
+# 示例默认只允许影子运行；即使误删 --record-only，也必须显式启用实盘才会下单。
+# state_file 与 event_csv 是基础路径；程序会自动追加市场标签和实盘/影子标记，
+# 此处不要预先填写最终文件名。
+strategy:
+  mode: residual_dynamic
+  live_enabled: false
+  window_minutes: 180
+  min_samples: 120
+  lower_quantile: 0.10
+  upper_quantile: 0.90
+  regime_window_minutes: 60
+  regime_recovery_minutes: 15
+  exit_band_fraction: 0.25
+  min_exit_band_bps: 0.5
+  min_expected_profit_bps: 2.0
+  soft_hold_minutes: 60
+  hard_hold_minutes: 360
+  entry_reference_max_age_sec: 15
+  entry_reference_max_skew_sec: 15
+  state_file: logs/campaign-state.json
+  event_csv: logs/strategy-events.csv
+
+slippage:
+  bootstrap_bps: 5.0
+  min_bps: 1.0
+  safety_bps: 1.0
+  hard_max_bps: 20.0
+  max_edge_fraction: 0.25
+  min_live_samples: 10
 
 # ==================== LOGGING & DASHBOARD / 日志与仪表盘 ====================
 # On a terminal the bot shows a live Rich dashboard (books, signal, positions,

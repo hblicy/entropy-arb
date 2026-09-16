@@ -1,0 +1,292 @@
+import json
+import math
+
+import pytest
+
+from entropy_arb.campaign import (
+    CampaignRecoveryError,
+    CampaignInvariantError,
+    CampaignStateError,
+    CampaignStore,
+    PositionCampaign,
+    reconcile_campaign,
+)
+from entropy_arb.strategy import MarketIdentity, ModelSnapshot
+
+
+def snapshot():
+    return ModelSnapshot(
+        version=7,
+        minute=100,
+        samples=180,
+        status="READY",
+        median_bps=10.0,
+        lower_bps=-20.0,
+        q25_bps=0.0,
+        q75_bps=20.0,
+        upper_bps=40.0,
+    )
+
+
+def campaign(**overrides):
+    values = {
+        "campaign_id": "campaign-1",
+        "mode": "shadow",
+        "identity": MarketIdentity(
+            "ANTH", "io", "ANTHROPIC", "lighter-rh"),
+        "direction": "buy_entropy",
+        "opened_at": 1000.0,
+        "qty": 1.0,
+        "entropy_avg_px": 100.0,
+        "hedge_avg_px": 101.0,
+        "frozen_model": snapshot(),
+        "entry_boundary_bps": -20.0,
+        "exit_target_bps": 5.0,
+        "fees_usd": 0.09,
+        "realized_pnl_usd": -0.09,
+    }
+    values.update(overrides)
+    return PositionCampaign(**values)
+
+
+def test_campaign_transitions_by_wall_clock():
+    value = campaign()
+
+    assert value.status_at(4599, soft_sec=3600, hard_sec=21600) == "OPEN"
+    assert value.status_at(4600, soft_sec=3600, hard_sec=21600) == "SOFT_EXIT"
+    assert value.status_at(22600, soft_sec=3600, hard_sec=21600) == "HARD_EXIT"
+
+
+def test_campaign_rejects_reverse_add():
+    with pytest.raises(CampaignInvariantError, match="direction"):
+        campaign().apply_matched_fill(
+            intent="ADD",
+            direction="sell_entropy",
+            qty=0.1,
+            entropy_px=99.0,
+            hedge_px=100.0,
+            fees_usd=0.01,
+        )
+
+
+def test_add_updates_weighted_prices_and_fees():
+    updated = campaign().apply_matched_fill(
+        intent="ADD",
+        direction="buy_entropy",
+        qty=1.0,
+        entropy_px=102.0,
+        hedge_px=103.0,
+        fees_usd=0.1,
+    )
+
+    assert updated.qty == 2.0
+    assert updated.entropy_avg_px == 101.0
+    assert updated.hedge_avg_px == 102.0
+    assert updated.fees_usd == pytest.approx(0.19)
+    assert updated.realized_pnl_usd == pytest.approx(-0.19)
+
+
+def test_partial_close_reduces_quantity_without_crossing_zero():
+    updated = campaign().apply_matched_fill(
+        intent="CLOSE",
+        direction="buy_entropy",
+        qty=0.4,
+        entropy_px=102.0,
+        hedge_px=102.0,
+        fees_usd=0.05,
+    )
+
+    assert updated.qty == pytest.approx(0.6)
+    assert updated.realized_pnl_usd == pytest.approx(0.26)
+
+    with pytest.raises(CampaignInvariantError, match="exceeds"):
+        updated.apply_matched_fill(
+            intent="CLOSE",
+            direction="buy_entropy",
+            qty=0.7,
+            entropy_px=102.0,
+            hedge_px=102.0,
+            fees_usd=0.05,
+        )
+
+
+def test_full_close_returns_none():
+    assert campaign().apply_matched_fill(
+        intent="FORCED_CLOSE",
+        direction="buy_entropy",
+        qty=1.0,
+        entropy_px=98.0,
+        hedge_px=102.0,
+        fees_usd=0.05,
+    ) is None
+
+
+def test_atomic_store_round_trip_and_shadow_path(tmp_path):
+    store = CampaignStore(
+        str(tmp_path / "campaign-state.json"), shadow=True)
+    expected = campaign()
+
+    store.save(expected)
+
+    assert store.path.name == "campaign-state.shadow.json"
+    assert store.load() == expected
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_store_can_persist_flat_state(tmp_path):
+    store = CampaignStore(str(tmp_path / "state.json"), shadow=False)
+
+    store.save(None)
+
+    assert store.load() is None
+    assert store.path.exists()
+
+
+def test_store_rejects_corrupt_or_unknown_schema(tmp_path):
+    path = tmp_path / "campaign-state.json"
+    path.write_text('{"schema_version":999,"campaign":null}',
+                    encoding="utf-8")
+
+    with pytest.raises(CampaignStateError, match="schema_version"):
+        CampaignStore(str(path), shadow=False).load()
+
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(CampaignStateError, match="valid JSON"):
+        CampaignStore(str(path), shadow=False).load()
+
+
+def test_campaign_rejects_nonfinite_persisted_values(tmp_path):
+    path = tmp_path / "state.json"
+    payload = {
+        "schema_version": 1,
+        "campaign": {
+            "campaign_id": "bad",
+            "mode": "live",
+            "identity": {
+                "entropy_symbol": "ANTH",
+                "entropy_dex": "io",
+                "hedge_symbol": "ANTHROPIC",
+                "hedge_venue": "lighter-rh",
+            },
+            "direction": "buy_entropy",
+            "opened_at": 1,
+            "qty": math.nan,
+            "entropy_avg_px": 100,
+            "hedge_avg_px": 100,
+            "frozen_model": snapshot().__dict__,
+            "entry_boundary_bps": -20,
+            "exit_target_bps": 5,
+            "fees_usd": 0,
+            "realized_pnl_usd": 0,
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CampaignStateError, match="qty"):
+        CampaignStore(str(path), shadow=False).load()
+
+    payload["campaign"]["qty"] = 1
+    payload["campaign"]["frozen_model"]["median_bps"] = math.nan
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CampaignStateError, match="frozen_model.median_bps"):
+        CampaignStore(str(path), shadow=False).load()
+
+
+def test_campaign_rejects_integer_too_large_for_float():
+    with pytest.raises(CampaignInvariantError, match="qty must be finite"):
+        campaign(qty=10 ** 400)
+
+
+def test_campaign_loader_wraps_integer_too_large_for_float(tmp_path):
+    path = tmp_path / "state.json"
+    store = CampaignStore(str(path), shadow=False)
+    store.save(campaign())
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["campaign"]["qty"] = 10 ** 400
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+            CampaignStateError, match="invalid campaign state: qty must be finite"):
+        store.load()
+
+
+def test_reconcile_allows_flat_without_state():
+    result = reconcile_campaign(
+        None, entropy_position=0.0, hedge_position=0.0,
+        step=0.001, net_tolerance=0.001)
+
+    assert result.campaign is None
+    assert result.reason == ""
+
+
+def test_reconcile_rejects_one_whole_size_step_as_flat():
+    with pytest.raises(CampaignRecoveryError, match="no saved campaign"):
+        reconcile_campaign(
+            None,
+            entropy_position=0.01,
+            hedge_position=-0.01,
+            step=0.01,
+            net_tolerance=0.001,
+        )
+
+
+@pytest.mark.parametrize(
+    ("direction", "entropy_position", "hedge_position"),
+    [
+        ("sell_entropy", -1.0, 1.0),
+        ("buy_entropy", 1.0, -1.0),
+    ],
+)
+def test_reconcile_resumes_matching_campaign(
+        direction, entropy_position, hedge_position):
+    saved = campaign(mode="live", direction=direction)
+
+    result = reconcile_campaign(
+        saved,
+        entropy_position=entropy_position,
+        hedge_position=hedge_position,
+        step=0.001,
+        net_tolerance=0.001,
+    )
+
+    assert result.campaign == saved
+    assert result.reason == ""
+
+
+@pytest.mark.parametrize(
+    ("saved", "entropy_position", "hedge_position"),
+    [
+        (None, -1.0, 1.0),
+        (campaign(mode="live", direction="sell_entropy"), 0.0, 0.0),
+        (campaign(mode="live", direction="sell_entropy"), -1.0, 0.5),
+        (campaign(mode="live", direction="buy_entropy"), -1.0, 1.0),
+    ],
+)
+def test_reconcile_fails_closed_on_ambiguous_or_mismatched_state(
+        saved, entropy_position, hedge_position):
+    with pytest.raises(CampaignRecoveryError, match="campaign recovery"):
+        reconcile_campaign(
+            saved,
+            entropy_position=entropy_position,
+            hedge_position=hedge_position,
+            step=0.001,
+            net_tolerance=0.001,
+        )
+
+
+@pytest.mark.parametrize(
+    ("entropy_position", "hedge_position", "step", "net_tolerance"),
+    [(math.nan, 0, .001, .001), (0, math.inf, .001, .001),
+     (0, 0, 0, .001), (0, 0, .001, -1)],
+)
+def test_reconcile_rejects_invalid_numeric_inputs(
+        entropy_position, hedge_position, step, net_tolerance):
+    with pytest.raises(ValueError):
+        reconcile_campaign(
+            None,
+            entropy_position=entropy_position,
+            hedge_position=hedge_position,
+            step=step,
+            net_tolerance=net_tolerance,
+        )

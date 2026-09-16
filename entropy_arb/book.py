@@ -132,6 +132,25 @@ def walk_depth(levels: List[Level], qty: float) -> Tuple[float, float]:
     return marginal_px, notional
 
 
+def quantity_within_notional(levels: List[Level], cap_notional: float) -> float:
+    """Return the maximum base quantity whose walked notional fits the cap."""
+    remaining = cap_notional
+    qty = 0.0
+    for px, size in levels:
+        if remaining <= 0.0:
+            break
+        take = min(size, remaining / px)
+        qty += take
+        remaining -= take * px
+        if take < size:
+            break
+    return qty
+
+
+def _notional_within_cap(value: float, cap: float) -> bool:
+    return value <= cap + max(1e-9, abs(cap) * 1e-12)
+
+
 @dataclass
 class ArbPlan:
     qty: float
@@ -159,7 +178,7 @@ class ArbPlan:
 def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
              buy_fee_bps: float, sell_fee_bps: float, take_fraction: float,
              cap_notional: float, min_base: float, min_notional: float,
-             size_step: float):
+             size_step: float, max_base: Optional[float] = None):
     """Size a two-leg taker slice: buy on buy_book, sell on sell_book.
 
     A slice qualifies when the executable premium (sell bid over buy ask)
@@ -179,12 +198,29 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
     q_max, q_max_notional = crossable_base(asks, bids, threshold, buy_fee, sell_fee)
     if q_max <= 0:
         return None, "no_edge"
-    target = min(q_max * take_fraction, cap_notional / asks[0][0])
+    base_cap = (math.inf if max_base is None
+                else _validate_plan_number("max_base", max_base))
+    target = min(
+        q_max * take_fraction,
+        quantity_within_notional(asks, cap_notional),
+        quantity_within_notional(bids, cap_notional),
+        base_cap,
+    )
     target = floor_step(target, size_step)
     if target < min_base:
         return None, "below_min_base"
     buy_limit, buy_notional = walk_depth(asks, target)
     sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        target = floor_step(target - size_step, size_step)
+        if target < min_base:
+            return None, "below_min_base"
+        buy_limit, buy_notional = walk_depth(asks, target)
+        sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        raise ArithmeticError("planned leg notional exceeds cap")
     if buy_notional < min_notional or sell_notional < min_notional:
         return None, "below_min_notional"
     return ArbPlan(
@@ -194,4 +230,277 @@ def plan_arb(buy_book: OrderBook, sell_book: OrderBook, *, threshold_bps: float,
         top_premium_bps=top_premium_bps,
         marginal_premium_bps=(sell_limit / buy_limit - 1.0) * 1e4,
         buy_fee=buy_fee, sell_fee=sell_fee,
+    ), "ok"
+
+
+@dataclass(frozen=True)
+class ConvergencePlan:
+    qty: float
+    buy_limit: float
+    sell_limit: float
+    buy_notional: float
+    sell_notional: float
+    q_max: float
+    buy_depth_slippage_bps: float
+    sell_depth_slippage_bps: float
+    open_depth_slippage_bps: float
+    convergence_bps: float
+    projected_net_bps: float
+
+
+@dataclass(frozen=True)
+class MatchedClosePlan:
+    qty: float
+    buy_limit: float
+    sell_limit: float
+    buy_notional: float
+    sell_notional: float
+    buy_depth_slippage_bps: float
+    sell_depth_slippage_bps: float
+
+
+def _validate_plan_number(name: str, value: float, *,
+                          positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    if positive and value <= 0:
+        raise ValueError(f"{name} must be positive")
+    if not positive and value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
+
+
+def _directional_signed_residual(
+        direction: str, buy_px: float, sell_px: float,
+        reference_basis_bps: float) -> float:
+    if direction == "sell_entropy":
+        signed_premium = (sell_px / buy_px - 1.0) * 1e4
+    elif direction == "buy_entropy":
+        signed_premium = (buy_px / sell_px - 1.0) * 1e4
+    else:
+        raise ValueError(f"unknown direction {direction!r}")
+    return signed_premium - reference_basis_bps
+
+
+def _convergence_space(direction: str, signed_residual_bps: float,
+                       exit_residual_bps: float) -> float:
+    if direction == "sell_entropy":
+        return signed_residual_bps - exit_residual_bps
+    if direction == "buy_entropy":
+        return exit_residual_bps - signed_residual_bps
+    raise ValueError(f"unknown direction {direction!r}")
+
+
+def _bounded_common_depth(asks: List[Level], bids: List[Level], *,
+                          buy_slippage_bps: float,
+                          sell_slippage_bps: float) -> float:
+    best_ask = asks[0][0]
+    best_bid = bids[0][0]
+    qty = 0.0
+    i = j = 0
+    ask_remaining = bid_remaining = 0.0
+    ask_px = bid_px = 0.0
+    while True:
+        if ask_remaining <= 0:
+            if i >= len(asks):
+                break
+            ask_px, ask_remaining = asks[i]
+            i += 1
+        if bid_remaining <= 0:
+            if j >= len(bids):
+                break
+            bid_px, bid_remaining = bids[j]
+            j += 1
+        buy_slip = (ask_px / best_ask - 1.0) * 1e4
+        sell_slip = (best_bid / bid_px - 1.0) * 1e4
+        if (buy_slip > buy_slippage_bps + 1e-9
+                or sell_slip > sell_slippage_bps + 1e-9):
+            break
+        take = min(ask_remaining, bid_remaining)
+        qty += take
+        ask_remaining -= take
+        bid_remaining -= take
+    return qty
+
+
+def plan_convergence_trade(
+        buy_book: OrderBook, sell_book: OrderBook, *, direction: str,
+        reference_basis_bps: float, exit_residual_bps: float,
+        round_trip_fee_bps: float, close_slippage_reserve_bps: float,
+        min_expected_profit_bps: float, buy_slippage_budget_bps: float,
+        sell_slippage_budget_bps: float, take_fraction: float,
+        cap_notional: float, min_base: float, min_notional: float,
+        size_step: float):
+    """Plan a matched opening slice against a frozen residual exit target."""
+    if direction not in {"sell_entropy", "buy_entropy"}:
+        raise ValueError(f"unknown direction {direction!r}")
+    if (isinstance(reference_basis_bps, bool)
+            or not isinstance(reference_basis_bps, (int, float))):
+        raise ValueError("reference_basis_bps must be a number")
+    basis = float(reference_basis_bps)
+    if not math.isfinite(basis):
+        raise ValueError("reference_basis_bps must be finite")
+    exit_residual = float(exit_residual_bps)
+    if not math.isfinite(exit_residual):
+        raise ValueError("exit_residual_bps must be finite")
+    fees = _validate_plan_number("round_trip_fee_bps", round_trip_fee_bps)
+    close_reserve = _validate_plan_number(
+        "close_slippage_reserve_bps", close_slippage_reserve_bps)
+    min_profit = _validate_plan_number(
+        "min_expected_profit_bps", min_expected_profit_bps)
+    buy_budget = _validate_plan_number(
+        "buy_slippage_budget_bps", buy_slippage_budget_bps)
+    sell_budget = _validate_plan_number(
+        "sell_slippage_budget_bps", sell_slippage_budget_bps)
+    take_fraction = _validate_plan_number(
+        "take_fraction", take_fraction, positive=True)
+    if take_fraction > 1:
+        raise ValueError("take_fraction must not exceed 1")
+    cap_notional = _validate_plan_number(
+        "cap_notional", cap_notional, positive=True)
+    min_base = _validate_plan_number("min_base", min_base)
+    min_notional = _validate_plan_number("min_notional", min_notional)
+    size_step = _validate_plan_number("size_step", size_step, positive=True)
+
+    asks = buy_book.sorted_asks()
+    bids = sell_book.sorted_bids()
+    if not asks or not bids:
+        return None, "empty_book"
+    best_ask = asks[0][0]
+    best_bid = bids[0][0]
+    top_residual = _directional_signed_residual(
+        direction, best_ask, best_bid, basis)
+    convergence = _convergence_space(
+        direction, top_residual, exit_residual)
+    top_projected = convergence - fees - close_reserve
+    if top_projected < min_profit:
+        return None, "insufficient_net_edge"
+
+    q_max = 0.0
+    i = j = 0
+    ask_remaining = bid_remaining = 0.0
+    ask_px = bid_px = 0.0
+    while True:
+        if ask_remaining <= 0:
+            if i >= len(asks):
+                break
+            ask_px, ask_remaining = asks[i]
+            i += 1
+        if bid_remaining <= 0:
+            if j >= len(bids):
+                break
+            bid_px, bid_remaining = bids[j]
+            j += 1
+        buy_slip = (ask_px / best_ask - 1.0) * 1e4
+        sell_slip = (best_bid / bid_px - 1.0) * 1e4
+        marginal_residual = _directional_signed_residual(
+            direction, ask_px, bid_px, basis)
+        marginal_convergence = _convergence_space(
+            direction, marginal_residual, exit_residual)
+        projected = marginal_convergence - fees - close_reserve
+        if (buy_slip > buy_budget + 1e-9
+                or sell_slip > sell_budget + 1e-9
+                or projected < min_profit):
+            break
+        take = min(ask_remaining, bid_remaining)
+        q_max += take
+        ask_remaining -= take
+        bid_remaining -= take
+    if q_max <= 0:
+        return None, "depth_slippage_exceeded"
+
+    target = min(
+        q_max * take_fraction,
+        quantity_within_notional(asks, cap_notional),
+        quantity_within_notional(bids, cap_notional),
+    )
+    target = floor_step(target, size_step)
+    if target < min_base:
+        return None, "below_min_base"
+    buy_limit, buy_notional = walk_depth(asks, target)
+    sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        target = floor_step(target - size_step, size_step)
+        if target < min_base:
+            return None, "below_min_base"
+        buy_limit, buy_notional = walk_depth(asks, target)
+        sell_limit, sell_notional = walk_depth(bids, target)
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        raise ArithmeticError("planned convergence leg notional exceeds cap")
+    if buy_notional < min_notional or sell_notional < min_notional:
+        return None, "below_min_notional"
+    buy_slip = (buy_limit / best_ask - 1.0) * 1e4
+    sell_slip = (best_bid / sell_limit - 1.0) * 1e4
+    marginal_residual = _directional_signed_residual(
+        direction, buy_limit, sell_limit, basis)
+    marginal_convergence = _convergence_space(
+        direction, marginal_residual, exit_residual)
+    projected = marginal_convergence - fees - close_reserve
+    return ConvergencePlan(
+        qty=target,
+        buy_limit=buy_limit,
+        sell_limit=sell_limit,
+        buy_notional=buy_notional,
+        sell_notional=sell_notional,
+        q_max=q_max,
+        buy_depth_slippage_bps=buy_slip,
+        sell_depth_slippage_bps=sell_slip,
+        open_depth_slippage_bps=buy_slip + sell_slip,
+        convergence_bps=marginal_convergence,
+        projected_net_bps=projected,
+    ), "ok"
+
+
+def plan_matched_close(
+        buy_book: OrderBook, sell_book: OrderBook, *, max_qty: float,
+        cap_notional: float, buy_slippage_bps: float,
+        sell_slippage_bps: float, min_base: float, min_notional: float,
+        size_step: float):
+    """Plan a risk-reducing equal-base close inside fixed price bounds."""
+    max_qty = _validate_plan_number("max_qty", max_qty, positive=True)
+    cap_notional = _validate_plan_number(
+        "cap_notional", cap_notional, positive=True)
+    buy_budget = _validate_plan_number(
+        "buy_slippage_bps", buy_slippage_bps)
+    sell_budget = _validate_plan_number(
+        "sell_slippage_bps", sell_slippage_bps)
+    min_base = _validate_plan_number("min_base", min_base)
+    min_notional = _validate_plan_number("min_notional", min_notional)
+    size_step = _validate_plan_number("size_step", size_step, positive=True)
+    asks = buy_book.sorted_asks()
+    bids = sell_book.sorted_bids()
+    if not asks or not bids:
+        return None, "empty_book"
+    q_max = _bounded_common_depth(
+        asks, bids, buy_slippage_bps=buy_budget,
+        sell_slippage_bps=sell_budget)
+    target = min(
+        q_max,
+        max_qty,
+        quantity_within_notional(asks, cap_notional),
+        quantity_within_notional(bids, cap_notional),
+    )
+    target = floor_step(target, size_step)
+    if target < min_base:
+        return None, "below_min_base"
+    buy_limit, buy_notional = walk_depth(asks, target)
+    sell_limit, sell_notional = walk_depth(bids, target)
+    if buy_notional < min_notional or sell_notional < min_notional:
+        return None, "below_min_notional"
+    if (not _notional_within_cap(buy_notional, cap_notional)
+            or not _notional_within_cap(sell_notional, cap_notional)):
+        raise ArithmeticError("planned close leg notional exceeds cap")
+    return MatchedClosePlan(
+        qty=target,
+        buy_limit=buy_limit,
+        sell_limit=sell_limit,
+        buy_notional=buy_notional,
+        sell_notional=sell_notional,
+        buy_depth_slippage_bps=(buy_limit / asks[0][0] - 1.0) * 1e4,
+        sell_depth_slippage_bps=(bids[0][0] / sell_limit - 1.0) * 1e4,
     ), "ok"

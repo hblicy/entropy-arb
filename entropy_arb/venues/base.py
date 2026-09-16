@@ -7,6 +7,7 @@ from typing import Callable, List, Optional, Protocol, runtime_checkable
 from ..book import OrderBook
 from ..config import VenueConf
 from ..models import OrderResult
+from ..reference import ReferenceState
 
 
 @runtime_checkable
@@ -16,6 +17,7 @@ class VenueAdapter(Protocol):
     key: str
     name: str
     book: OrderBook
+    reference: ReferenceState
     position: float
     cash: float
     volume_usd: float
@@ -32,7 +34,11 @@ class VenueAdapter(Protocol):
 
     async def load_market(self) -> None: ...
 
+    async def refresh_reference_rest(self) -> bool: ...
+
     def init_signer(self) -> None: ...
+
+    def account_lock_id(self) -> str: ...
 
     def configure_peer(self, other: "VenueAdapter") -> None: ...
 

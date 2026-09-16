@@ -26,10 +26,27 @@ from .book import OrderBook
 from .config import VenueConf
 from .feeds import HLBookFeed
 from .models import OrderResult
+from .reference import InvalidReference, ReferenceState, ReferenceUpdate
 
 log = logging.getLogger("hl")
 
 INFO_TIMEOUT = 10.0
+
+
+def parse_hl_rest_asset_ctx(ctx: dict) -> ReferenceUpdate:
+    try:
+        funding = ctx.get("funding")
+        return ReferenceUpdate(
+            oracle_px=(None if ctx.get("oraclePx") is None
+                       else float(ctx["oraclePx"])),
+            mark_px=(None if ctx.get("markPx") is None
+                     else float(ctx["markPx"])),
+            funding_current_bps_per_hour=(
+                None if funding is None else float(funding) * 1e4),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidReference(f"invalid Hyperliquid REST asset context: {exc}") \
+            from exc
 
 
 class NonceAllocator:
@@ -70,6 +87,7 @@ class HLVenue:
         self.session = session
         self.settle_timeout = settle_timeout_sec
         self.book = OrderBook()
+        self.reference = ReferenceState()
         self.position = 0.0
         self.cash = 0.0
         self.volume_usd = 0.0     # cumulative filled notional this session
@@ -119,8 +137,34 @@ class HLVenue:
                      self.name, self.coin, self.asset_id, self.size_decimals,
                      a.get("maxLeverage"),
                      "isolated-only" if a.get("onlyIsolated") else "")
+            try:
+                await self.refresh_reference_rest()
+            except (aiohttp.ClientError, asyncio.TimeoutError,
+                    InvalidReference) as exc:
+                log.warning("[%s] initial reference REST failed: %s",
+                            self.name, exc)
             return
         raise RuntimeError(f"[{self.name}] {want} not found")
+
+    async def refresh_reference_rest(self) -> bool:
+        websocket_generation = self.reference.websocket_generation
+        try:
+            data = await self._info({
+                "type": "metaAndAssetCtxs", "dex": self.conf.hl_dex})
+            meta, contexts = data
+            index = next(
+                idx for idx, asset in enumerate(meta["universe"])
+                if asset.get("name") == self.coin)
+            update = parse_hl_rest_asset_ctx(contexts[index])
+        except (KeyError, IndexError, StopIteration, TypeError,
+                ValueError) as exc:
+            raise InvalidReference(
+                f"invalid Hyperliquid REST reference payload for "
+                f"{self.coin}: {exc}") from exc
+        return self.reference.apply_rest_if_ws_unchanged(
+            update,
+            expected_websocket_generation=websocket_generation,
+        )
 
     def init_signer(self) -> None:
         c = self.conf.hl_creds
@@ -153,13 +197,23 @@ class HLVenue:
         if address and address == other._query_address():
             other.include_core_equity = False
 
+    def account_lock_id(self) -> str:
+        if self.account is None:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        address = getattr(getattr(self.account, "wallet", None), "address", None)
+        if not isinstance(address, str) or not address:
+            raise RuntimeError(
+                f"[{self.name}] signer account identity is unavailable")
+        return f"hl:{address.lower()}"
+
     def start_tasks(self, stop: asyncio.Event, notify, live: bool) -> list:
         def book_notify() -> None:
             notify("book", self.key)
 
         return [asyncio.create_task(
             HLBookFeed(self.name, self.ws_url, self.coin, self.book,
-                       book_notify).run(stop),
+                       book_notify, self.reference).run(stop),
             name=f"book-{self.key}")]
 
     def ready_to_trade(self) -> bool:
